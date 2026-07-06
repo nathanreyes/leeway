@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target/
+
+# Backtrace/profiling output
+*.profraw
+
+# Local SQLite database and its journals
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
