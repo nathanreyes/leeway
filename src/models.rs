@@ -58,8 +58,6 @@ sql_enum!(Mode { Automatic => "automatic", Manual => "manual" });
 sql_enum!(AccountType {
     Checking => "checking",
     CreditCard => "credit_card",
-    Reserve => "reserve",
-    Investment => "investment",
 });
 
 // --- Money <-> SQLite ----------------------------------------------------------
@@ -81,13 +79,30 @@ impl rusqlite::ToSql for Money {
 // One struct per row shape. `Option<T>` mirrors a nullable column. Note `account_type`
 // rather than `type` (a reserved word), and `NaiveDate` for the parsed start date.
 
+/// A cash-flow account. `balance` is the spendable ground truth for a **checking**
+/// account. A **credit card** instead carries `credit_limit` + `available_credit` (both
+/// entered by hand); its debt is `owed()` and its `balance` is unused (0).
 #[derive(Clone, Debug)]
 pub struct Account {
     pub id: String,
     pub name: String,
     pub account_type: AccountType,
     pub balance: Money,
-    pub protected: bool,
+    pub credit_limit: Option<Money>,
+    pub available_credit: Option<Money>,
+}
+
+impl Account {
+    /// What a credit card owes: `limit − available`. Can be negative (a statement credit,
+    /// i.e. the card owes you). Returns `ZERO` for non-card accounts and unset fields.
+    pub fn owed(&self) -> Money {
+        match self.account_type {
+            AccountType::CreditCard => {
+                self.credit_limit.unwrap_or(Money::ZERO) - self.available_credit.unwrap_or(Money::ZERO)
+            }
+            AccountType::Checking => Money::ZERO,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -96,18 +111,30 @@ pub struct Plan {
     pub name: String,
 }
 
+/// A first-class recurring item — WHAT a bill/paycheck/envelope is, independent of any
+/// plan. Its `id` is the durable series identity that instances carry as `series_id` and
+/// that trends group by. One series can appear in many plans; editing these fields
+/// affects every plan that uses it.
 #[derive(Clone, Debug)]
-pub struct PlanItem {
+pub struct Series {
     pub id: String,
-    pub plan_id: String,
     pub kind: Kind,
     pub label: String,
-    pub slug: Option<String>,
     pub category: Option<String>,
-    pub direction: Option<Direction>,
+    pub direction: Option<Direction>,   // transactions
+    pub period_type: Option<PeriodType>, // envelopes
+    pub mode: Option<Mode>,              // envelopes (None = inherit global default)
+}
+
+/// A series' membership in one plan: the join of `plan_item` and `series`. `item_id` is
+/// the plan_item row (per-plan); `amount` is this plan's budgeted figure; `series` is the
+/// shared definition. This is the read-model the editor and stamping work with.
+#[derive(Clone, Debug)]
+pub struct PlanEntry {
+    pub item_id: String,
+    pub plan_id: String,
     pub amount: Money,
-    pub period_type: Option<PeriodType>,
-    pub mode: Option<Mode>,
+    pub series: Series,
 }
 
 #[derive(Clone, Debug)]

@@ -3,7 +3,7 @@
 //! data. A web or desktop frontend could call `MonthView::build` and render it too.
 
 use crate::calc::{self, WhatsLeft};
-use crate::models::{Direction, Envelope, Mode, Month, Txn};
+use crate::models::{Account, AccountType, Direction, Envelope, Mode, Month, Txn};
 use crate::money::Money;
 use crate::queries;
 use anyhow::Result;
@@ -24,6 +24,8 @@ pub struct MonthView {
     pub days_elapsed: i64,
     pub elapsed_fraction: f64,
     pub whats_left: WhatsLeft,
+    /// Every account, in name order — the editable ground-truth balances.
+    pub accounts: Vec<Account>,
     /// Standalone income+bills (no envelope), income first — the list you toggle settled.
     pub standalone: Vec<Txn>,
     pub envelopes: Vec<EnvelopeRow>,
@@ -44,9 +46,13 @@ impl MonthView {
         let fraction = calc::elapsed_fraction(month.start_date, month.days_in_month, today);
         let days_elapsed = calc::days_elapsed(month.start_date, month.days_in_month, today);
 
-        // Accounts split into spendable vs held-back.
-        let funds_available: Money = accounts.iter().filter(|a| !a.protected).map(|a| a.balance).sum();
-        let protected: Money = accounts.iter().filter(|a| a.protected).map(|a| a.balance).sum();
+        // Cash-flow roles by account type: checking is spendable, credit cards are debt.
+        let funds_available: Money = accounts
+            .iter()
+            .filter(|a| a.account_type == AccountType::Checking)
+            .map(|a| a.balance)
+            .sum();
+        let card_debt: Money = accounts.iter().map(|a| a.owed()).sum();
 
         // Standalone transactions (envelope_id IS NULL) drive income/bills remaining.
         let standalone: Vec<Txn> = all_txns
@@ -90,7 +96,7 @@ impl MonthView {
 
         let whats_left = WhatsLeft::compute(
             funds_available,
-            protected,
+            card_debt,
             income_remaining,
             bills_remaining,
             envelopes_remaining,
@@ -101,6 +107,7 @@ impl MonthView {
             days_elapsed,
             elapsed_fraction: fraction,
             whats_left,
+            accounts, // moved in after its balances were summed above
             standalone,
             envelopes,
         }))
@@ -111,5 +118,66 @@ fn dir_rank(d: Direction) -> u8 {
     match d {
         Direction::In => 0,
         Direction::Out => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::money::Money;
+    use crate::{db, ops};
+    use chrono::NaiveDate;
+
+    #[test]
+    fn editing_a_balance_moves_whats_left() {
+        let mut conn = db::open_in_memory().unwrap();
+        ops::seed_demo(&mut conn).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+
+        let before = MonthView::build(&conn, today).unwrap().unwrap();
+        assert_eq!(before.accounts.len(), 2, "seed makes checking + credit card");
+
+        // Bump the (unprotected) checking account by exactly $500.
+        let checking = before
+            .accounts
+            .iter()
+            .find(|a| a.name == "Checking")
+            .unwrap();
+        let new_balance = checking.balance + Money::from_dollars(500.0);
+        ops::set_balance(&conn, &checking.id, new_balance).unwrap();
+
+        let after = MonthView::build(&conn, today).unwrap().unwrap();
+        // Funds and the headline both rise by the same $500; nothing else shifts.
+        assert_eq!(
+            after.whats_left.funds_available,
+            before.whats_left.funds_available + Money::from_dollars(500.0)
+        );
+        assert_eq!(
+            after.whats_left.whats_left,
+            before.whats_left.whats_left + Money::from_dollars(500.0)
+        );
+    }
+
+    #[test]
+    fn credit_card_owed_reduces_whats_left() {
+        let mut conn = db::open_in_memory().unwrap();
+        ops::seed_demo(&mut conn).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+
+        let before = MonthView::build(&conn, today).unwrap().unwrap();
+        // Funds are checking only; the demo card owes 5000 − 4150 = 850.
+        assert_eq!(before.whats_left.funds_available, Money::from_dollars(4200.0));
+        assert_eq!(before.whats_left.card_debt, Money::from_dollars(850.0));
+        // Regression guard: the card must SUBTRACT, not add (the old bug added it).
+        assert!(before.whats_left.whats_left < before.whats_left.funds_available + before.whats_left.income_remaining);
+
+        // Spend $100 on the card → available drops $100 → owed +$100 → what's left −$100.
+        let card = before.accounts.iter().find(|a| a.name == "Credit Card").unwrap();
+        let new_avail = card.available_credit.unwrap() - Money::from_dollars(100.0);
+        ops::set_available_credit(&conn, &card.id, new_avail).unwrap();
+
+        let after = MonthView::build(&conn, today).unwrap().unwrap();
+        assert_eq!(after.whats_left.card_debt, before.whats_left.card_debt + Money::from_dollars(100.0));
+        assert_eq!(after.whats_left.whats_left, before.whats_left.whats_left - Money::from_dollars(100.0));
     }
 }

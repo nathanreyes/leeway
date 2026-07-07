@@ -17,8 +17,13 @@ use std::sync::LazyLock;
 /// `LazyLock` builds this once, on first use, and caches it. `include_str!` pastes the
 /// contents of schema.sql into the binary at compile time, so there's no file to ship
 /// alongside the executable.
-static MIGRATIONS: LazyLock<Migrations<'static>> =
-    LazyLock::new(|| Migrations::new(vec![M::up(include_str!("schema.sql"))]));
+static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
+    Migrations::new(vec![
+        M::up(include_str!("schema.sql")),
+        M::up(include_str!("migrations/002_first_class_series.sql")),
+        M::up(include_str!("migrations/003_credit_card_model.sql")),
+    ])
+});
 
 /// Open the database at `path` (creating the file if missing) and bring its schema up to
 /// the latest version. Returns the live connection the rest of the app uses.
@@ -65,5 +70,20 @@ mod tests {
             )
             .expect("default setting row");
         assert_eq!(mode, "automatic");
+    }
+
+    #[test]
+    fn account_migrated_to_card_model() {
+        let conn = open_in_memory().expect("schema should apply");
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('account')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(cols.iter().any(|c| c == "credit_limit_cents"));
+        assert!(cols.iter().any(|c| c == "available_credit_cents"));
+        assert!(!cols.iter().any(|c| c == "protected"), "protected flag dropped");
     }
 }

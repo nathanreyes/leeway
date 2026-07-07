@@ -67,8 +67,8 @@ pub fn txn_remaining(txn: &Txn) -> Money {
 /// number the whole app exists to show.
 #[derive(Clone, Copy, Debug)]
 pub struct WhatsLeft {
-    pub funds_available: Money,     // unprotected account balances (checking, ...)
-    pub protected: Money,           // credit cards + reserve, held back
+    pub funds_available: Money,     // spendable checking balances
+    pub card_debt: Money,           // total credit-card owed (= limit − available)
     pub income_remaining: Money,    // unsettled standalone income
     pub bills_remaining: Money,     // unsettled standalone bills
     pub envelopes_remaining: Money, // sum of every envelope's remaining
@@ -78,17 +78,17 @@ pub struct WhatsLeft {
 impl WhatsLeft {
     pub fn compute(
         funds_available: Money,
-        protected: Money,
+        card_debt: Money,
         income_remaining: Money,
         bills_remaining: Money,
         envelopes_remaining: Money,
     ) -> WhatsLeft {
-        let whats_left = funds_available - protected + income_remaining
+        let whats_left = funds_available - card_debt + income_remaining
             - bills_remaining
             - envelopes_remaining;
         WhatsLeft {
             funds_available,
-            protected,
+            card_debt,
             income_remaining,
             bills_remaining,
             envelopes_remaining,
@@ -164,7 +164,7 @@ mod tests {
     fn whats_left_formula() {
         let wl = WhatsLeft::compute(
             Money::from_dollars(5000.0), // funds
-            Money::from_dollars(1200.0), // protected
+            Money::from_dollars(1200.0), // card debt
             Money::from_dollars(800.0),  // income remaining
             Money::from_dollars(1500.0), // bills remaining
             Money::from_dollars(900.0),  // envelopes remaining

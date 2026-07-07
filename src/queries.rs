@@ -7,7 +7,8 @@
 use crate::models::*;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, OptionalExtension, Row};
+use std::collections::HashSet;
 
 /// The global default envelope mode (from the `setting` table). Falls back to
 /// Automatic if the row is somehow missing.
@@ -27,7 +28,8 @@ pub fn default_mode(conn: &Connection) -> Result<Mode> {
 
 pub fn load_accounts(conn: &Connection) -> Result<Vec<Account>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, type, balance_cents, protected FROM account ORDER BY name",
+        "SELECT id, name, type, balance_cents, credit_limit_cents, available_credit_cents
+         FROM account ORDER BY name",
     )?;
     // `query_map` runs the SQL and applies the mapper to each row; `collect` gathers the
     // results, and the `?` after it fails fast if any row failed to map.
@@ -127,32 +129,71 @@ pub fn get_plan(conn: &Connection, plan_id: &str) -> Result<Option<Plan>> {
     }
 }
 
-/// All items in a plan, envelopes first then transactions, each alphabetical — a stable
-/// order so the editor's selection doesn't jump around as you rename things.
-pub fn load_plan_items(conn: &Connection, plan_id: &str) -> Result<Vec<PlanItem>> {
+/// All entries in a plan (plan_item JOIN series), envelopes first then transactions, each
+/// alphabetical — a stable order so the editor's selection doesn't jump as you rename.
+pub fn load_plan_entries(conn: &Connection, plan_id: &str) -> Result<Vec<PlanEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, kind, label, slug, category, direction,
-                amount_cents, period_type, mode
-         FROM plan_item WHERE plan_id = ?1
-         ORDER BY kind, label",
+        "SELECT pi.id AS item_id, pi.plan_id AS plan_id, pi.amount_cents AS amount_cents,
+                s.id AS series_id, s.kind AS kind, s.label AS label, s.category AS category,
+                s.direction AS direction, s.period_type AS period_type, s.mode AS mode
+         FROM plan_item pi JOIN series s ON s.id = pi.series_id
+         WHERE pi.plan_id = ?1
+         ORDER BY s.kind, s.label",
     )?;
     let rows = stmt
-        .query_map([plan_id], |r| {
-            Ok(PlanItem {
-                id: r.get("id")?,
-                plan_id: r.get("plan_id")?,
-                kind: r.get("kind")?,
-                label: r.get("label")?,
-                slug: r.get("slug")?,
-                category: r.get("category")?,
-                direction: r.get("direction")?,
-                amount: r.get("amount_cents")?,
-                period_type: r.get("period_type")?,
-                mode: r.get("mode")?,
-            })
-        })?
+        .query_map([plan_id], map_plan_entry)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Every series, for the reuse picker.
+pub fn list_series(conn: &Connection) -> Result<Vec<Series>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, label, category, direction, period_type, mode
+         FROM series ORDER BY kind, label",
+    )?;
+    let rows = stmt
+        .query_map([], map_series)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The set of series ids already included in a plan — so the picker can mark/skip them.
+pub fn series_in_plan(conn: &Connection, plan_id: &str) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT series_id FROM plan_item WHERE plan_id = ?1")?;
+    let ids = stmt
+        .query_map([plan_id], |r| r.get::<_, String>("series_id"))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    Ok(ids)
+}
+
+fn map_series(r: &Row) -> rusqlite::Result<Series> {
+    Ok(Series {
+        id: r.get("id")?,
+        kind: r.get("kind")?,
+        label: r.get("label")?,
+        category: r.get("category")?,
+        direction: r.get("direction")?,
+        period_type: r.get("period_type")?,
+        mode: r.get("mode")?,
+    })
+}
+
+fn map_plan_entry(r: &Row) -> rusqlite::Result<PlanEntry> {
+    Ok(PlanEntry {
+        item_id: r.get("item_id")?,
+        plan_id: r.get("plan_id")?,
+        amount: r.get("amount_cents")?,
+        series: Series {
+            id: r.get("series_id")?,
+            kind: r.get("kind")?,
+            label: r.get("label")?,
+            category: r.get("category")?,
+            direction: r.get("direction")?,
+            period_type: r.get("period_type")?,
+            mode: r.get("mode")?,
+        },
+    })
 }
 
 /// Is there already a month with this label? Used to stop stamping the same month twice.
@@ -165,6 +206,16 @@ pub fn month_label_exists(conn: &Connection, label: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// The id of the month with this label, if any — so a restamp can target it.
+pub fn month_id_for_label(conn: &Connection, label: &str) -> Result<Option<String>> {
+    let id = conn
+        .query_row("SELECT id FROM month WHERE label = ?1 LIMIT 1", [label], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?;
+    Ok(id)
+}
+
 // --- Row mappers ---------------------------------------------------------------
 
 fn map_account(r: &Row) -> rusqlite::Result<Account> {
@@ -173,7 +224,8 @@ fn map_account(r: &Row) -> rusqlite::Result<Account> {
         name: r.get("name")?,
         account_type: r.get("type")?, // AccountType::FromSql
         balance: r.get("balance_cents")?, // Money::FromSql
-        protected: r.get("protected")?, // INTEGER 0/1 -> bool
+        credit_limit: r.get("credit_limit_cents")?, // Option<Money>: NULL -> None
+        available_credit: r.get("available_credit_cents")?,
     })
 }
 

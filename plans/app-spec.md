@@ -11,33 +11,38 @@ A single-user, local-first budgeting app whose job is to answer one question all
 - Spending categories (groceries, dining) are **envelopes** that bleed down over the month on their own.
 - The app keeps every month it has ever stamped, so it can show **trends** ("what was electric this time last year?").
 - Anything that would force routine data entry into the main loop is suspect. Entry is optional enrichment, never a requirement.
+- **Cash flow, not net worth.** Accounts are only checking (spendable) and credit cards (a liability = `credit_limit − available_credit`). Saving toward a goal is modeled as a monthly commitment (an envelope or a set-aside bill that lowers "what's left"); tracking accumulated goal *balances* is out of scope.
 
 ---
 
 ## 2. Core concepts
 
-Two primitives, cleanly related:
+Three primitives, cleanly related:
 
 - **Transaction** — an atomic money event: amount, direction (in/out), a settled flag. Paychecks and known bills *are* transactions. A transaction may stand alone (a bill, a paycheck) or belong to a manual envelope (a grocery purchase).
 - **Envelope** — a budgeted pool with a consumption *mode*. An **automatic** envelope accrues over time; a **manual** envelope is consumed by the transactions inside it.
+- **Series** — a first-class, durable definition of a recurring item (Rent, Groceries): its kind, label, category, and coded fields (direction / period / mode). A series is the **permanent identity** that stamped instances carry as `series_id` and that trends group by. One series can appear in many plans, so trends connect even when you switch which plan you stamp.
 
 And a separation across time:
 
-- **Plan** — a reusable *template*: a named set of recurring transaction- and envelope-definitions. You can keep several (normal month, tight month, summer-with-the-kids) and choose which to stamp.
-- **Stamping** — at the start of a month you stamp a plan, which **copies** its items into concrete instances for that month. The link to the plan is then **broken**: the month is an independent snapshot. Editing the plan afterward never reaches back into a stamped month.
+- **Plan** — a reusable *template*: a named set of plan-items, each referencing a **series** and carrying that plan's budgeted *amount*. The series says *what* the item is; the plan says *how much*. You can keep several plans (normal month, tight month, summer-with-the-kids) that share series, and choose which to stamp.
+- **Stamping** — at the start of a month you stamp a plan, which **copies** its items into concrete instances for that month (the series' fields + the plan's amount). The link to the plan is then **broken**: the month is an independent snapshot. Editing the plan afterward never reaches back into a stamped month. A month may be **restamped** with any plan — **merge** (additive; refresh unsettled instances, protect settled ones) or **replace** (clean slate; keeps hand-entered data only if you ask). Matching is by shared `series_id`.
 
 ---
 
 ## 3. Data model (SQLite)
 
 ```sql
--- Real-world balances. Manually entered ground truth, carried across months.
+-- Cash-flow accounts. Manually entered ground truth, carried across months. Only two
+-- roles, derived from `type`: checking (spendable) and credit_card (a liability). Reserve/
+-- investment and net-worth tracking are intentionally out of scope.
 CREATE TABLE account (
-    id        TEXT PRIMARY KEY,            -- UUID
-    name      TEXT NOT NULL,
-    type      TEXT NOT NULL,               -- 'checking' | 'credit_card' | 'reserve' | 'investment'
-    balance   REAL NOT NULL,
-    protected INTEGER NOT NULL DEFAULT 0   -- 1 = held back from funds (credit cards, reserve)
+    id               TEXT PRIMARY KEY,     -- UUID
+    name             TEXT NOT NULL,
+    type             TEXT NOT NULL,        -- 'checking' | 'credit_card'
+    balance          REAL NOT NULL,        -- checking: spendable balance (credit cards store 0)
+    credit_limit     REAL,                 -- credit cards only
+    available_credit REAL                  -- credit cards only; owed = credit_limit − available_credit
 );
 
 -- Named templates.
@@ -46,20 +51,27 @@ CREATE TABLE plan (
     name TEXT NOT NULL
 );
 
--- Recurring definitions inside a plan.
--- plan_item.id is the PERMANENT SERIES IDENTITY: minted once, never reused or recomputed,
--- copied onto every instance it stamps. It is NOT derived from the label, so renames are free.
-CREATE TABLE plan_item (
+-- The PERMANENT SERIES IDENTITY: minted once, never reused or recomputed, copied onto
+-- every instance it stamps as `series_id`. It is NOT derived from the label, so renames
+-- are free. One series may be referenced by many plans; editing it affects them all.
+CREATE TABLE series (
     id          TEXT PRIMARY KEY,          -- UUID — the durable series id
-    plan_id     TEXT NOT NULL REFERENCES plan(id),
     kind        TEXT NOT NULL,             -- 'transaction' | 'envelope'
     label       TEXT NOT NULL,             -- cosmetic only; safe to edit
-    slug        TEXT,                      -- optional, for display/search ONLY — never used to match
     category    TEXT,
     direction   TEXT,                      -- 'in' | 'out'  (transactions)
-    amount      REAL NOT NULL,             -- default / budgeted amount
     period_type TEXT,                      -- envelopes: 'daily' | 'weekly' | 'monthly'
     mode        TEXT                       -- envelopes: 'automatic' | 'manual' | NULL = inherit global default
+);
+
+-- A series' membership in a plan. The series says WHAT the item is; the plan_item says
+-- HOW MUCH this template budgets for it. `amount` is per-plan; everything else lives on
+-- the series.
+CREATE TABLE plan_item (
+    id        TEXT PRIMARY KEY,            -- UUID (per-plan row; NOT the series identity)
+    plan_id   TEXT NOT NULL REFERENCES plan(id),
+    series_id TEXT NOT NULL REFERENCES series(id),
+    amount    REAL NOT NULL                -- this plan's budgeted amount for the series
 );
 
 -- A stamped period.
@@ -111,7 +123,7 @@ Key field notes:
 
 - **`amount` is NOT NULL everywhere** and is seeded from the plan at stamp time, so it is never empty. That makes "marking paid requires an amount" true by construction — there is no null to chase.
 - **`stamped_amount`** is the frozen value captured at stamp time. The plan's budget figure is never lost: budget-vs-actual for any month is `amount` vs `stamped_amount`.
-- **`series_id`** is a *copied* value, not a foreign key. The relationship to the plan is severed (no cascade, plan can change or be deleted), but the identifier survives so trends can group.
+- **`series_id`** on an instance is a *copied* value, not a live foreign key. The link to the plan is severed at stamp time (the plan can change or be deleted), but the identifier equals a `series.id` that persists, so trends group across months — and across plans, since plans share series. Restamp matches instances to a plan's items by this value.
 - **Effective envelope mode** = `COALESCE(envelope.mode, setting['default_envelope_mode'])`. Setting `mode` explicitly is the per-envelope override.
 
 ---
@@ -144,14 +156,14 @@ Note: on an automatic envelope you may still record transactions — they are ke
 ### The "what's left" rollup
 
 ```
-funds_available       = SUM(account.balance WHERE protected = 0)            -- checking, etc.
-protected             = SUM(account.balance WHERE protected = 1)            -- credit cards + reserve
+funds_available       = SUM(account.balance WHERE type='checking')              -- spendable
+card_debt             = SUM(credit_limit - available_credit WHERE type='credit_card')  -- owed
 income_remaining      = SUM(txn.amount  WHERE direction='in'  AND settled=0 AND envelope_id IS NULL)
 bills_remaining       = SUM(txn.amount  WHERE direction='out' AND settled=0 AND envelope_id IS NULL)
 envelopes_remaining   = SUM(envelope.remaining)
 
 whats_left = funds_available
-           - protected
+           - card_debt
            + income_remaining
            - bills_remaining
            - envelopes_remaining
@@ -225,3 +237,5 @@ Group by the copied `series_id`, never by name. Compare `amount` to `stamped_amo
 - **Plan-diff indicators & restamp** — flagging where the current month drifts from a selected plan, with a one-click restamp. Enabled for free by the design: match each instance's `series_id` against the current plan's `plan_item.id`. No data changes needed to add it later.
 - **"Confirmed amount" flag** for trend honesty on automatic envelopes.
 - **Sub-monthly forecasting** (week-by-week) using the optional `date_paid`.
+- **Net-worth / goal tracking** — reserve & investment accounts, and accumulated progress toward savings goals (a target + running balance). Deliberately excluded to keep the tool focused on cash flow.
+- **Account management UI** — creating/renaming/deleting accounts (they are currently seeded).
