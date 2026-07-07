@@ -51,10 +51,20 @@ CREATE TABLE month (
 );
 
 -- Envelope instance (one per stamped envelope per month).
+--
+-- `series_id` is a copied `series.id` value, deliberately NOT a live foreign key. We
+-- considered enforcing it and chose not to: an instance is a self-contained snapshot (it
+-- copies label/period_type/mode at stamp time and reads nothing from the series row), so it
+-- doesn't depend on the series existing. Deleting a series once no plan uses it (see
+-- ops::delete_series) legitimately orphans this id on past months, and that's fine — trends
+-- still group by the value. A real FK would force ON DELETE RESTRICT (series never prunable
+-- once stamped), SET NULL (wipes trend continuity), or CASCADE (destroys history), all of
+-- which fight the snapshot model. Integrity holds by construction: series_id is only ever
+-- set by copying a validated series.id at stamp time, never from user input.
 CREATE TABLE envelope (
     id                   TEXT PRIMARY KEY,  -- UUID
     month_id             TEXT NOT NULL REFERENCES month(id),
-    series_id            TEXT NOT NULL,     -- copied plan_item.id (plain value, NOT a live FK)
+    series_id            TEXT NOT NULL,     -- copied series.id; soft reference, NOT a live FK (see table comment)
     label                TEXT NOT NULL,
     category             TEXT,
     amount_cents         INTEGER NOT NULL,  -- this month's budget (editable)
@@ -67,7 +77,7 @@ CREATE TABLE envelope (
 CREATE TABLE txn (
     id                   TEXT PRIMARY KEY,  -- UUID
     month_id             TEXT NOT NULL REFERENCES month(id),  -- the PERIOD = the trend time axis
-    series_id            TEXT,              -- copied plan_item.id; NULL for one-offs (no series)
+    series_id            TEXT,              -- copied series.id, soft reference (see envelope table comment); NULL for one-offs
     envelope_id          TEXT REFERENCES envelope(id),        -- NULL = standalone (bill/income)
     account_id           TEXT REFERENCES account(id),
     label                TEXT NOT NULL,
