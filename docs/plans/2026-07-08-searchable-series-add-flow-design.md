@@ -41,21 +41,28 @@ distinction can be removed for income, expenses, and envelopes.
 
 ## Restamp Policy
 
-Restamp behavior is based on whether a month instance's series is included in the target
-plan, not on where the instance was first created.
+Restamp behavior keeps two identities separate:
+
+- `series.id` is the durable trend/reuse identity.
+- A plan item or month row is an occurrence of that series.
+
+The same series may appear more than once in a plan or month. That supports real-world
+cases such as two paychecks from the same income series in one monthly template.
 
 Merge:
 
-- If a target-plan series already exists in the month, refresh that instance from the
-  plan's values, preserving settled transaction actuals as today.
-- If the series is absent, insert it.
-- Never duplicate a series already present in the month.
+- Match each target-plan occurrence to an existing month occurrence of the same series
+  where possible.
+- Refresh the matched instance from that plan occurrence, preserving settled transaction
+  actuals as today.
+- If a target-plan occurrence has no available month occurrence, insert it.
+- If a month already has multiple occurrences for a series, match them in stable row order.
 
 Replace:
 
-- Reset or insert every series in the target plan.
-- Remove month instances whose series is not in the target plan unless the user chooses
-  to keep items outside the plan.
+- Reset or insert every occurrence in the target plan.
+- Remove extra month occurrences whose series cannot be matched to a target-plan
+  occurrence unless the user chooses to keep items outside the plan.
 - Manual spending inside envelopes remains linked when its envelope is kept; if its
   envelope is removed while spending is kept, detach the spending to standalone as today.
 
@@ -64,20 +71,22 @@ instead of "keep hand-entered items."
 
 ## Data Flow
 
-The core identity remains `series.id`. Plan entries and month instances both refer to it.
-Creating a new item creates the series first, then inserts the plan item or month
+The core reuse identity remains `series.id`. Plan entries and month instances both refer
+to it. Creating a new item creates the series first, then inserts the plan item or month
 instance.
+
+Series id is not unique inside a plan or month. The row id is the occurrence identity:
+
+- `plan_item.id` distinguishes repeated plan occurrences of the same series.
+- `txn.id` and `envelope.id` distinguish repeated month occurrences of the same series.
 
 The implementation should add explicit month insert helpers for a series-backed
 transaction and envelope. Existing one-off helpers can either be retired for main budget
 items or limited to manual envelope spending, where a standalone spending row still makes
 sense.
 
-Duplicate prevention should happen by series id:
-
-- A plan cannot add the same series twice through the add prompt.
-- A month cannot add the same standalone income/expense or envelope series twice through
-  the add prompt.
+Do not block adding the same series twice. The search prompt should allow selecting an
+already-present series and create another occurrence with its own amount.
 
 ## Error Handling
 
@@ -86,8 +95,8 @@ Empty input does not create anything. `Esc` closes the prompt without inserting 
 If the amount cannot be parsed, the amount prompt stays open with the user's text and
 shows the existing parse error status.
 
-If the selected series is already present in the current plan or month, the app should
-leave data unchanged and show a status message naming the duplicate.
+Selecting a series that is already present creates another occurrence. The user can remove
+an unwanted occurrence with the existing remove/delete command.
 
 ## Testing
 
@@ -96,7 +105,9 @@ Run the Rust test suite. Manual verification should check:
 - Plan editor `n` searches only the focused block's series.
 - Plan editor no longer advertises or responds to `i`.
 - Month dashboard `n` searches only the focused block's series.
-- Selecting an existing series inserts that series instead of creating a duplicate.
+- Selecting an existing series inserts a new occurrence of that series.
+- Selecting the same existing series twice creates two occurrences with shared
+  `series_id` and separate row ids.
 - Creating from no match creates a series and then inserts it.
 - Replace offers to keep items outside the target plan and handles kept/removed rows
   without orphaning manual envelope spending.
