@@ -59,7 +59,8 @@ Behavior:
 - `n` on income creates a new transaction series with `Direction::In`.
 - `n` on expenses creates a new transaction series with `Direction::Out`.
 - `n` on envelopes creates a new envelope series.
-- Transaction-only commands (`d`) are only advertised on income/expenses.
+- Transaction direction is not a quick-edit command; use remove/re-add to move an item
+  between income and expenses.
 - Envelope-only commands (`m`, `p`) are only advertised on envelopes.
 - Shared commands (`r`, `a`, `x`) work on the selected row in the focused block.
 

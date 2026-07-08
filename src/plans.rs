@@ -2,7 +2,7 @@
 //!
 //! Editing model: focus Income, Expenses, or Envelopes, press `n` to insert a new item
 //! there, then immediately fill label and amount through a short prompt chain. Later edits
-//! still use single-key actions (`r` label, `a` amount, `d`/`m`/`p` cycle coded fields).
+//! still use single-key actions (`r` label, `a` amount, `m`/`p` cycle envelope coded fields).
 
 use crate::{App, ConfirmAction, PlanFocus, PromptKind, Screen};
 use anyhow::Result;
@@ -224,20 +224,7 @@ pub fn handle_editor_key(
             }
         }
 
-        // Cycle the coded fields on the SERIES (affects every plan that uses it).
-        KeyCode::Char('d') => {
-            if app.plan_focus == PlanFocus::Envelopes {
-                app.status = Some("Direction applies to income and expenses".into());
-            } else if let Some(en) = selected_entry(app, entries) {
-                let next = match en.series.direction {
-                    Some(Direction::Out) | None => Direction::In,
-                    Some(Direction::In) => Direction::Out,
-                };
-                app.pending_select = Some(en.item_id.clone());
-                ops::set_series_direction(&app.conn, &en.series.id, next)?;
-                app.status = Some("Direction changed (affects all plans using this series)".into());
-            }
-        }
+        // Cycle the envelope coded fields on the SERIES (affects every plan that uses it).
         KeyCode::Char('m') => {
             if app.plan_focus != PlanFocus::Envelopes {
                 app.status = Some("Mode applies to envelopes".into());
@@ -371,8 +358,6 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
             Span::raw(" label  "),
             key(" a "),
             Span::raw(" amount  "),
-            key(" d "),
-            Span::raw(" direction  "),
             key(" x "),
             Span::raw(" remove  "),
             key(" Esc "),
@@ -605,4 +590,97 @@ fn key(label: &str) -> Span<'static> {
         label.to_string(),
         Style::default().fg(Color::Black).bg(Color::Gray),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ballpark::money::Money;
+    use ballpark::queries;
+    use ratatui::crossterm::event::KeyModifiers;
+    use rusqlite::Connection;
+    use uuid::Uuid;
+
+    fn open_test_conn() -> Connection {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ballpark-plans-{}.db", Uuid::new_v4()));
+        ballpark::db::open(&path).unwrap()
+    }
+
+    fn app_with_transaction_plan() -> (App, Plan, Vec<PlanEntry>, String) {
+        let conn = open_test_conn();
+        let plan_id = ops::create_plan(&conn, "Normal").unwrap();
+        let rent_series_id = ops::create_series(
+            &conn,
+            Kind::Transaction,
+            "Rent",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        ops::add_plan_item(
+            &conn,
+            &plan_id,
+            &rent_series_id,
+            Money::from_dollars(1800.0),
+        )
+        .unwrap();
+
+        let plan = queries::get_plan(&conn, &plan_id).unwrap().unwrap();
+        let entries = queries::load_plan_entries(&conn, &plan_id).unwrap();
+        let app = App {
+            conn,
+            screen: Screen::PlanEditor {
+                plan_id: plan_id.clone(),
+            },
+            should_quit: false,
+            dash_focus: crate::DashFocus::Income,
+            viewed_year: 2026,
+            viewed_month: 9,
+            dash_income_sel: 0,
+            dash_expense_sel: 0,
+            dash_env_sel: 0,
+            dash_acct_sel: 0,
+            plans_sel: 0,
+            plan_focus: PlanFocus::Expenses,
+            editor_income_sel: 0,
+            editor_expense_sel: 0,
+            editor_env_sel: 0,
+            picker_sel: 0,
+            pending_select: None,
+            pending_dash_txn: None,
+            pending_dash_env: None,
+            modal: None,
+            status: None,
+        };
+
+        (app, plan, entries, rent_series_id)
+    }
+
+    fn direction_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn direction_key_does_not_change_transaction_series_direction() {
+        let (mut app, plan, entries, rent_series_id) = app_with_transaction_plan();
+        let rent = entries
+            .iter()
+            .find(|entry| entry.series.id == rent_series_id)
+            .unwrap();
+        assert_eq!(rent.series.direction, Some(Direction::Out));
+
+        handle_editor_key(&mut app, direction_key(), &plan, &entries).unwrap();
+
+        assert!(app.status.is_none());
+        assert!(app.pending_select.is_none());
+        let refreshed: Direction = app
+            .conn
+            .query_row("SELECT direction FROM series WHERE id = ?1", [&rent_series_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(refreshed, Direction::Out);
+    }
 }

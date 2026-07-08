@@ -110,10 +110,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         KeyCode::Char('n') => add_adhoc(app, view)?,
 
         // The edit verbs mirror the plan editor's keys and remain ad-hoc-only here.
-        // Deletion is separate: stamped rows are already month-owned snapshots.
+        // Direction changes intentionally stay out of this fast path: moving between
+        // income and expenses is safer as remove/re-add.
         KeyCode::Char('r') => edit_label(app, view), // rename / label
         KeyCode::Char('a') => edit_amount(app, view), // amount
-        KeyCode::Char('d') => cycle_direction(app, view)?, // transaction direction
         KeyCode::Char('m') => cycle_mode(app, view)?, // envelope mode
         KeyCode::Char('t') => cycle_period(app, view)?, // envelope period type
         KeyCode::Char('s') => feed_spending(app, view), // file spending into a manual envelope
@@ -276,23 +276,6 @@ fn edit_amount(app: &mut App, view: &MonthView) {
             );
         }
     }
-}
-
-/// `d`: flip an ad-hoc transaction's direction (out ⇄ in).
-fn cycle_direction(app: &mut App, view: &MonthView) -> Result<()> {
-    if let Some(t) = selected_txn(app, view) {
-        if t.series_id.is_some() {
-            app.status = Some(PLAN_EDIT_HINT.into());
-        } else {
-            let next = match t.direction {
-                Direction::Out => Direction::In,
-                Direction::In => Direction::Out,
-            };
-            app.pending_dash_txn = Some(t.id.clone());
-            ops::set_txn_direction(&app.conn, &t.id, next)?;
-        }
-    }
-    Ok(())
 }
 
 /// `m`: flip an ad-hoc envelope's mode (automatic ⇄ manual).
@@ -520,7 +503,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             Span::raw(" paid  "),
             key(" n "),
             Span::raw(" add  "),
-            key(" r/a/d "),
+            key(" r/a "),
             Span::raw(" edit item  "),
             key(" x "),
             Span::raw(" del  "),
@@ -965,6 +948,36 @@ mod tests {
 
     fn delete_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+    }
+
+    fn direction_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn direction_key_does_not_move_transaction_between_blocks() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Expenses;
+        let view = month_view(&app);
+        let rent = view
+            .standalone
+            .iter()
+            .find(|txn| txn.label == "Rent")
+            .unwrap();
+        assert_eq!(rent.direction, Direction::Out);
+        let rent_id = rent.id.clone();
+
+        handle_key(&mut app, direction_key(), &Some(view)).unwrap();
+
+        assert!(app.status.is_none());
+        assert!(app.pending_dash_txn.is_none());
+        let refreshed = month_view(&app);
+        let rent = refreshed
+            .standalone
+            .iter()
+            .find(|txn| txn.id == rent_id)
+            .unwrap();
+        assert_eq!(rent.direction, Direction::Out);
     }
 
     #[test]
