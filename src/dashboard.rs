@@ -9,12 +9,12 @@ use ballpark::models::{AccountType, Direction, Mode, PeriodType};
 use ballpark::money::Money;
 use ballpark::view::{EnvelopeRow, MonthView};
 use ballpark::{ops, queries};
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
 pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Result<()> {
     // Clear any leftover status the moment the user acts again.
@@ -50,7 +50,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
                 PromptKind::GoToMonth,
             ),
             // Only leave the header if there's a month whose panels we can move onto.
-            KeyCode::Tab if view.is_some() => app.dash_focus = DashFocus::Transactions,
+            KeyCode::Tab if view.is_some() => app.dash_focus = DashFocus::Accounts,
             _ => {}
         }
         return Ok(());
@@ -60,21 +60,27 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
     let Some(view) = view else { return Ok(()) };
 
     match key.code {
-        // Tab cycles Transactions → Envelopes → Accounts → Header (Header→Transactions above).
+        // Tab cycles Accounts → Income → Expenses → Envelopes → Header (Header→Accounts above).
         KeyCode::Tab => {
             app.dash_focus = match app.dash_focus {
-                DashFocus::Transactions => DashFocus::Envelopes,
-                DashFocus::Envelopes => DashFocus::Accounts,
-                DashFocus::Accounts => DashFocus::Header,
-                DashFocus::Header => DashFocus::Transactions, // unreachable; keeps match total
+                DashFocus::Accounts => DashFocus::Income,
+                DashFocus::Income => DashFocus::Expenses,
+                DashFocus::Expenses => DashFocus::Envelopes,
+                DashFocus::Envelopes => DashFocus::Header,
+                DashFocus::Header => DashFocus::Accounts, // unreachable; keeps match total
             };
         }
 
         // j/k move within the *focused* list.
         KeyCode::Char('j') | KeyCode::Down => match app.dash_focus {
-            DashFocus::Transactions => {
-                if app.dash_sel + 1 < view.standalone.len() {
-                    app.dash_sel += 1;
+            DashFocus::Income => {
+                if app.dash_income_sel + 1 < txn_count(view, Direction::In) {
+                    app.dash_income_sel += 1;
+                }
+            }
+            DashFocus::Expenses => {
+                if app.dash_expense_sel + 1 < txn_count(view, Direction::Out) {
+                    app.dash_expense_sel += 1;
                 }
             }
             DashFocus::Envelopes => {
@@ -90,7 +96,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
             DashFocus::Header => {}
         },
         KeyCode::Char('k') | KeyCode::Up => match app.dash_focus {
-            DashFocus::Transactions => app.dash_sel = app.dash_sel.saturating_sub(1),
+            DashFocus::Income => app.dash_income_sel = app.dash_income_sel.saturating_sub(1),
+            DashFocus::Expenses => app.dash_expense_sel = app.dash_expense_sel.saturating_sub(1),
             DashFocus::Envelopes => app.dash_env_sel = app.dash_env_sel.saturating_sub(1),
             DashFocus::Accounts => app.dash_acct_sel = app.dash_acct_sel.saturating_sub(1),
             DashFocus::Header => {}
@@ -105,13 +112,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         // The create-then-edit verbs. Each mirrors the plan editor's keys and, on the
         // transactions/envelopes panels, acts on the *selected ad-hoc row* (plan-derived
         // rows are managed in Plans — `edit_target`/`selected_*` enforce that with a nudge).
-        KeyCode::Char('r') => edit_label(app, view),   // rename / label
-        KeyCode::Char('a') => edit_amount(app, view),  // amount
+        KeyCode::Char('r') => edit_label(app, view), // rename / label
+        KeyCode::Char('a') => edit_amount(app, view), // amount
         KeyCode::Char('d') => cycle_direction(app, view)?, // transaction direction
-        KeyCode::Char('m') => cycle_mode(app, view)?,      // envelope mode
-        KeyCode::Char('t') => cycle_period(app, view)?,    // envelope period type
-        KeyCode::Char('s') => feed_spending(app, view),    // file spending into a manual envelope
-        KeyCode::Char('x') => delete_adhoc(app, view),     // delete an ad-hoc row
+        KeyCode::Char('m') => cycle_mode(app, view)?, // envelope mode
+        KeyCode::Char('t') => cycle_period(app, view)?, // envelope period type
+        KeyCode::Char('s') => feed_spending(app, view), // file spending into a manual envelope
+        KeyCode::Char('x') => delete_adhoc(app, view), // delete an ad-hoc row
 
         // `e` is the Accounts panel's edit alias (Enter also works there).
         KeyCode::Char('e') => {
@@ -127,7 +134,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
                         app.open_text(
                             format!("Credit limit for {}", acct.name),
                             crate::amount_edit_string(acct.credit_limit.unwrap_or(Money::ZERO)),
-                            PromptKind::CardLimit { id: acct.id.clone() },
+                            PromptKind::CardLimit {
+                                id: acct.id.clone(),
+                            },
                         );
                     }
                 }
@@ -138,11 +147,33 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
     Ok(())
 }
 
-/// The currently-selected standalone transaction, if the Transactions panel is focused.
+/// The currently-selected standalone transaction, if an income/expense panel is focused.
 fn selected_txn<'v>(app: &App, view: &'v MonthView) -> Option<&'v ballpark::models::Txn> {
-    (app.dash_focus == DashFocus::Transactions)
-        .then(|| view.standalone.get(app.dash_sel))
-        .flatten()
+    match app.dash_focus {
+        DashFocus::Income => selected_txn_by_direction(view, Direction::In, app.dash_income_sel),
+        DashFocus::Expenses => {
+            selected_txn_by_direction(view, Direction::Out, app.dash_expense_sel)
+        }
+        _ => None,
+    }
+}
+
+fn selected_txn_by_direction<'v>(
+    view: &'v MonthView,
+    direction: Direction,
+    selected: usize,
+) -> Option<&'v ballpark::models::Txn> {
+    view.standalone
+        .iter()
+        .filter(|txn| txn.direction == direction)
+        .nth(selected)
+}
+
+fn txn_count(view: &MonthView, direction: Direction) -> usize {
+    view.standalone
+        .iter()
+        .filter(|txn| txn.direction == direction)
+        .count()
 }
 
 /// The currently-selected envelope row, if the Envelopes panel is focused.
@@ -156,26 +187,40 @@ fn selected_env<'v>(app: &App, view: &'v MonthView) -> Option<&'v EnvelopeRow> {
 /// stamped plan's snapshot, edited in Plans — the dashboard only edits ad-hoc rows.
 const PLAN_ROW_HINT: &str = "That's a plan item — edit it in Plans (p), or add an ad-hoc one (n)";
 
-/// Add a new ad-hoc row to whichever list is focused, then select it once it reloads. New
-/// items start with placeholder values the user refines with r/a/d (txn) or r/a/m/t (env).
+/// Start a pending ad-hoc item for whichever budget block is focused. Nothing is inserted
+/// until the label and amount prompts both complete.
 fn add_adhoc(app: &mut App, view: &MonthView) -> Result<()> {
     match app.dash_focus {
-        DashFocus::Transactions => {
-            let id = ops::add_oneoff_txn(&app.conn, &view.month.id, "New item", Direction::Out, Money::ZERO)?;
-            app.pending_dash_txn = Some(id);
-            app.status = Some("Added a one-off — set label (r), amount (a), direction (d)".into());
-        }
+        DashFocus::Income => app.open_text(
+            "Label",
+            "",
+            PromptKind::DraftTxnLabel {
+                month_id: view.month.id.clone(),
+                direction: Direction::In,
+            },
+        ),
+        DashFocus::Expenses => app.open_text(
+            "Label",
+            "",
+            PromptKind::DraftTxnLabel {
+                month_id: view.month.id.clone(),
+                direction: Direction::Out,
+            },
+        ),
         DashFocus::Envelopes => {
             // Seed the mode from the global default, exactly like a new series does.
             let mode = queries::default_mode(&app.conn)?;
-            let id = ops::add_oneoff_envelope(
-                &app.conn, &view.month.id, "New envelope", Money::ZERO, PeriodType::Monthly, mode,
-            )?;
-            app.pending_dash_env = Some(id);
-            app.status = Some("Added an envelope — set label (r), amount (a), mode (m)".into());
+            app.open_text(
+                "Envelope label",
+                "",
+                PromptKind::DraftEnvelopeLabel {
+                    month_id: view.month.id.clone(),
+                    mode,
+                },
+            );
         }
         // The other panels have their own creation flows (accounts) or none (header).
-        _ => app.status = Some("Focus Bills or Envelopes to add an ad-hoc item".into()),
+        _ => app.status = Some("Focus Income, Expenses, or Envelopes to add an ad-hoc item".into()),
     }
     Ok(())
 }
@@ -186,13 +231,23 @@ fn edit_label(app: &mut App, view: &MonthView) {
         if t.series_id.is_some() {
             app.status = Some(PLAN_ROW_HINT.into());
         } else {
-            app.open_text("Label", t.label.clone(), PromptKind::TxnLabel { id: t.id.clone() });
+            app.open_text_replace_on_type(
+                "Label",
+                t.label.clone(),
+                PromptKind::TxnLabel { id: t.id.clone() },
+            );
         }
     } else if let Some(e) = selected_env(app, view) {
         if e.envelope.series_id.is_some() {
             app.status = Some(PLAN_ROW_HINT.into());
         } else {
-            app.open_text("Envelope label", e.envelope.label.clone(), PromptKind::EnvelopeLabel { id: e.envelope.id.clone() });
+            app.open_text_replace_on_type(
+                "Envelope label",
+                e.envelope.label.clone(),
+                PromptKind::EnvelopeLabel {
+                    id: e.envelope.id.clone(),
+                },
+            );
         }
     }
 }
@@ -203,13 +258,23 @@ fn edit_amount(app: &mut App, view: &MonthView) {
         if t.series_id.is_some() {
             app.status = Some(PLAN_ROW_HINT.into());
         } else {
-            app.open_text("Amount (dollars)", crate::amount_edit_string(t.amount), PromptKind::TxnAmount { id: t.id.clone() });
+            app.open_text(
+                "Amount (dollars)",
+                crate::amount_edit_string(t.amount),
+                PromptKind::TxnAmount { id: t.id.clone() },
+            );
         }
     } else if let Some(e) = selected_env(app, view) {
         if e.envelope.series_id.is_some() {
             app.status = Some(PLAN_ROW_HINT.into());
         } else {
-            app.open_text("Envelope amount (dollars)", crate::amount_edit_string(e.envelope.amount), PromptKind::EnvelopeAmount { id: e.envelope.id.clone() });
+            app.open_text(
+                "Envelope amount (dollars)",
+                crate::amount_edit_string(e.envelope.amount),
+                PromptKind::EnvelopeAmount {
+                    id: e.envelope.id.clone(),
+                },
+            );
         }
     }
 }
@@ -224,6 +289,7 @@ fn cycle_direction(app: &mut App, view: &MonthView) -> Result<()> {
                 Direction::Out => Direction::In,
                 Direction::In => Direction::Out,
             };
+            app.pending_dash_txn = Some(t.id.clone());
             ops::set_txn_direction(&app.conn, &t.id, next)?;
         }
     }
@@ -272,10 +338,16 @@ fn feed_spending(app: &mut App, view: &MonthView) {
             Mode::Manual => app.open_text(
                 format!("Spend in “{}” (dollars)", e.envelope.label),
                 String::new(),
-                PromptKind::EnvelopeSpend { envelope_id: e.envelope.id.clone(), month_id: view.month.id.clone() },
+                PromptKind::EnvelopeSpend {
+                    envelope_id: e.envelope.id.clone(),
+                    month_id: view.month.id.clone(),
+                },
             ),
             Mode::Automatic => {
-                app.status = Some("Automatic envelopes accrue by time; switch to manual (m) to file spending".into());
+                app.status = Some(
+                    "Automatic envelopes accrue by time; switch to manual (m) to file spending"
+                        .into(),
+                );
             }
         }
     }
@@ -287,7 +359,10 @@ fn delete_adhoc(app: &mut App, view: &MonthView) {
         if t.series_id.is_some() {
             app.status = Some(PLAN_ROW_HINT.into());
         } else {
-            app.open_confirm(format!("Delete “{}”?", t.label), ConfirmAction::DeleteTxn { id: t.id.clone() });
+            app.open_confirm(
+                format!("Delete “{}”?", t.label),
+                ConfirmAction::DeleteTxn { id: t.id.clone() },
+            );
         }
     } else if let Some(e) = selected_env(app, view) {
         if e.envelope.series_id.is_some() {
@@ -295,7 +370,9 @@ fn delete_adhoc(app: &mut App, view: &MonthView) {
         } else {
             app.open_confirm(
                 format!("Delete envelope “{}” and its spending?", e.envelope.label),
-                ConfirmAction::DeleteEnvelope { id: e.envelope.id.clone() },
+                ConfirmAction::DeleteEnvelope {
+                    id: e.envelope.id.clone(),
+                },
             );
         }
     }
@@ -309,15 +386,17 @@ fn step_month(app: &mut App, delta: i32) {
     let zero_based = app.viewed_year * 12 + (app.viewed_month as i32 - 1) + delta;
     app.viewed_year = zero_based.div_euclid(12);
     app.viewed_month = zero_based.rem_euclid(12) as u32 + 1;
-    app.dash_sel = 0;
+    app.dash_income_sel = 0;
+    app.dash_expense_sel = 0;
+    app.dash_env_sel = 0;
     app.dash_acct_sel = 0;
 }
 
 /// Do the focused panel's action: settle a bill, or open the balance-edit prompt.
 fn act_on_focus(app: &mut App, view: &MonthView) -> Result<()> {
     match app.dash_focus {
-        DashFocus::Transactions => {
-            if let Some(txn) = view.standalone.get(app.dash_sel) {
+        DashFocus::Income | DashFocus::Expenses => {
+            if let Some(txn) = selected_txn(app, view) {
                 ops::toggle_settled(&app.conn, &txn.id, txn.settled)?;
             }
         }
@@ -331,14 +410,18 @@ fn act_on_focus(app: &mut App, view: &MonthView) -> Result<()> {
                     AccountType::Checking => app.open_text(
                         format!("New balance for {}", acct.name),
                         crate::amount_edit_string(acct.balance),
-                        PromptKind::AccountBalance { id: acct.id.clone() },
+                        PromptKind::AccountBalance {
+                            id: acct.id.clone(),
+                        },
                     ),
                     // Credit card: the primary edit is available credit (owed is derived);
                     // the limit gets its own key (`l`).
                     AccountType::CreditCard => app.open_text(
                         format!("Available credit for {}", acct.name),
                         crate::amount_edit_string(acct.available_credit.unwrap_or(Money::ZERO)),
-                        PromptKind::CardAvailable { id: acct.id.clone() },
+                        PromptKind::CardAvailable {
+                            id: acct.id.clone(),
+                        },
                     ),
                 }
             }
@@ -367,24 +450,28 @@ pub fn draw(frame: &mut Frame, app: &App, view: &Option<MonthView>) {
     draw_footer(frame, footer, app, view);
 }
 
-/// The full month view: the "what's left" rollup on top, then the three columns
-/// (accounts, bills, envelopes).
+/// The full month view: compact accounts and the "what's left" rollup on top, then
+/// budget blocks below (income/expenses stacked, envelopes beside them).
 fn draw_month_body(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
     // 7 rows for "what's left" so all breakdown lines (funds/card, income/bills/envelopes,
     // carry) fit inside the borders.
-    let [whats_left, body] =
-        Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).areas(area);
+    let [top, body] = Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).areas(area);
 
-    let [acct_area, txn_area, env_area] = Layout::horizontal([
-        Constraint::Percentage(30),
-        Constraint::Percentage(38),
-        Constraint::Percentage(32),
+    let [acct_area, whats_left] =
+        Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(top);
+
+    let [left_items, env_area] =
+        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)]).areas(body);
+    let [income_area, expense_area] = Layout::vertical([
+        Constraint::Length(crate::income_block_height(txn_count(view, Direction::In))),
+        Constraint::Min(0),
     ])
-    .areas(body);
+    .areas(left_items);
 
-    draw_whats_left(frame, whats_left, view);
     draw_accounts(frame, acct_area, app, view);
-    draw_transactions(frame, txn_area, app, view);
+    draw_whats_left(frame, whats_left, view);
+    draw_transactions(frame, income_area, app, view, Direction::In);
+    draw_transactions(frame, expense_area, app, view, Direction::Out);
     draw_envelopes(frame, env_area, app, view);
 }
 
@@ -397,8 +484,14 @@ fn draw_missing_month(frame: &mut Frame, area: Rect, app: &App) {
         Line::raw(""),
         Line::from(format!("  {label} isn't stamped yet.").bold()),
         Line::raw(""),
-        Line::from(Span::styled("  Press p to open Plans and stamp one onto it,", dim)),
-        Line::from(Span::styled("  or k/j to step months and m to jump to one.", dim)),
+        Line::from(Span::styled(
+            "  Press p to open Plans and stamp one onto it,",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  or k/j to step months and m to jump to one.",
+            dim,
+        )),
     ];
     let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Ballpark "));
     frame.render_widget(p, area);
@@ -415,38 +508,62 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
                 spans.push(Span::raw(" panel  "));
             }
             spans.extend([
-                key(" k/j "), Span::raw(" prev/next month  "),
-                key(" m "), Span::raw(" go to month  "),
-                key(" p "), Span::raw(" plans  "),
-                key(" q "), Span::raw(" quit"),
+                key(" k/j "),
+                Span::raw(" prev/next month  "),
+                key(" m "),
+                Span::raw(" go to month  "),
+                key(" p "),
+                Span::raw(" plans  "),
+                key(" q "),
+                Span::raw(" quit"),
             ]);
             Line::from(spans)
         }
-        DashFocus::Transactions => Line::from(vec![
-            key(" Tab "), Span::raw(" panel  "),
-            key(" j/k "), Span::raw(" move  "),
-            key(" Enter "), Span::raw(" paid  "),
-            key(" n "), Span::raw(" add  "),
-            key(" r/a/d "), Span::raw(" edit  "),
-            key(" x "), Span::raw(" del  "),
-            key(" q "), Span::raw(" quit"),
+        DashFocus::Income | DashFocus::Expenses => Line::from(vec![
+            key(" Tab "),
+            Span::raw(" panel  "),
+            key(" j/k "),
+            Span::raw(" move  "),
+            key(" Enter "),
+            Span::raw(" paid  "),
+            key(" n "),
+            Span::raw(" add  "),
+            key(" r/a/d "),
+            Span::raw(" edit item  "),
+            key(" x "),
+            Span::raw(" del  "),
+            key(" q "),
+            Span::raw(" quit"),
         ]),
         DashFocus::Envelopes => Line::from(vec![
-            key(" Tab "), Span::raw(" panel  "),
-            key(" j/k "), Span::raw(" move  "),
-            key(" s "), Span::raw(" spend  "),
-            key(" n "), Span::raw(" add  "),
-            key(" r/a/m/t "), Span::raw(" edit  "),
-            key(" x "), Span::raw(" del  "),
-            key(" q "), Span::raw(" quit"),
+            key(" Tab "),
+            Span::raw(" panel  "),
+            key(" j/k "),
+            Span::raw(" move  "),
+            key(" s "),
+            Span::raw(" spend  "),
+            key(" n "),
+            Span::raw(" add  "),
+            key(" r/a/m/t "),
+            Span::raw(" edit  "),
+            key(" x "),
+            Span::raw(" del  "),
+            key(" q "),
+            Span::raw(" quit"),
         ]),
         DashFocus::Accounts => Line::from(vec![
-            key(" Tab "), Span::raw(" panel  "),
-            key(" j/k "), Span::raw(" move  "),
-            key(" Enter "), Span::raw(" edit  "),
-            key(" l "), Span::raw(" card limit  "),
-            key(" p "), Span::raw(" plans  "),
-            key(" q "), Span::raw(" quit"),
+            key(" Tab "),
+            Span::raw(" panel  "),
+            key(" j/k "),
+            Span::raw(" move  "),
+            key(" Enter "),
+            Span::raw(" edit  "),
+            key(" l "),
+            Span::raw(" card limit  "),
+            key(" p "),
+            Span::raw(" plans  "),
+            key(" q "),
+            Span::raw(" quit"),
         ]),
     };
     crate::draw_status_footer(frame, area, hints, &app.status);
@@ -460,16 +577,27 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
         .iter()
         .map(|a| match a.account_type {
             AccountType::Checking => {
-                let color = if a.balance.cents() < 0 { Color::Red } else { Color::Green };
+                let color = if a.balance.cents() < 0 {
+                    Color::Red
+                } else {
+                    Color::Green
+                };
                 ListItem::new(Line::from(vec![
                     Span::raw(format!("{:<13}", crate::truncate(&a.name, 13))),
-                    Span::styled(format!("{:>10}", a.balance.to_string()), Style::default().fg(color)),
+                    Span::styled(
+                        format!("{:>10}", a.balance.to_string()),
+                        Style::default().fg(color),
+                    ),
                 ]))
             }
             AccountType::CreditCard => {
                 let owed = a.owed();
                 // Owed > 0 is a debt (red); ≤ 0 is a statement credit in your favor (green).
-                let owed_color = if owed.cents() > 0 { Color::Red } else { Color::Green };
+                let owed_color = if owed.cents() > 0 {
+                    Color::Red
+                } else {
+                    Color::Green
+                };
                 let line1 = Line::from(vec![
                     Span::raw(format!("{:<13}", crate::truncate(&a.name, 13))),
                     Span::styled(format!("owed {}", owed), Style::default().fg(owed_color)),
@@ -490,7 +618,11 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
     let focused = app.dash_focus == DashFocus::Accounts;
     let mut state = ListState::default();
     // Only show a highlight on the focused panel, so it's obvious which list is live.
-    state.select(if focused { Some(app.dash_acct_sel) } else { None });
+    state.select(if focused {
+        Some(app.dash_acct_sel)
+    } else {
+        None
+    });
 
     let list = List::new(items)
         .block(panel_block(" Accounts ", focused))
@@ -501,7 +633,9 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
 
 /// A bordered block whose border turns cyan when its panel is focused.
 fn panel_block(title: &str, focused: bool) -> Block<'_> {
-    let block = Block::default().borders(Borders::ALL).title(title.to_string());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string());
     if focused {
         block.border_style(Style::default().fg(Color::Cyan))
     } else {
@@ -519,12 +653,21 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, view: Option<&MonthView
         // days *since* the 1st (0 on the 1st) — right for accrual, but as a day-of-month
         // label it reads a day short, so +1 turns it into the calendar day (7th → "day 7").
         Some(v) if v.is_current => {
-            format!(" Ballpark — {}   (day {} of {}) ", label, v.days_elapsed + 1, v.month.days_in_month)
+            format!(
+                " Ballpark — {}   (day {} of {}) ",
+                label,
+                v.days_elapsed + 1,
+                v.month.days_in_month
+            )
         }
         // Any other stamped month is wholly in the past or future (only the calendar month
         // contains today), so `days_elapsed` at either extreme tells us which.
         Some(v) => {
-            let when = if v.days_elapsed >= v.month.days_in_month { "past" } else { "upcoming" };
+            let when = if v.days_elapsed >= v.month.days_in_month {
+                "past"
+            } else {
+                "upcoming"
+            };
             format!(" Ballpark — {label}   ({when}) ")
         }
         None => format!(" Ballpark — {label}   (not stamped) "),
@@ -545,66 +688,98 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, view: Option<&MonthView
 
 fn draw_whats_left(frame: &mut Frame, area: Rect, view: &MonthView) {
     let wl = &view.whats_left;
-    let headline_color = if wl.whats_left.cents() >= 0 { Color::Green } else { Color::Red };
+    let result_color = if wl.whats_left.cents() >= 0 {
+        Color::Green
+    } else {
+        Color::Red
+    };
 
-    let mut lines = vec![
-        Line::from(vec![
-            Span::raw("What's left:  "),
-            Span::styled(
-                wl.whats_left.to_string(),
-                Style::default().fg(headline_color).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::raw(""),
-    ];
+    let mut lines = Vec::new();
 
     // The account-derived terms (funds, card debt, carry) are only part of the headline for
     // the current month; the view already zeroed them off-month. So we only *show* them for
     // the current month, and otherwise say why the balance is income − bills − envelopes.
     if view.is_current {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{:>12}", wl.funds_available.to_string()), Style::default().fg(Color::Cyan)),
-            Span::raw("  funds"),
-            Span::raw("   − "),
-            Span::styled(wl.card_debt.to_string(), Style::default().fg(Color::Red)),
-            Span::raw(" card debt"),
-        ]));
+        let mut row = summary_term(wl.funds_available, "funds", Color::Cyan);
+        row.push(Span::raw("  "));
+        row.extend(summary_term(
+            Money(-wl.card_debt.cents()),
+            "card debt",
+            Color::Red,
+        ));
+        lines.push(Line::from(row));
     }
 
-    lines.push(Line::from(vec![
-        Span::raw("   + "),
-        Span::styled(wl.income_remaining.to_string(), Style::default().fg(Color::Green)),
-        Span::raw(" income left    − "),
-        Span::styled(wl.bills_remaining.to_string(), Style::default().fg(Color::Red)),
-        Span::raw(" bills left    − "),
-        Span::styled(wl.envelopes_remaining.to_string(), Style::default().fg(Color::Magenta)),
-        Span::raw(" envelopes"),
-    ]));
+    let mut row = summary_term(wl.income_remaining, "income left", Color::Green);
+    row.push(Span::raw("  "));
+    row.extend(summary_term(
+        Money(-wl.bills_remaining.cents()),
+        "bills left",
+        Color::Red,
+    ));
+    lines.push(Line::from(row));
 
     if view.is_current {
-        // Net carry effect: already signed (checking buffers pull down, card carryovers
-        // push up), so it's shown as a single "+ <signed>" term folded into the total.
-        lines.push(Line::from(vec![
-            Span::raw("   + "),
-            Span::styled(wl.carry_adjustment.to_string(), Style::default().fg(Color::Yellow)),
-            Span::raw(" carry (buffers −, card carryovers +)"),
-        ]));
+        let mut row = summary_term(
+            Money(-wl.envelopes_remaining.cents()),
+            "envelopes",
+            Color::Magenta,
+        );
+        row.push(Span::raw("  "));
+        row.extend(summary_term(wl.carry_adjustment, "carry", Color::Yellow));
+        lines.push(Line::from(row));
     } else {
+        lines.push(Line::from(summary_term(
+            Money(-wl.envelopes_remaining.cents()),
+            "envelopes",
+            Color::Magenta,
+        )));
         lines.push(Line::from(Span::styled(
-            "   account balances count only in the current month",
+            "  account balances count only in the current month",
             Style::default().fg(Color::DarkGray),
         )));
     }
 
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" What's left "));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("= "),
+        Span::styled(
+            format!("{:>10}", wl.whats_left.to_string()),
+            Style::default()
+                .fg(result_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  what's left"),
+    ]));
+
+    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Summary "));
     frame.render_widget(p, area);
 }
 
-fn draw_transactions(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
+fn summary_term(amount: Money, label: &str, color: Color) -> Vec<Span<'static>> {
+    let sign = if amount.cents() < 0 { "−" } else { "+" };
+    let amount = Money(amount.cents().abs());
+    vec![
+        Span::raw(format!("{sign} ")),
+        Span::styled(
+            format!("{:>10}", amount.to_string()),
+            Style::default().fg(color),
+        ),
+        Span::raw(format!("  {:<width$}", label, width = 11)),
+    ]
+}
+
+fn draw_transactions(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    view: &MonthView,
+    direction: Direction,
+) {
     let items: Vec<ListItem> = view
         .standalone
         .iter()
+        .filter(|t| t.direction == direction)
         .map(|t| {
             let check = if t.settled { "[x]" } else { "[ ]" };
             let sign = match t.direction {
@@ -627,14 +802,25 @@ fn draw_transactions(frame: &mut Frame, area: Rect, app: &App, view: &MonthView)
         })
         .collect();
 
-    let focused = app.dash_focus == DashFocus::Transactions;
+    let (title, focused, selected) = match direction {
+        Direction::In => (
+            " Income ",
+            app.dash_focus == DashFocus::Income,
+            app.dash_income_sel,
+        ),
+        Direction::Out => (
+            " Expenses ",
+            app.dash_focus == DashFocus::Expenses,
+            app.dash_expense_sel,
+        ),
+    };
     let mut state = ListState::default();
-    if focused && !view.standalone.is_empty() {
-        state.select(Some(app.dash_sel));
+    if focused && !items.is_empty() {
+        state.select(Some(selected));
     }
 
     let list = List::new(items)
-        .block(panel_block(" Income & Bills ", focused))
+        .block(panel_block(title, focused))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▌");
     frame.render_stateful_widget(list, area, &mut state);
@@ -699,5 +885,8 @@ fn meter_bar(consumed: Money, total: Money, width: usize) -> String {
 
 /// A small pill-styled key hint, e.g. ` j/k `.
 fn key(label: &str) -> Span<'_> {
-    Span::styled(label.to_string(), Style::default().fg(Color::Black).bg(Color::Gray))
+    Span::styled(
+        label.to_string(),
+        Style::default().fg(Color::Black).bg(Color::Gray),
+    )
 }

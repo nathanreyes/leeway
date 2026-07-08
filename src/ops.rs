@@ -143,7 +143,10 @@ pub fn restamp_merge(conn: &mut Connection, month_id: &str, plan_id: &str) -> Re
             },
         }
     }
-    tx.execute("UPDATE month SET plan_id = ?1 WHERE id = ?2", rusqlite::params![plan_id, month_id])?;
+    tx.execute(
+        "UPDATE month SET plan_id = ?1 WHERE id = ?2",
+        rusqlite::params![plan_id, month_id],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -209,7 +212,10 @@ pub fn restamp_replace(
                     // Plan-derived but removed from the plan: detach any surviving manual
                     // spending to standalone (so kept hand-entered data isn't orphaned by
                     // the FK), then drop the envelope.
-                    tx.execute("UPDATE txn SET envelope_id = NULL WHERE envelope_id = ?1", [&e.id])?;
+                    tx.execute(
+                        "UPDATE txn SET envelope_id = NULL WHERE envelope_id = ?1",
+                        [&e.id],
+                    )?;
                     tx.execute("DELETE FROM envelope WHERE id = ?1", [&e.id])?;
                 }
             }
@@ -223,13 +229,20 @@ pub fn restamp_replace(
         }
     }
 
-    tx.execute("UPDATE month SET plan_id = ?1 WHERE id = ?2", rusqlite::params![plan_id, month_id])?;
+    tx.execute(
+        "UPDATE month SET plan_id = ?1 WHERE id = ?2",
+        rusqlite::params![plan_id, month_id],
+    )?;
     tx.commit()?;
     Ok(())
 }
 
 /// Find a month's envelope instance for a series, if present.
-fn find_month_envelope(conn: &Connection, month_id: &str, series_id: &str) -> Result<Option<String>> {
+fn find_month_envelope(
+    conn: &Connection,
+    month_id: &str,
+    series_id: &str,
+) -> Result<Option<String>> {
     let id = conn
         .query_row(
             "SELECT id FROM envelope WHERE month_id = ?1 AND series_id = ?2 LIMIT 1",
@@ -241,7 +254,11 @@ fn find_month_envelope(conn: &Connection, month_id: &str, series_id: &str) -> Re
 }
 
 /// Find a month's standalone txn instance for a series, returning its id and settled flag.
-fn find_month_txn(conn: &Connection, month_id: &str, series_id: &str) -> Result<Option<(String, bool)>> {
+fn find_month_txn(
+    conn: &Connection,
+    month_id: &str,
+    series_id: &str,
+) -> Result<Option<(String, bool)>> {
     let row = conn
         .query_row(
             "SELECT id, settled FROM txn WHERE month_id = ?1 AND series_id = ?2 LIMIT 1",
@@ -298,7 +315,12 @@ fn refresh_txn(conn: &Connection, id: &str, entry: &PlanEntry) -> Result<()> {
 /// Mark a transaction settled at `actual` (prefilled with its current amount, editable).
 /// Because `amount_cents` is NOT NULL, "marking paid requires an amount" holds by
 /// construction — there's never a null to chase.
-pub fn mark_paid(conn: &Connection, txn_id: &str, actual: Money, date_paid: Option<&str>) -> Result<()> {
+pub fn mark_paid(
+    conn: &Connection,
+    txn_id: &str,
+    actual: Money,
+    date_paid: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "UPDATE txn SET amount_cents = ?1, settled = 1, date_paid = ?2 WHERE id = ?3",
         rusqlite::params![actual, date_paid, txn_id],
@@ -372,13 +394,19 @@ pub fn set_available_credit(conn: &Connection, account_id: &str, available: Mone
 /// Create an empty plan and return its id.
 pub fn create_plan(conn: &Connection, name: &str) -> Result<String> {
     let id = new_id();
-    conn.execute("INSERT INTO plan (id, name) VALUES (?1, ?2)", rusqlite::params![id, name])?;
+    conn.execute(
+        "INSERT INTO plan (id, name) VALUES (?1, ?2)",
+        rusqlite::params![id, name],
+    )?;
     Ok(id)
 }
 
 /// Rename a plan. Labels are cosmetic — no instance references a plan's name.
 pub fn rename_plan(conn: &Connection, plan_id: &str, name: &str) -> Result<()> {
-    conn.execute("UPDATE plan SET name = ?1 WHERE id = ?2", rusqlite::params![name, plan_id])?;
+    conn.execute(
+        "UPDATE plan SET name = ?1 WHERE id = ?2",
+        rusqlite::params![name, plan_id],
+    )?;
     Ok(())
 }
 
@@ -426,7 +454,12 @@ pub fn create_series(
 
 /// Add an existing series to a plan at $0 (the per-plan budgeted amount, edited later).
 /// Returns the new plan_item id.
-pub fn add_plan_item(conn: &Connection, plan_id: &str, series_id: &str, amount: Money) -> Result<String> {
+pub fn add_plan_item(
+    conn: &Connection,
+    plan_id: &str,
+    series_id: &str,
+    amount: Money,
+) -> Result<String> {
     let id = new_id();
     conn.execute(
         "INSERT INTO plan_item (id, plan_id, series_id, amount_cents) VALUES (?1, ?2, ?3, ?4)",
@@ -435,18 +468,36 @@ pub fn add_plan_item(conn: &Connection, plan_id: &str, series_id: &str, amount: 
     Ok(id)
 }
 
-/// Create a brand-new transaction series (label "New bill", outgoing) and add it to the
-/// plan. Returns the plan_item id so the caller can select it for editing.
-pub fn add_new_transaction(conn: &Connection, plan_id: &str) -> Result<String> {
-    let series_id = create_series(conn, Kind::Transaction, "New bill", Some(Direction::Out), None, None)?;
-    add_plan_item(conn, plan_id, &series_id, Money::ZERO)
+/// Create a brand-new transaction series and add it to the plan. Returns the plan_item id
+/// so the caller can select it after the prompt flow inserts it.
+pub fn add_new_transaction(
+    conn: &Connection,
+    plan_id: &str,
+    label: &str,
+    direction: Direction,
+    amount: Money,
+) -> Result<String> {
+    let series_id = create_series(conn, Kind::Transaction, label, Some(direction), None, None)?;
+    add_plan_item(conn, plan_id, &series_id, amount)
 }
 
-/// Create a brand-new envelope series (label "New envelope", monthly, mode inherited) and
-/// add it to the plan. Returns the plan_item id.
-pub fn add_new_envelope(conn: &Connection, plan_id: &str) -> Result<String> {
-    let series_id = create_series(conn, Kind::Envelope, "New envelope", None, Some(PeriodType::Monthly), None)?;
-    add_plan_item(conn, plan_id, &series_id, Money::ZERO)
+/// Create a brand-new envelope series (monthly, mode inherited) and add it to the plan.
+/// Returns the plan_item id so the caller can select it after insertion.
+pub fn add_new_envelope(
+    conn: &Connection,
+    plan_id: &str,
+    label: &str,
+    amount: Money,
+) -> Result<String> {
+    let series_id = create_series(
+        conn,
+        Kind::Envelope,
+        label,
+        None,
+        Some(PeriodType::Monthly),
+        None,
+    )?;
+    add_plan_item(conn, plan_id, &series_id, amount)
 }
 
 /// Add an existing series to a plan (the reuse picker). Returns the plan_item id.
@@ -456,31 +507,50 @@ pub fn add_existing_series(conn: &Connection, plan_id: &str, series_id: &str) ->
 
 /// Per-plan: set this plan's budgeted amount for an item. Edits `plan_item`, not `series`.
 pub fn set_item_amount(conn: &Connection, item_id: &str, amount: Money) -> Result<()> {
-    conn.execute("UPDATE plan_item SET amount_cents = ?1 WHERE id = ?2", rusqlite::params![amount, item_id])?;
+    conn.execute(
+        "UPDATE plan_item SET amount_cents = ?1 WHERE id = ?2",
+        rusqlite::params![amount, item_id],
+    )?;
     Ok(())
 }
 
 // The following edit the shared SERIES, so they affect every plan that includes it.
 
 pub fn set_series_label(conn: &Connection, series_id: &str, label: &str) -> Result<()> {
-    conn.execute("UPDATE series SET label = ?1 WHERE id = ?2", rusqlite::params![label, series_id])?;
+    conn.execute(
+        "UPDATE series SET label = ?1 WHERE id = ?2",
+        rusqlite::params![label, series_id],
+    )?;
     Ok(())
 }
 
-pub fn set_series_direction(conn: &Connection, series_id: &str, direction: Direction) -> Result<()> {
-    conn.execute("UPDATE series SET direction = ?1 WHERE id = ?2", rusqlite::params![direction, series_id])?;
+pub fn set_series_direction(
+    conn: &Connection,
+    series_id: &str,
+    direction: Direction,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE series SET direction = ?1 WHERE id = ?2",
+        rusqlite::params![direction, series_id],
+    )?;
     Ok(())
 }
 
 /// Set an envelope series' mode to a concrete value. There is no "inherit" state anymore:
 /// mode is frozen at creation, and this is how the user explicitly changes it afterwards.
 pub fn set_series_mode(conn: &Connection, series_id: &str, mode: Mode) -> Result<()> {
-    conn.execute("UPDATE series SET mode = ?1 WHERE id = ?2", rusqlite::params![mode, series_id])?;
+    conn.execute(
+        "UPDATE series SET mode = ?1 WHERE id = ?2",
+        rusqlite::params![mode, series_id],
+    )?;
     Ok(())
 }
 
 pub fn set_series_period(conn: &Connection, series_id: &str, period: PeriodType) -> Result<()> {
-    conn.execute("UPDATE series SET period_type = ?1 WHERE id = ?2", rusqlite::params![period, series_id])?;
+    conn.execute(
+        "UPDATE series SET period_type = ?1 WHERE id = ?2",
+        rusqlite::params![period, series_id],
+    )?;
     Ok(())
 }
 
@@ -583,17 +653,26 @@ pub fn add_envelope_spending(
 // dashboard gates them to ad-hoc rows; plan-derived instances are managed via Plans.
 
 pub fn set_txn_label(conn: &Connection, txn_id: &str, label: &str) -> Result<()> {
-    conn.execute("UPDATE txn SET label = ?1 WHERE id = ?2", rusqlite::params![label, txn_id])?;
+    conn.execute(
+        "UPDATE txn SET label = ?1 WHERE id = ?2",
+        rusqlite::params![label, txn_id],
+    )?;
     Ok(())
 }
 
 pub fn set_txn_amount(conn: &Connection, txn_id: &str, amount: Money) -> Result<()> {
-    conn.execute("UPDATE txn SET amount_cents = ?1 WHERE id = ?2", rusqlite::params![amount, txn_id])?;
+    conn.execute(
+        "UPDATE txn SET amount_cents = ?1 WHERE id = ?2",
+        rusqlite::params![amount, txn_id],
+    )?;
     Ok(())
 }
 
 pub fn set_txn_direction(conn: &Connection, txn_id: &str, direction: Direction) -> Result<()> {
-    conn.execute("UPDATE txn SET direction = ?1 WHERE id = ?2", rusqlite::params![direction, txn_id])?;
+    conn.execute(
+        "UPDATE txn SET direction = ?1 WHERE id = ?2",
+        rusqlite::params![direction, txn_id],
+    )?;
     Ok(())
 }
 
@@ -605,22 +684,34 @@ pub fn delete_txn(conn: &Connection, txn_id: &str) -> Result<()> {
 }
 
 pub fn set_envelope_label(conn: &Connection, id: &str, label: &str) -> Result<()> {
-    conn.execute("UPDATE envelope SET label = ?1 WHERE id = ?2", rusqlite::params![label, id])?;
+    conn.execute(
+        "UPDATE envelope SET label = ?1 WHERE id = ?2",
+        rusqlite::params![label, id],
+    )?;
     Ok(())
 }
 
 pub fn set_envelope_amount(conn: &Connection, id: &str, amount: Money) -> Result<()> {
-    conn.execute("UPDATE envelope SET amount_cents = ?1 WHERE id = ?2", rusqlite::params![amount, id])?;
+    conn.execute(
+        "UPDATE envelope SET amount_cents = ?1 WHERE id = ?2",
+        rusqlite::params![amount, id],
+    )?;
     Ok(())
 }
 
 pub fn set_envelope_mode(conn: &Connection, id: &str, mode: Mode) -> Result<()> {
-    conn.execute("UPDATE envelope SET mode = ?1 WHERE id = ?2", rusqlite::params![mode, id])?;
+    conn.execute(
+        "UPDATE envelope SET mode = ?1 WHERE id = ?2",
+        rusqlite::params![mode, id],
+    )?;
     Ok(())
 }
 
 pub fn set_envelope_period(conn: &Connection, id: &str, period: PeriodType) -> Result<()> {
-    conn.execute("UPDATE envelope SET period_type = ?1 WHERE id = ?2", rusqlite::params![period, id])?;
+    conn.execute(
+        "UPDATE envelope SET period_type = ?1 WHERE id = ?2",
+        rusqlite::params![period, id],
+    )?;
     Ok(())
 }
 
@@ -640,7 +731,11 @@ pub fn delete_envelope(conn: &mut Connection, id: &str) -> Result<()> {
 /// Number of days in the given calendar month. Computed by asking "what's day 1 of next
 /// month?" and stepping back one day.
 pub fn days_in_month(year: i32, month: u32) -> i64 {
-    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let (ny, nm) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
     let first_next = NaiveDate::from_ymd_opt(ny, nm, 1).unwrap();
     let last_this = first_next.pred_opt().unwrap();
     last_this.day() as i64
@@ -660,7 +755,12 @@ pub fn seed_demo(conn: &mut Connection) -> Result<()> {
     let card = new_id();
     conn.execute(
         "INSERT INTO account (id, name, type, balance_cents) VALUES (?1,?2,?3,?4)",
-        rusqlite::params![checking, "Checking", AccountType::Checking.as_str(), Money::from_dollars(4200.0)],
+        rusqlite::params![
+            checking,
+            "Checking",
+            AccountType::Checking.as_str(),
+            Money::from_dollars(4200.0)
+        ],
     )?;
     conn.execute(
         "INSERT INTO account (id, name, type, balance_cents, credit_limit_cents, available_credit_cents)
@@ -676,7 +776,10 @@ pub fn seed_demo(conn: &mut Connection) -> Result<()> {
 
     // A plan and its recurring items.
     let plan_id = new_id();
-    conn.execute("INSERT INTO plan (id, name) VALUES (?1, ?2)", rusqlite::params![plan_id, "Normal Month"])?;
+    conn.execute(
+        "INSERT INTO plan (id, name) VALUES (?1, ?2)",
+        rusqlite::params![plan_id, "Normal Month"],
+    )?;
 
     // Helper: create a series and immediately add it to the plan at `amount`.
     // `conn` is borrowed by each call, so this is a plain closure over plan_id.
@@ -692,12 +795,54 @@ pub fn seed_demo(conn: &mut Connection) -> Result<()> {
         Ok(())
     };
 
-    add(Kind::Transaction, "Paycheck", Some(Direction::In), Money::from_dollars(5200.0), None, None)?;
-    add(Kind::Transaction, "Rent", Some(Direction::Out), Money::from_dollars(1800.0), None, None)?;
-    add(Kind::Transaction, "Electric", Some(Direction::Out), Money::from_dollars(140.0), None, None)?;
-    add(Kind::Transaction, "Internet", Some(Direction::Out), Money::from_dollars(70.0), None, None)?;
-    add(Kind::Envelope, "Groceries", None, Money::from_dollars(2000.0), Some(PeriodType::Monthly), Some(Mode::Automatic))?;
-    add(Kind::Envelope, "Dining", None, Money::from_dollars(300.0), Some(PeriodType::Monthly), Some(Mode::Manual))?;
+    add(
+        Kind::Transaction,
+        "Paycheck",
+        Some(Direction::In),
+        Money::from_dollars(5200.0),
+        None,
+        None,
+    )?;
+    add(
+        Kind::Transaction,
+        "Rent",
+        Some(Direction::Out),
+        Money::from_dollars(1800.0),
+        None,
+        None,
+    )?;
+    add(
+        Kind::Transaction,
+        "Electric",
+        Some(Direction::Out),
+        Money::from_dollars(140.0),
+        None,
+        None,
+    )?;
+    add(
+        Kind::Transaction,
+        "Internet",
+        Some(Direction::Out),
+        Money::from_dollars(70.0),
+        None,
+        None,
+    )?;
+    add(
+        Kind::Envelope,
+        "Groceries",
+        None,
+        Money::from_dollars(2000.0),
+        Some(PeriodType::Monthly),
+        Some(Mode::Automatic),
+    )?;
+    add(
+        Kind::Envelope,
+        "Dining",
+        None,
+        Money::from_dollars(300.0),
+        Some(PeriodType::Monthly),
+        Some(Mode::Manual),
+    )?;
 
     // Stamp it for the current calendar month.
     let today = Local::now().date_naive();
@@ -740,9 +885,25 @@ mod tests {
 
         // Build a plan from scratch. Create series explicitly so we know their ids.
         let plan_id = create_plan(&conn, "Tight Month").unwrap();
-        let rent_series = create_series(&conn, Kind::Transaction, "Rent", Some(Direction::Out), None, None).unwrap();
+        let rent_series = create_series(
+            &conn,
+            Kind::Transaction,
+            "Rent",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
         add_plan_item(&conn, &plan_id, &rent_series, Money::from_dollars(1500.0)).unwrap();
-        let groc_series = create_series(&conn, Kind::Envelope, "Groceries", None, Some(PeriodType::Monthly), Some(Mode::Automatic)).unwrap();
+        let groc_series = create_series(
+            &conn,
+            Kind::Envelope,
+            "Groceries",
+            None,
+            Some(PeriodType::Monthly),
+            Some(Mode::Automatic),
+        )
+        .unwrap();
         add_plan_item(&conn, &plan_id, &groc_series, Money::from_dollars(600.0)).unwrap();
 
         let entries = queries::load_plan_entries(&conn, &plan_id).unwrap();
@@ -756,7 +917,10 @@ mod tests {
         assert_eq!(stamped_txns.len(), 1);
         assert_eq!(stamped_txns[0].amount, Money::from_dollars(1500.0));
         // series_id on the instance equals the durable series identity.
-        assert_eq!(stamped_txns[0].series_id.as_deref(), Some(rent_series.as_str()));
+        assert_eq!(
+            stamped_txns[0].series_id.as_deref(),
+            Some(rent_series.as_str())
+        );
 
         // Deleting the plan leaves the stamped month intact (severed link).
         delete_plan(&mut conn, &plan_id).unwrap();
@@ -774,7 +938,13 @@ mod tests {
         let electric = txns.iter().find(|t| t.label == "Electric").unwrap();
 
         // Pay it at a corrected actual.
-        mark_paid(&conn, &electric.id, Money::from_dollars(152.30), Some("2026-07-05")).unwrap();
+        mark_paid(
+            &conn,
+            &electric.id,
+            Money::from_dollars(152.30),
+            Some("2026-07-05"),
+        )
+        .unwrap();
         let after = queries::load_txns(&conn, &month.id).unwrap();
         let electric = after.iter().find(|t| t.label == "Electric").unwrap();
         assert!(electric.settled);
@@ -793,7 +963,15 @@ mod tests {
     fn cross_plan_series_continuity_on_merge() {
         let mut conn = db::open_in_memory().unwrap();
         // One shared Rent series, included in two different plans at different amounts.
-        let rent = create_series(&conn, Kind::Transaction, "Rent", Some(Direction::Out), None, None).unwrap();
+        let rent = create_series(
+            &conn,
+            Kind::Transaction,
+            "Rent",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
         let plan_a = create_plan(&conn, "Normal").unwrap();
         add_plan_item(&conn, &plan_a, &rent, Money::from_dollars(1800.0)).unwrap();
         let plan_b = create_plan(&conn, "Tight").unwrap();
@@ -806,18 +984,45 @@ mod tests {
         restamp_merge(&mut conn, &month_id, &plan_b).unwrap();
 
         let txns = queries::load_txns(&conn, &month_id).unwrap();
-        let rent_rows: Vec<_> = txns.iter().filter(|t| t.series_id.as_deref() == Some(rent.as_str())).collect();
-        assert_eq!(rent_rows.len(), 1, "no duplicate — matched, not re-inserted");
-        assert_eq!(rent_rows[0].amount, Money::from_dollars(1500.0), "refreshed to plan B");
+        let rent_rows: Vec<_> = txns
+            .iter()
+            .filter(|t| t.series_id.as_deref() == Some(rent.as_str()))
+            .collect();
+        assert_eq!(
+            rent_rows.len(),
+            1,
+            "no duplicate — matched, not re-inserted"
+        );
+        assert_eq!(
+            rent_rows[0].amount,
+            Money::from_dollars(1500.0),
+            "refreshed to plan B"
+        );
     }
 
     #[test]
     fn merge_protects_settled_refreshes_unsettled_and_adds_new() {
         let mut conn = db::open_in_memory().unwrap();
         let plan = create_plan(&conn, "P").unwrap();
-        let rent = create_series(&conn, Kind::Transaction, "Rent", Some(Direction::Out), None, None).unwrap();
+        let rent = create_series(
+            &conn,
+            Kind::Transaction,
+            "Rent",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
         let rent_item = add_plan_item(&conn, &plan, &rent, Money::from_dollars(1000.0)).unwrap();
-        let elec = create_series(&conn, Kind::Transaction, "Electric", Some(Direction::Out), None, None).unwrap();
+        let elec = create_series(
+            &conn,
+            Kind::Transaction,
+            "Electric",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
         let elec_item = add_plan_item(&conn, &plan, &elec, Money::from_dollars(100.0)).unwrap();
 
         let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
@@ -825,23 +1030,51 @@ mod tests {
 
         // Settle Rent at a corrected actual.
         let txns = queries::load_txns(&conn, &month_id).unwrap();
-        let rent_txn = txns.iter().find(|t| t.series_id.as_deref() == Some(rent.as_str())).unwrap();
+        let rent_txn = txns
+            .iter()
+            .find(|t| t.series_id.as_deref() == Some(rent.as_str()))
+            .unwrap();
         mark_paid(&conn, &rent_txn.id, Money::from_dollars(1234.0), None).unwrap();
 
         // Change both plan amounts and add a brand-new series.
         set_item_amount(&conn, &rent_item, Money::from_dollars(1100.0)).unwrap();
         set_item_amount(&conn, &elec_item, Money::from_dollars(120.0)).unwrap();
-        let water = create_series(&conn, Kind::Transaction, "Water", Some(Direction::Out), None, None).unwrap();
+        let water = create_series(
+            &conn,
+            Kind::Transaction,
+            "Water",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
         add_plan_item(&conn, &plan, &water, Money::from_dollars(40.0)).unwrap();
 
         restamp_merge(&mut conn, &month_id, &plan).unwrap();
 
         let after = queries::load_txns(&conn, &month_id).unwrap();
-        let get = |sid: &str| after.iter().find(|t| t.series_id.as_deref() == Some(sid)).unwrap();
-        assert_eq!(get(&rent).amount, Money::from_dollars(1234.0), "settled Rent protected");
+        let get = |sid: &str| {
+            after
+                .iter()
+                .find(|t| t.series_id.as_deref() == Some(sid))
+                .unwrap()
+        };
+        assert_eq!(
+            get(&rent).amount,
+            Money::from_dollars(1234.0),
+            "settled Rent protected"
+        );
         assert!(get(&rent).settled);
-        assert_eq!(get(&elec).amount, Money::from_dollars(120.0), "unsettled Electric refreshed");
-        assert_eq!(get(&water).amount, Money::from_dollars(40.0), "new series inserted");
+        assert_eq!(
+            get(&elec).amount,
+            Money::from_dollars(120.0),
+            "unsettled Electric refreshed"
+        );
+        assert_eq!(
+            get(&water).amount,
+            Money::from_dollars(40.0),
+            "new series inserted"
+        );
     }
 
     #[test]
@@ -850,9 +1083,25 @@ mod tests {
         fn setup() -> (Connection, String, String, String) {
             let mut conn = db::open_in_memory().unwrap();
             let plan = create_plan(&conn, "P").unwrap();
-            let rent = create_series(&conn, Kind::Transaction, "Rent", Some(Direction::Out), None, None).unwrap();
+            let rent = create_series(
+                &conn,
+                Kind::Transaction,
+                "Rent",
+                Some(Direction::Out),
+                None,
+                None,
+            )
+            .unwrap();
             add_plan_item(&conn, &plan, &rent, Money::from_dollars(1000.0)).unwrap();
-            let dining = create_series(&conn, Kind::Envelope, "Dining", None, Some(PeriodType::Monthly), Some(Mode::Manual)).unwrap();
+            let dining = create_series(
+                &conn,
+                Kind::Envelope,
+                "Dining",
+                None,
+                Some(PeriodType::Monthly),
+                Some(Mode::Manual),
+            )
+            .unwrap();
             add_plan_item(&conn, &plan, &dining, Money::from_dollars(300.0)).unwrap();
 
             let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
@@ -861,13 +1110,21 @@ mod tests {
             // Settle Rent so we can confirm Replace unsettles it.
             let rent_txn_id = {
                 let txns = queries::load_txns(&conn, &month_id).unwrap();
-                txns.iter().find(|t| t.series_id.as_deref() == Some(rent.as_str())).unwrap().id.clone()
+                txns.iter()
+                    .find(|t| t.series_id.as_deref() == Some(rent.as_str()))
+                    .unwrap()
+                    .id
+                    .clone()
             };
             mark_paid(&conn, &rent_txn_id, Money::from_dollars(1000.0), None).unwrap();
 
             let dining_env_id = {
                 let envs = queries::load_envelopes(&conn, &month_id).unwrap();
-                envs.iter().find(|e| e.label == "Dining").unwrap().id.clone()
+                envs.iter()
+                    .find(|e| e.label == "Dining")
+                    .unwrap()
+                    .id
+                    .clone()
             };
 
             // A standalone one-off (no series, no envelope).
@@ -875,7 +1132,8 @@ mod tests {
                 "INSERT INTO txn (id, month_id, label, direction, amount_cents, settled)
                  VALUES ('oneoff', ?1, 'Gift', 'out', 5000, 0)",
                 [&month_id],
-            ).unwrap();
+            )
+            .unwrap();
             // Manual-envelope spending (no series, envelope_id set).
             conn.execute(
                 "INSERT INTO txn (id, month_id, envelope_id, label, direction, amount_cents, settled)
@@ -891,7 +1149,10 @@ mod tests {
             let (mut conn, plan, month_id, _dining) = setup();
             restamp_replace(&mut conn, &month_id, &plan, false).unwrap();
             let txns = queries::load_txns(&conn, &month_id).unwrap();
-            assert!(txns.iter().all(|t| t.series_id.is_some()), "all one-offs + manual spending wiped");
+            assert!(
+                txns.iter().all(|t| t.series_id.is_some()),
+                "all one-offs + manual spending wiped"
+            );
             let rent = txns.iter().find(|t| t.label == "Rent").unwrap();
             assert!(!rent.settled, "Replace unsettles plan items");
         }
@@ -903,7 +1164,11 @@ mod tests {
             let txns = queries::load_txns(&conn, &month_id).unwrap();
             assert!(txns.iter().any(|t| t.id == "oneoff"), "one-off kept");
             let spend = txns.iter().find(|t| t.id == "spend").unwrap();
-            assert_eq!(spend.envelope_id.as_deref(), Some(dining.as_str()), "spending still linked");
+            assert_eq!(
+                spend.envelope_id.as_deref(),
+                Some(dining.as_str()),
+                "spending still linked"
+            );
         }
     }
 
@@ -928,12 +1193,26 @@ mod tests {
     fn delete_series_blocked_while_referenced() {
         let conn = db::open_in_memory().unwrap();
         let plan = create_plan(&conn, "P").unwrap();
-        let s = create_series(&conn, Kind::Transaction, "Rent", Some(Direction::Out), None, None).unwrap();
+        let s = create_series(
+            &conn,
+            Kind::Transaction,
+            "Rent",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
         let item = add_plan_item(&conn, &plan, &s, Money::from_dollars(10.0)).unwrap();
 
-        assert!(delete_series(&conn, &s).is_err(), "blocked while a plan uses it");
+        assert!(
+            delete_series(&conn, &s).is_err(),
+            "blocked while a plan uses it"
+        );
         delete_plan_item(&conn, &item).unwrap();
-        assert!(delete_series(&conn, &s).is_ok(), "allowed once unreferenced");
+        assert!(
+            delete_series(&conn, &s).is_ok(),
+            "allowed once unreferenced"
+        );
     }
 
     #[test]
@@ -946,15 +1225,43 @@ mod tests {
         assert!(!month_has_handentered(&conn, &month.id).unwrap());
 
         // Add an ad-hoc bill and an ad-hoc envelope.
-        let txn_id = add_oneoff_txn(&conn, &month.id, "Concert", Direction::Out, Money::from_dollars(120.0)).unwrap();
-        let env_id = add_oneoff_envelope(&conn, &month.id, "Fun", Money::from_dollars(200.0), PeriodType::Monthly, Mode::Manual).unwrap();
+        let txn_id = add_oneoff_txn(
+            &conn,
+            &month.id,
+            "Concert",
+            Direction::Out,
+            Money::from_dollars(120.0),
+        )
+        .unwrap();
+        let env_id = add_oneoff_envelope(
+            &conn,
+            &month.id,
+            "Fun",
+            Money::from_dollars(200.0),
+            PeriodType::Monthly,
+            Mode::Manual,
+        )
+        .unwrap();
 
         // Both are seriesless (the ad-hoc marker) and now count as hand-entered.
-        let txn = queries::load_txns(&conn, &month.id).unwrap().into_iter().find(|t| t.id == txn_id).unwrap();
-        assert!(txn.series_id.is_none() && txn.envelope_id.is_none() && txn.stamped_amount.is_none());
-        let env = queries::load_envelopes(&conn, &month.id).unwrap().into_iter().find(|e| e.id == env_id).unwrap();
+        let txn = queries::load_txns(&conn, &month.id)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == txn_id)
+            .unwrap();
+        assert!(
+            txn.series_id.is_none() && txn.envelope_id.is_none() && txn.stamped_amount.is_none()
+        );
+        let env = queries::load_envelopes(&conn, &month.id)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == env_id)
+            .unwrap();
         assert!(env.series_id.is_none());
-        assert!(month_has_handentered(&conn, &month.id).unwrap(), "ad-hoc envelope alone trips the flag");
+        assert!(
+            month_has_handentered(&conn, &month.id).unwrap(),
+            "ad-hoc envelope alone trips the flag"
+        );
     }
 
     #[test]
@@ -964,14 +1271,43 @@ mod tests {
         seed_demo(&mut conn).unwrap();
         let month = queries::current_month(&conn).unwrap().unwrap();
 
-        let env_id = add_oneoff_envelope(&conn, &month.id, "Fun", Money::from_dollars(200.0), PeriodType::Monthly, Mode::Manual).unwrap();
-        add_envelope_spending(&conn, &month.id, &env_id, "Lunch", Money::from_dollars(30.0)).unwrap();
-        add_envelope_spending(&conn, &month.id, &env_id, "Movie", Money::from_dollars(20.0)).unwrap();
+        let env_id = add_oneoff_envelope(
+            &conn,
+            &month.id,
+            "Fun",
+            Money::from_dollars(200.0),
+            PeriodType::Monthly,
+            Mode::Manual,
+        )
+        .unwrap();
+        add_envelope_spending(
+            &conn,
+            &month.id,
+            &env_id,
+            "Lunch",
+            Money::from_dollars(30.0),
+        )
+        .unwrap();
+        add_envelope_spending(
+            &conn,
+            &month.id,
+            &env_id,
+            "Movie",
+            Money::from_dollars(20.0),
+        )
+        .unwrap();
 
         // Manual consumed = sum of filed spending, independent of elapsed time.
-        let env = queries::load_envelopes(&conn, &month.id).unwrap().into_iter().find(|e| e.id == env_id).unwrap();
-        let env_txns = queries::load_txns(&conn, &month.id).unwrap()
-            .into_iter().filter(|t| t.envelope_id.as_deref() == Some(env_id.as_str())).collect::<Vec<_>>();
+        let env = queries::load_envelopes(&conn, &month.id)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == env_id)
+            .unwrap();
+        let env_txns = queries::load_txns(&conn, &month.id)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.envelope_id.as_deref() == Some(env_id.as_str()))
+            .collect::<Vec<_>>();
         let consumed = calc::envelope_consumed(&env, Mode::Manual, &env_txns, 0.0);
         assert_eq!(consumed, Money::from_dollars(50.0));
     }
@@ -982,13 +1318,36 @@ mod tests {
         fn setup() -> (Connection, String, String, String) {
             let mut conn = db::open_in_memory().unwrap();
             let plan = create_plan(&conn, "P").unwrap();
-            let rent = create_series(&conn, Kind::Transaction, "Rent", Some(Direction::Out), None, None).unwrap();
+            let rent = create_series(
+                &conn,
+                Kind::Transaction,
+                "Rent",
+                Some(Direction::Out),
+                None,
+                None,
+            )
+            .unwrap();
             add_plan_item(&conn, &plan, &rent, Money::from_dollars(1000.0)).unwrap();
             let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
             let month_id = stamp(&mut conn, &plan, "2026-09", start, 30).unwrap();
 
-            let env_id = add_oneoff_envelope(&conn, &month_id, "Fun", Money::from_dollars(200.0), PeriodType::Monthly, Mode::Manual).unwrap();
-            add_envelope_spending(&conn, &month_id, &env_id, "Lunch", Money::from_dollars(30.0)).unwrap();
+            let env_id = add_oneoff_envelope(
+                &conn,
+                &month_id,
+                "Fun",
+                Money::from_dollars(200.0),
+                PeriodType::Monthly,
+                Mode::Manual,
+            )
+            .unwrap();
+            add_envelope_spending(
+                &conn,
+                &month_id,
+                &env_id,
+                "Lunch",
+                Money::from_dollars(30.0),
+            )
+            .unwrap();
             (conn, plan, month_id, env_id)
         }
 
@@ -999,7 +1358,10 @@ mod tests {
             let envs = queries::load_envelopes(&conn, &month_id).unwrap();
             assert!(envs.iter().all(|e| e.id != env_id), "ad-hoc envelope wiped");
             let txns = queries::load_txns(&conn, &month_id).unwrap();
-            assert!(txns.iter().all(|t| t.envelope_id.is_none()), "its spending wiped too");
+            assert!(
+                txns.iter().all(|t| t.envelope_id.is_none()),
+                "its spending wiped too"
+            );
             assert!(txns.iter().any(|t| t.label == "Rent"), "plan bill kept");
         }
 
@@ -1010,7 +1372,11 @@ mod tests {
             let envs = queries::load_envelopes(&conn, &month_id).unwrap();
             assert!(envs.iter().any(|e| e.id == env_id), "ad-hoc envelope kept");
             let txns = queries::load_txns(&conn, &month_id).unwrap();
-            assert!(txns.iter().any(|t| t.envelope_id.as_deref() == Some(env_id.as_str())), "spending still linked");
+            assert!(
+                txns.iter()
+                    .any(|t| t.envelope_id.as_deref() == Some(env_id.as_str())),
+                "spending still linked"
+            );
         }
     }
 }
