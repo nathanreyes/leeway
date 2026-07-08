@@ -16,16 +16,18 @@ immediately.
 
 Apply the same create flow everywhere `n` creates income, expenses, or envelopes:
 
-- Insert the new row immediately with an empty label and a zero amount.
-- Select the row after reload using the existing pending-selection fields.
 - Open the label prompt with an empty input.
-- When the label prompt is submitted, save the label if it is non-empty.
-- Immediately open the amount prompt for the same row.
+- Keep the pending item in modal state; do not write to SQLite yet.
+- When the label prompt is submitted, require a non-empty label and open the amount
+  prompt for the same pending item.
 - Show the amount prompt with `0.00` prefilled but replacement-ready, so the first typed
   character clears the value.
+- When the amount prompt is submitted with a valid amount, insert the row once using the
+  collected label and amount.
+- Select the newly inserted row after reload using the existing pending-selection fields.
 
-`Esc` cancels only the currently open prompt. Since creation still happens before input,
-canceling leaves the new row in place, matching the current create-first behavior.
+`Esc` cancels the currently open prompt and drops the pending draft. Since nothing has
+been inserted yet, canceling leaves no blank row behind.
 
 Existing edit commands stay intact:
 
@@ -36,18 +38,17 @@ Existing edit commands stay intact:
 ## Data Flow
 
 No schema changes are needed. The insert helpers continue to write `NOT NULL` labels and
-amounts. New rows use an empty string for the initial label and `Money::ZERO` for the
-amount.
+amounts, but new-item prompts hold those values in memory until the amount is confirmed.
 
 The text prompt state gains a small replacement mode. When active, the first printable
 character replaces the current buffer instead of appending to it. Backspace or navigation
 keys leave normal editing semantics.
 
-Prompt submission gains create-chain variants that carry the created row id:
+Prompt submission gains draft-create variants that carry the target context:
 
-- Dashboard transaction label -> dashboard transaction amount.
-- Dashboard envelope label -> dashboard envelope amount.
-- Plan series label -> plan item amount.
+- Dashboard transaction label -> dashboard transaction amount -> insert one-off txn.
+- Dashboard envelope label -> dashboard envelope amount -> insert one-off envelope.
+- Plan series label -> plan item amount -> insert recurring plan item.
 
 ## Testing
 
@@ -58,4 +59,5 @@ Run the Rust test suite after implementation. Manual verification should check:
 - Dashboard `n` in Envelopes opens a blank label prompt, then amount.
 - Plan editor `n` in each block follows the same flow.
 - Typing in the chained amount prompt replaces `0.00` without backspacing.
+- `Esc` from either prompt creates nothing.
 - Existing `r` and `a` prompts still edit current values normally.
