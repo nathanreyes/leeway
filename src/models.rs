@@ -90,6 +90,11 @@ pub struct Account {
     pub balance: Money,
     pub credit_limit: Option<Money>,
     pub available_credit: Option<Money>,
+    /// One amount, meaning set by `account_type` (`None` = not set, treated as 0):
+    ///   - checking:    a buffer the user wants to keep parked in the account.
+    ///   - credit card: a balance the user is willing to carry into next month.
+    /// The math effect lives in `carry_adjustment()`, which knows the sign per type.
+    pub carry_balance: Option<Money>,
 }
 
 impl Account {
@@ -101,6 +106,21 @@ impl Account {
                 self.credit_limit.unwrap_or(Money::ZERO) - self.available_credit.unwrap_or(Money::ZERO)
             }
             AccountType::Checking => Money::ZERO,
+        }
+    }
+
+    /// The signed effect this account's carry balance has on "what's left". This is the
+    /// ONE place the buffer/carryover sign asymmetry lives — the reason a single stored
+    /// column is safe:
+    ///   - Checking: the buffer is cash you won't spend, so hold it back → NEGATIVE.
+    ///   - Credit card: the tolerated balance is debt you won't pay this month, so it
+    ///     cancels that much of `owed()`'s drag → POSITIVE.
+    /// `None` carry (the default) means no adjustment.
+    pub fn carry_adjustment(&self) -> Money {
+        let carry = self.carry_balance.unwrap_or(Money::ZERO);
+        match self.account_type {
+            AccountType::Checking => Money::ZERO - carry, // reserve cash
+            AccountType::CreditCard => carry,             // forgive deferred debt
         }
     }
 }
@@ -123,7 +143,7 @@ pub struct Series {
     pub category: Option<String>,
     pub direction: Option<Direction>,   // transactions
     pub period_type: Option<PeriodType>, // envelopes
-    pub mode: Option<Mode>,              // envelopes (None = inherit global default)
+    pub mode: Option<Mode>,              // Some for envelopes (frozen at creation); None for transactions
 }
 
 /// A series' membership in one plan: the join of `plan_item` and `series`. `item_id` is
@@ -150,13 +170,16 @@ pub struct Month {
 pub struct Envelope {
     pub id: String,
     pub month_id: String,
-    pub series_id: String,
+    /// The durable series identity this instance was stamped from, or `None` for an
+    /// **ad-hoc** envelope added straight into the month (no plan behind it). Same meaning
+    /// as `Txn::series_id`: `Some` = plan-derived, `None` = hand-entered.
+    pub series_id: Option<String>,
     pub label: String,
     pub category: Option<String>,
     pub amount: Money,
     pub stamped_amount: Money,
     pub period_type: PeriodType,
-    pub mode: Option<Mode>,
+    pub mode: Mode, // frozen at stamp time; never re-resolved against the global default
 }
 
 #[derive(Clone, Debug)]

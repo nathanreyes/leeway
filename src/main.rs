@@ -27,6 +27,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Which screen is showing. `PlanEditor` carries the id of the plan being edited —
 /// that's how the loop knows which plan's items to load.
@@ -38,12 +39,16 @@ pub enum Screen {
     SeriesPicker { plan_id: String },
 }
 
-/// Which panel the dashboard's keys act on. The dashboard now has two interactive lists
-/// (bills you settle, accounts you rebalance), so we track which one is "focused" and
-/// route j/k and Enter to it. Tab flips between them.
+/// Which control the dashboard's keys act on. Four focusable things now: the month header
+/// (where j/k step months and `m` jumps to one), the bills list (settle + add/edit ad-hoc),
+/// the envelopes list (feed manual + add/edit ad-hoc), and the accounts list (rebalance).
+/// We track which is "focused" and route j/k and Enter to it; Tab cycles
+/// Header → Transactions → Envelopes → Accounts → Header.
 #[derive(Clone, Copy, PartialEq)]
 pub enum DashFocus {
+    Header,
     Transactions,
+    Envelopes,
     Accounts,
 }
 
@@ -94,9 +99,22 @@ pub enum PromptKind {
     /// Edit a plan_item's per-plan budgeted amount.
     ItemAmount { id: String },
     StampMonth { plan_id: String },
+    /// Navigate the dashboard to a typed `YYYY-MM` period (view only — no stamping).
+    GoToMonth,
     AccountBalance { id: String },
     CardAvailable { id: String },
     CardLimit { id: String },
+    /// Edit an ad-hoc transaction's label (this instance only — no series).
+    TxnLabel { id: String },
+    /// Edit an ad-hoc transaction's amount.
+    TxnAmount { id: String },
+    /// Edit an ad-hoc envelope's label.
+    EnvelopeLabel { id: String },
+    /// Edit an ad-hoc envelope's monthly amount.
+    EnvelopeAmount { id: String },
+    /// File a spend into a (manual) envelope: the value is the dollar amount spent. Carries
+    /// the month so the new txn lands in the right period.
+    EnvelopeSpend { envelope_id: String, month_id: String },
 }
 
 pub struct Confirm {
@@ -108,6 +126,10 @@ pub struct Confirm {
 pub enum ConfirmAction {
     DeletePlan { id: String },
     DeleteItem { id: String },
+    /// Delete an ad-hoc transaction from a month.
+    DeleteTxn { id: String },
+    /// Delete an ad-hoc envelope (and any spending filed in it) from a month.
+    DeleteEnvelope { id: String },
 }
 
 /// All mutable UI state. Each screen keeps its own selection index so moving between
@@ -117,7 +139,13 @@ pub struct App {
     pub screen: Screen,
     pub should_quit: bool,
     pub dash_focus: DashFocus,
+    /// The period the dashboard is showing, as a (year, month). Starts on today's calendar
+    /// month and moves as you navigate the header; the view for it is looked up fresh each
+    /// frame, so a period with no stamped month simply renders the "not stamped" prompt.
+    pub viewed_year: i32,
+    pub viewed_month: u32,
     pub dash_sel: usize,
+    pub dash_env_sel: usize,
     pub dash_acct_sel: usize,
     pub plans_sel: usize,
     pub editor_sel: usize,
@@ -126,6 +154,11 @@ pub struct App {
     /// position isn't known until the next reload (rows are sorted). We stash the id
     /// here and the loop resolves it to an index once the items are loaded.
     pub pending_select: Option<String>,
+    /// The dashboard's counterparts to `pending_select`: after creating an ad-hoc txn or
+    /// envelope we stash its id here, and the event loop resolves it to a list index on the
+    /// next reload (the lists are sorted, so the position isn't known until then).
+    pub pending_dash_txn: Option<String>,
+    pub pending_dash_env: Option<String>,
     pub modal: Option<Modal>,
     /// A transient one-liner (errors, confirmations) shown in the footer.
     pub status: Option<String>,
@@ -152,19 +185,29 @@ impl App {
 fn main() -> Result<()> {
     let path = PathBuf::from("ballpark.db");
     let mut conn = db::open(&path)?;
+    // On a fresh database this stamps the current calendar month, satisfying "if no month
+    // exists, create one" for a first-ever launch.
     ops::seed_demo(&mut conn)?;
+
+    // The app opens on the current calendar month.
+    let today = Local::now().date_naive();
 
     let mut app = App {
         conn,
         screen: Screen::Dashboard,
         should_quit: false,
         dash_focus: DashFocus::Transactions,
+        viewed_year: today.year(),
+        viewed_month: today.month(),
         dash_sel: 0,
+        dash_env_sel: 0,
         dash_acct_sel: 0,
         plans_sel: 0,
         editor_sel: 0,
         picker_sel: 0,
         pending_select: None,
+        pending_dash_txn: None,
+        pending_dash_env: None,
         modal: None,
         status: None,
     };
@@ -178,17 +221,47 @@ fn main() -> Result<()> {
 /// The event loop. Each iteration loads only the data the current screen needs, draws,
 /// then reads and routes one key.
 fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
-    let today = Local::now().date_naive();
-
     while !app.should_quit {
+        // Resolve "today" fresh every iteration from the local system clock. Combined with
+        // `read_key`'s idle wake-up (below), this means a date that rolls over while the app
+        // sits open — e.g. left running past midnight — is picked up and redrawn on its own,
+        // rather than being stuck on whatever day it was at launch.
+        let today = Local::now().date_naive();
+
         // `match` on the screen keeps each branch's data local — the borrow of `app.conn`
         // for loading is released before we take a `&mut app` to handle input.
         match &app.screen {
             Screen::Dashboard => {
-                let view = ballpark::view::MonthView::build(&app.conn, today)?;
-                if let Some(v) = &view {
-                    clamp(&mut app.dash_sel, v.standalone.len());
-                    clamp(&mut app.dash_acct_sel, v.accounts.len());
+                let view = ballpark::view::MonthView::build_for(
+                    &app.conn,
+                    today,
+                    app.viewed_year,
+                    app.viewed_month,
+                )?;
+                match &view {
+                    Some(v) => {
+                        // Resolve "select the item I just created" now that the sorted lists
+                        // are loaded (mirrors the plan editor's pending_select handling).
+                        if let Some(target) = app.pending_dash_txn.take() {
+                            if let Some(idx) = v.standalone.iter().position(|t| t.id == target) {
+                                app.dash_sel = idx;
+                                app.dash_focus = DashFocus::Transactions;
+                            }
+                        }
+                        if let Some(target) = app.pending_dash_env.take() {
+                            if let Some(idx) = v.envelopes.iter().position(|e| e.envelope.id == target) {
+                                app.dash_env_sel = idx;
+                                app.dash_focus = DashFocus::Envelopes;
+                            }
+                        }
+                        clamp(&mut app.dash_sel, v.standalone.len());
+                        clamp(&mut app.dash_env_sel, v.envelopes.len());
+                        clamp(&mut app.dash_acct_sel, v.accounts.len());
+                    }
+                    // No month for this period → the header is the only sensible control, so
+                    // pin focus there. That keeps j/k/m navigation working with nothing else
+                    // on screen (and stops Tab from stranding focus on an absent panel).
+                    None => app.dash_focus = DashFocus::Header,
                 }
                 terminal.draw(|f| {
                     dashboard::draw(f, app, &view);
@@ -272,9 +345,19 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-/// Read one key *press*. Returns `None` for releases, resizes, mouse — anything we don't
-/// act on (the next frame redraws regardless).
+/// How long the loop waits for input before waking on its own to redraw. This is what lets
+/// the day tick over unattended: even with no keypresses we re-enter the loop at least this
+/// often, re-resolve `today`, and repaint. A minute is far finer than a day, so the header
+/// updates within a minute of midnight, at negligible idle cost.
+const IDLE_TICK: Duration = Duration::from_secs(60);
+
+/// Read one key *press*. Returns `None` for releases, resizes, mouse, or an idle timeout —
+/// anything we don't act on (the next frame redraws regardless). `event::poll` returns as
+/// soon as input arrives, so waiting up to `IDLE_TICK` never adds latency to real keystrokes.
 fn read_key() -> Result<Option<KeyEvent>> {
+    if !event::poll(IDLE_TICK)? {
+        return Ok(None); // idle wake-up: no input, but let the loop redraw with a fresh date
+    }
     match event::read()? {
         Event::Key(key) if key.kind == KeyEventKind::Press => Ok(Some(key)),
         _ => Ok(None),
@@ -434,6 +517,16 @@ fn submit_text(app: &mut App) -> Result<()> {
             None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
         },
         PromptKind::StampMonth { plan_id } => stamp_from_input(app, &plan_id, &text)?,
+        PromptKind::GoToMonth => match parse_year_month(&text) {
+            Some((year, month)) => {
+                app.viewed_year = year;
+                app.viewed_month = month;
+                // New period → old row indices are meaningless; start its lists at the top.
+                app.dash_sel = 0;
+                app.dash_acct_sel = 0;
+            }
+            None => app.status = Some(format!("Enter a month as YYYY-MM (got “{text}”)")),
+        },
         PromptKind::AccountBalance { id } => match Money::parse_dollars(&text) {
             Some(balance) => ops::set_balance(&app.conn, &id, balance)?,
             None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
@@ -444,6 +537,31 @@ fn submit_text(app: &mut App) -> Result<()> {
         },
         PromptKind::CardLimit { id } => match Money::parse_dollars(&text) {
             Some(limit) => ops::set_credit_limit(&app.conn, &id, limit)?,
+            None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
+        },
+        PromptKind::TxnLabel { id } => {
+            if !text.is_empty() {
+                ops::set_txn_label(&app.conn, &id, &text)?;
+            }
+        }
+        PromptKind::TxnAmount { id } => match Money::parse_dollars(&text) {
+            Some(amount) => ops::set_txn_amount(&app.conn, &id, amount)?,
+            None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
+        },
+        PromptKind::EnvelopeLabel { id } => {
+            if !text.is_empty() {
+                ops::set_envelope_label(&app.conn, &id, &text)?;
+            }
+        }
+        PromptKind::EnvelopeAmount { id } => match Money::parse_dollars(&text) {
+            Some(amount) => ops::set_envelope_amount(&app.conn, &id, amount)?,
+            None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
+        },
+        PromptKind::EnvelopeSpend { envelope_id, month_id } => match Money::parse_dollars(&text) {
+            Some(amount) => {
+                ops::add_envelope_spending(&app.conn, &month_id, &envelope_id, "Spending", amount)?;
+                app.status = Some(format!("Filed {amount} of spending"));
+            }
             None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
         },
     }
@@ -463,6 +581,14 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         ops::delete_plan_item(&app.conn, &id)?;
                         app.status = Some("Item deleted".into());
                     }
+                    ConfirmAction::DeleteTxn { id } => {
+                        ops::delete_txn(&app.conn, &id)?;
+                        app.status = Some("Deleted".into());
+                    }
+                    ConfirmAction::DeleteEnvelope { id } => {
+                        ops::delete_envelope(&mut app.conn, &id)?;
+                        app.status = Some("Deleted".into());
+                    }
                 }
             }
         }
@@ -479,6 +605,11 @@ fn stamp_from_input(app: &mut App, plan_id: &str, input: &str) -> Result<()> {
         return Ok(());
     };
     let label = format!("{year:04}-{month:02}");
+
+    // Land the dashboard on the month we're about to stamp (or restamp), so the result is
+    // visible the moment we switch back to it — even when it's a future or past period.
+    app.viewed_year = year;
+    app.viewed_month = month;
 
     // Already stamped? Offer Merge / Replace instead of a fresh stamp.
     if let Some(month_id) = queries::month_id_for_label(&app.conn, &label)? {

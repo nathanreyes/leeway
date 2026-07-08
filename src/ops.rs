@@ -75,7 +75,9 @@ fn insert_instance_from_entry(conn: &Connection, month_id: &str, entry: &PlanEnt
                     entry.amount,
                     entry.amount,
                     s.period_type.unwrap_or(PeriodType::Monthly),
-                    s.mode,
+                    // Envelope series always carry a concrete mode (enforced at creation and
+                    // by the series CHECK), so this copies a real value into the frozen snapshot.
+                    s.mode.expect("envelope series must have a mode"),
                 ],
             )?;
         }
@@ -103,16 +105,19 @@ fn insert_instance_from_entry(conn: &Connection, month_id: &str, entry: &PlanEnt
 
 // --- Restamp: Merge / Replace --------------------------------------------------
 
-/// Does this month contain hand-entered data — standalone one-offs OR manual-envelope
-/// spending? Both have `series_id IS NULL` (they didn't come from a plan). Drives whether
-/// Replace stops to ask before wiping.
+/// Does this month contain hand-entered data — standalone one-offs, manual-envelope
+/// spending, OR an ad-hoc envelope? All are marked the same way: `series_id IS NULL` (they
+/// didn't come from a plan). Drives whether Replace stops to ask before wiping.
 pub fn month_has_handentered(conn: &Connection, month_id: &str) -> Result<bool> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM txn WHERE month_id = ?1 AND series_id IS NULL",
+    // Two `series_id IS NULL` checks, one per table — a hand-entered txn or an ad-hoc
+    // envelope each counts. `OR EXISTS` short-circuits, so we stop at the first hit.
+    let has: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM txn      WHERE month_id = ?1 AND series_id IS NULL)
+             OR EXISTS(SELECT 1 FROM envelope WHERE month_id = ?1 AND series_id IS NULL)",
         [month_id],
         |r| r.get(0),
     )?;
-    Ok(count > 0)
+    Ok(has)
 }
 
 /// Merge a plan into an existing month: additive, refreshing the planned baseline.
@@ -184,16 +189,30 @@ pub fn restamp_replace(
         }
     }
 
-    // Envelopes (always plan-derived — series_id NOT NULL).
+    // Envelopes. `series_id` splits them three ways now that ad-hoc envelopes exist.
     for e in &envelopes {
-        if let Some(entry) = entry_by_series.get(e.series_id.as_str()) {
-            refresh_envelope(&tx, &e.id, entry)?;
-            seen.insert(e.series_id.clone());
-        } else {
-            // Removed from the plan: detach any surviving manual spending to standalone
-            // (so kept hand-entered data isn't orphaned by the FK), then drop the envelope.
-            tx.execute("UPDATE txn SET envelope_id = NULL WHERE envelope_id = ?1", [&e.id])?;
-            tx.execute("DELETE FROM envelope WHERE id = ?1", [&e.id])?;
+        match e.series_id.as_deref() {
+            // Ad-hoc envelope (hand-entered): follow the exact rule the txn loop above used
+            // for one-offs. On a wipe, drop it; its manual spending (also series_id NULL)
+            // was already deleted by that loop, so no child txn is left to violate the FK.
+            // On keep, leave both the envelope and its spending untouched.
+            None => {
+                if !keep_handentered {
+                    tx.execute("DELETE FROM envelope WHERE id = ?1", [&e.id])?;
+                }
+            }
+            Some(sid) => {
+                if let Some(entry) = entry_by_series.get(sid) {
+                    refresh_envelope(&tx, &e.id, entry)?;
+                    seen.insert(sid.to_string());
+                } else {
+                    // Plan-derived but removed from the plan: detach any surviving manual
+                    // spending to standalone (so kept hand-entered data isn't orphaned by
+                    // the FK), then drop the envelope.
+                    tx.execute("UPDATE txn SET envelope_id = NULL WHERE envelope_id = ?1", [&e.id])?;
+                    tx.execute("DELETE FROM envelope WHERE id = ?1", [&e.id])?;
+                }
+            }
         }
     }
 
@@ -247,7 +266,7 @@ fn refresh_envelope(conn: &Connection, id: &str, entry: &PlanEntry) -> Result<()
             s.label,
             s.category,
             s.period_type.unwrap_or(PeriodType::Monthly),
-            s.mode,
+            s.mode.expect("envelope series must have a mode"),
             id
         ],
     )?;
@@ -376,6 +395,11 @@ pub fn delete_plan(conn: &mut Connection, plan_id: &str) -> Result<()> {
 }
 
 /// Create a new series (a durable recurring-item definition). Category starts NULL.
+///
+/// `mode` is where the global default is applied — ONCE, here, at creation. An envelope
+/// series that passes `None` is seeded with the current `default_envelope_mode` and frozen;
+/// changing the global default later never touches it (that's the whole point — see
+/// migration 004). Transaction series have no mode and keep `None`.
 pub fn create_series(
     conn: &Connection,
     kind: Kind,
@@ -384,6 +408,13 @@ pub fn create_series(
     period_type: Option<PeriodType>,
     mode: Option<Mode>,
 ) -> Result<String> {
+    let mode = match kind {
+        Kind::Envelope => Some(match mode {
+            Some(m) => m,
+            None => crate::queries::default_mode(conn)?,
+        }),
+        Kind::Transaction => None, // transactions carry no mode
+    };
     let id = new_id();
     conn.execute(
         "INSERT INTO series (id, kind, label, direction, period_type, mode)
@@ -441,8 +472,9 @@ pub fn set_series_direction(conn: &Connection, series_id: &str, direction: Direc
     Ok(())
 }
 
-/// `None` clears the column so the envelope inherits the global default mode.
-pub fn set_series_mode(conn: &Connection, series_id: &str, mode: Option<Mode>) -> Result<()> {
+/// Set an envelope series' mode to a concrete value. There is no "inherit" state anymore:
+/// mode is frozen at creation, and this is how the user explicitly changes it afterwards.
+pub fn set_series_mode(conn: &Connection, series_id: &str, mode: Mode) -> Result<()> {
     conn.execute("UPDATE series SET mode = ?1 WHERE id = ?2", rusqlite::params![mode, series_id])?;
     Ok(())
 }
@@ -475,6 +507,131 @@ pub fn delete_series(conn: &Connection, series_id: &str) -> Result<()> {
         anyhow::bail!("series is used by {refs} plan item(s); remove it from those plans first");
     }
     conn.execute("DELETE FROM series WHERE id = ?1", [series_id])?;
+    Ok(())
+}
+
+// --- Ad-hoc month items (§ not-from-a-plan) ------------------------------------
+//
+// These write instances straight into a *month*, with `series_id = NULL` to mark them
+// hand-entered (the same signal one-off txns have always used). They never touch `plan`,
+// `plan_item`, or `series`, so they can't accidentally become part of a template. Restamp
+// Merge ignores them (it matches by series id) and Replace treats them as hand-entered.
+
+/// Add a standalone (no-envelope) one-off transaction to a month — an ad-hoc bill or bit of
+/// income. `series_id` and `stamped_amount` stay NULL (nothing to revert to), and it starts
+/// unsettled. Returns the new txn id so the caller can select it for editing.
+pub fn add_oneoff_txn(
+    conn: &Connection,
+    month_id: &str,
+    label: &str,
+    direction: Direction,
+    amount: Money,
+) -> Result<String> {
+    let id = new_id();
+    conn.execute(
+        "INSERT INTO txn (id, month_id, label, direction, amount_cents, settled)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        rusqlite::params![id, month_id, label, direction, amount],
+    )?;
+    Ok(id)
+}
+
+/// Add an ad-hoc envelope straight into a month (no series behind it). `stamped_amount`
+/// equals `amount` at creation, mirroring a stamped envelope, so "revert to planned" has a
+/// sensible target even though there's no plan. Returns the new envelope id.
+pub fn add_oneoff_envelope(
+    conn: &Connection,
+    month_id: &str,
+    label: &str,
+    amount: Money,
+    period_type: PeriodType,
+    mode: Mode,
+) -> Result<String> {
+    let id = new_id();
+    conn.execute(
+        "INSERT INTO envelope
+           (id, month_id, series_id, label, category, amount_cents,
+            stamped_amount_cents, period_type, mode)
+         VALUES (?1, ?2, NULL, ?3, NULL, ?4, ?5, ?6, ?7)",
+        rusqlite::params![id, month_id, label, amount, amount, period_type, mode],
+    )?;
+    Ok(id)
+}
+
+/// File a spend inside a manual envelope (what "feeds" it — a manual envelope's consumed
+/// amount is the sum of the txns filed in it; see `calc::envelope_consumed`). It's a
+/// hand-entered txn (`series_id NULL`) linked by `envelope_id`, direction Out, and marked
+/// settled since it records money already spent. Returns the new txn id.
+pub fn add_envelope_spending(
+    conn: &Connection,
+    month_id: &str,
+    envelope_id: &str,
+    label: &str,
+    amount: Money,
+) -> Result<String> {
+    let id = new_id();
+    conn.execute(
+        "INSERT INTO txn (id, month_id, envelope_id, label, direction, amount_cents, settled)
+         VALUES (?1, ?2, ?3, ?4, 'out', ?5, 1)",
+        rusqlite::params![id, month_id, envelope_id, label, amount],
+    )?;
+    Ok(id)
+}
+
+// Per-field editors for a month's instances. These edit the *instance* (this month's copy),
+// never a series — so they're safe for ad-hoc items and never leak into a plan. The
+// dashboard gates them to ad-hoc rows; plan-derived instances are managed via Plans.
+
+pub fn set_txn_label(conn: &Connection, txn_id: &str, label: &str) -> Result<()> {
+    conn.execute("UPDATE txn SET label = ?1 WHERE id = ?2", rusqlite::params![label, txn_id])?;
+    Ok(())
+}
+
+pub fn set_txn_amount(conn: &Connection, txn_id: &str, amount: Money) -> Result<()> {
+    conn.execute("UPDATE txn SET amount_cents = ?1 WHERE id = ?2", rusqlite::params![amount, txn_id])?;
+    Ok(())
+}
+
+pub fn set_txn_direction(conn: &Connection, txn_id: &str, direction: Direction) -> Result<()> {
+    conn.execute("UPDATE txn SET direction = ?1 WHERE id = ?2", rusqlite::params![direction, txn_id])?;
+    Ok(())
+}
+
+/// Delete a single transaction. Used for ad-hoc one-offs on the dashboard. (A standalone
+/// txn has no children; envelope-spending txns are deleted here too when their envelope is.)
+pub fn delete_txn(conn: &Connection, txn_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM txn WHERE id = ?1", [txn_id])?;
+    Ok(())
+}
+
+pub fn set_envelope_label(conn: &Connection, id: &str, label: &str) -> Result<()> {
+    conn.execute("UPDATE envelope SET label = ?1 WHERE id = ?2", rusqlite::params![label, id])?;
+    Ok(())
+}
+
+pub fn set_envelope_amount(conn: &Connection, id: &str, amount: Money) -> Result<()> {
+    conn.execute("UPDATE envelope SET amount_cents = ?1 WHERE id = ?2", rusqlite::params![amount, id])?;
+    Ok(())
+}
+
+pub fn set_envelope_mode(conn: &Connection, id: &str, mode: Mode) -> Result<()> {
+    conn.execute("UPDATE envelope SET mode = ?1 WHERE id = ?2", rusqlite::params![mode, id])?;
+    Ok(())
+}
+
+pub fn set_envelope_period(conn: &Connection, id: &str, period: PeriodType) -> Result<()> {
+    conn.execute("UPDATE envelope SET period_type = ?1 WHERE id = ?2", rusqlite::params![period, id])?;
+    Ok(())
+}
+
+/// Delete an envelope instance and any spending filed in it. The `txn.envelope_id` foreign
+/// key means we must clear the children first, so this runs in a transaction: drop the
+/// envelope's txns, then the envelope. Used for ad-hoc envelopes on the dashboard.
+pub fn delete_envelope(conn: &mut Connection, id: &str) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM txn WHERE envelope_id = ?1", [id])?;
+    tx.execute("DELETE FROM envelope WHERE id = ?1", [id])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -777,5 +934,83 @@ mod tests {
         assert!(delete_series(&conn, &s).is_err(), "blocked while a plan uses it");
         delete_plan_item(&conn, &item).unwrap();
         assert!(delete_series(&conn, &s).is_ok(), "allowed once unreferenced");
+    }
+
+    #[test]
+    fn adhoc_items_are_hand_entered_and_seriesless() {
+        let mut conn = db::open_in_memory().unwrap();
+        seed_demo(&mut conn).unwrap();
+        let month = queries::current_month(&conn).unwrap().unwrap();
+
+        // A fresh stamped month from the demo has no hand-entered data yet.
+        assert!(!month_has_handentered(&conn, &month.id).unwrap());
+
+        // Add an ad-hoc bill and an ad-hoc envelope.
+        let txn_id = add_oneoff_txn(&conn, &month.id, "Concert", Direction::Out, Money::from_dollars(120.0)).unwrap();
+        let env_id = add_oneoff_envelope(&conn, &month.id, "Fun", Money::from_dollars(200.0), PeriodType::Monthly, Mode::Manual).unwrap();
+
+        // Both are seriesless (the ad-hoc marker) and now count as hand-entered.
+        let txn = queries::load_txns(&conn, &month.id).unwrap().into_iter().find(|t| t.id == txn_id).unwrap();
+        assert!(txn.series_id.is_none() && txn.envelope_id.is_none() && txn.stamped_amount.is_none());
+        let env = queries::load_envelopes(&conn, &month.id).unwrap().into_iter().find(|e| e.id == env_id).unwrap();
+        assert!(env.series_id.is_none());
+        assert!(month_has_handentered(&conn, &month.id).unwrap(), "ad-hoc envelope alone trips the flag");
+    }
+
+    #[test]
+    fn feeding_a_manual_envelope_consumes_it() {
+        use crate::calc;
+        let mut conn = db::open_in_memory().unwrap();
+        seed_demo(&mut conn).unwrap();
+        let month = queries::current_month(&conn).unwrap().unwrap();
+
+        let env_id = add_oneoff_envelope(&conn, &month.id, "Fun", Money::from_dollars(200.0), PeriodType::Monthly, Mode::Manual).unwrap();
+        add_envelope_spending(&conn, &month.id, &env_id, "Lunch", Money::from_dollars(30.0)).unwrap();
+        add_envelope_spending(&conn, &month.id, &env_id, "Movie", Money::from_dollars(20.0)).unwrap();
+
+        // Manual consumed = sum of filed spending, independent of elapsed time.
+        let env = queries::load_envelopes(&conn, &month.id).unwrap().into_iter().find(|e| e.id == env_id).unwrap();
+        let env_txns = queries::load_txns(&conn, &month.id).unwrap()
+            .into_iter().filter(|t| t.envelope_id.as_deref() == Some(env_id.as_str())).collect::<Vec<_>>();
+        let consumed = calc::envelope_consumed(&env, Mode::Manual, &env_txns, 0.0);
+        assert_eq!(consumed, Money::from_dollars(50.0));
+    }
+
+    #[test]
+    fn replace_wipes_or_keeps_adhoc_envelope() {
+        // Build a month with one plan bill plus an ad-hoc manual envelope that has spending.
+        fn setup() -> (Connection, String, String, String) {
+            let mut conn = db::open_in_memory().unwrap();
+            let plan = create_plan(&conn, "P").unwrap();
+            let rent = create_series(&conn, Kind::Transaction, "Rent", Some(Direction::Out), None, None).unwrap();
+            add_plan_item(&conn, &plan, &rent, Money::from_dollars(1000.0)).unwrap();
+            let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+            let month_id = stamp(&mut conn, &plan, "2026-09", start, 30).unwrap();
+
+            let env_id = add_oneoff_envelope(&conn, &month_id, "Fun", Money::from_dollars(200.0), PeriodType::Monthly, Mode::Manual).unwrap();
+            add_envelope_spending(&conn, &month_id, &env_id, "Lunch", Money::from_dollars(30.0)).unwrap();
+            (conn, plan, month_id, env_id)
+        }
+
+        // Wipe: the ad-hoc envelope and its spending are both gone; the plan bill survives.
+        {
+            let (mut conn, plan, month_id, env_id) = setup();
+            restamp_replace(&mut conn, &month_id, &plan, false).unwrap();
+            let envs = queries::load_envelopes(&conn, &month_id).unwrap();
+            assert!(envs.iter().all(|e| e.id != env_id), "ad-hoc envelope wiped");
+            let txns = queries::load_txns(&conn, &month_id).unwrap();
+            assert!(txns.iter().all(|t| t.envelope_id.is_none()), "its spending wiped too");
+            assert!(txns.iter().any(|t| t.label == "Rent"), "plan bill kept");
+        }
+
+        // Keep: the ad-hoc envelope and its spending both remain, still linked.
+        {
+            let (mut conn, plan, month_id, env_id) = setup();
+            restamp_replace(&mut conn, &month_id, &plan, true).unwrap();
+            let envs = queries::load_envelopes(&conn, &month_id).unwrap();
+            assert!(envs.iter().any(|e| e.id == env_id), "ad-hoc envelope kept");
+            let txns = queries::load_txns(&conn, &month_id).unwrap();
+            assert!(txns.iter().any(|t| t.envelope_id.as_deref() == Some(env_id.as_str())), "spending still linked");
+        }
     }
 }
