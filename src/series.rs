@@ -9,13 +9,13 @@ use ballpark::view::{
     SeriesDetailView, SeriesGroup, SeriesPageView, SeriesTimeRange, SeriesTrendPoint,
 };
 use chrono::{Datelike, NaiveDate};
-use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Chart, Dataset, GraphType, ListItem, ListState, Paragraph};
+use ratatui::Frame;
 
 enum SidebarRow {
     Header(SeriesGroup),
@@ -343,15 +343,15 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
         return;
     };
 
-    let [summary_area, chart_area, current_area] = Layout::vertical([
-        Constraint::Length(8),
+    let [chart_area, summary_area, current_area] = Layout::vertical([
         Constraint::Min(8),
+        Constraint::Length(8),
         Constraint::Length(4),
     ])
     .areas(area);
 
-    draw_summary(frame, summary_area, detail);
     draw_chart(frame, chart_area, detail, &view.range_label);
+    draw_summary(frame, summary_area, detail);
     draw_current(frame, current_area, detail);
 }
 
@@ -435,41 +435,27 @@ fn draw_chart(frame: &mut Frame, area: Rect, detail: &SeriesDetailView, range_la
         return;
     }
 
-    let effective_segments = chart_segments(&detail.points, |point| point.effective);
-    let planned_segments = chart_segments(&detail.points, |point| point.planned);
     let values: Vec<f64> = detail
         .points
         .iter()
-        .flat_map(|point| [point.effective, point.planned])
-        .flatten()
+        .filter_map(|point| point.effective)
         .map(money_as_dollars)
         .collect();
     let (y_min, y_max) = y_bounds(&values);
     let x_max = detail.points.len().saturating_sub(1).max(1) as f64;
+    let bar_data: Vec<(f64, f64)> = detail
+        .points
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, point)| Some((idx as f64, money_as_dollars(point.effective?))))
+        .collect();
 
-    let mut datasets = Vec::new();
-    for (idx, segment) in effective_segments.iter().enumerate() {
-        let mut dataset = Dataset::default()
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Color::Cyan)
-            .data(segment.as_slice());
-        if idx == 0 {
-            dataset = dataset.name("effective");
-        }
-        datasets.push(dataset);
-    }
-    for (idx, segment) in planned_segments.iter().enumerate() {
-        let mut dataset = Dataset::default()
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Color::DarkGray)
-            .data(segment.as_slice());
-        if idx == 0 {
-            dataset = dataset.name("planned");
-        }
-        datasets.push(dataset);
-    }
+    let dataset = Dataset::default()
+        .name("effective")
+        .marker(Marker::Block)
+        .graph_type(GraphType::Bar)
+        .style(Color::Cyan)
+        .data(bar_data.as_slice());
 
     let x_axis = Axis::default()
         .title("month")
@@ -479,11 +465,23 @@ fn draw_chart(frame: &mut Frame, area: Rect, detail: &SeriesDetailView, range_la
         .title("amount")
         .bounds([y_min, y_max])
         .labels(axis_money_labels(y_min, y_max));
-    let chart = Chart::new(datasets)
+    let chart = Chart::new(vec![dataset])
         .block(crate::titled_block(format!(" Amount - {range_label} ")))
         .x_axis(x_axis)
         .y_axis(y_axis);
-    frame.render_widget(chart, area);
+
+    if area.height >= 8 {
+        let [chart_area, labels_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+        frame.render_widget(chart, chart_area);
+        frame.render_widget(
+            Paragraph::new(month_bar_labels(&detail.points, labels_area.width as usize))
+                .alignment(Alignment::Center),
+            labels_area,
+        );
+    } else {
+        frame.render_widget(chart, area);
+    }
 }
 
 fn draw_empty_chart(frame: &mut Frame, area: Rect, msg: &str, range_label: &str) {
@@ -637,35 +635,43 @@ fn visible_indices(app: &App, view: &SeriesPageView) -> Vec<usize> {
         .collect()
 }
 
-fn chart_segments(
-    points: &[SeriesTrendPoint],
-    value: fn(&SeriesTrendPoint) -> Option<Money>,
-) -> Vec<Vec<(f64, f64)>> {
-    let mut segments = Vec::new();
-    let mut current = Vec::new();
-    for (idx, point) in points.iter().enumerate() {
-        if let Some(amount) = value(point) {
-            current.push((idx as f64, money_as_dollars(amount)));
-        } else if !current.is_empty() {
-            segments.push(current);
-            current = Vec::new();
-        }
-    }
-    if !current.is_empty() {
-        segments.push(current);
-    }
-    segments
-}
-
 fn y_bounds(values: &[f64]) -> (f64, f64) {
-    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min = values
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min)
+        .min(0.0);
+    let max = values
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(0.0);
     if (max - min).abs() < f64::EPSILON {
         let pad = (max.abs() * 0.10).max(1.0);
         (min - pad, max + pad)
     } else {
-        let pad = ((max - min) * 0.15).max(1.0);
-        (min - pad, max + pad)
+        let pad = ((max - min) * 0.10).max(1.0);
+        let lower = if min >= 0.0 { 0.0 } else { min - pad };
+        let upper = if max <= 0.0 { 0.0 } else { max + pad };
+        (lower, upper)
+    }
+}
+
+fn month_bar_labels(points: &[SeriesTrendPoint], width: usize) -> Line<'static> {
+    let labels: Vec<String> = points
+        .iter()
+        .map(|point| month_name(&point.month_label).to_string())
+        .collect();
+    let full = labels.join(" ");
+    if full.len() <= width {
+        Line::from(Span::styled(full, Style::default().fg(Color::DarkGray)))
+    } else if let (Some(first), Some(last)) = (labels.first(), labels.last()) {
+        Line::from(Span::styled(
+            format!("{first} ... {last}"),
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Line::raw("")
     }
 }
 
@@ -685,7 +691,22 @@ fn short_month_label(label: &str) -> String {
     let Some((year, month)) = label.split_once('-') else {
         return label.to_string();
     };
-    let month = match month {
+    format!(
+        "{} {}",
+        month_name_from_number(month),
+        year.chars().skip(2).collect::<String>()
+    )
+}
+
+fn month_name(label: &str) -> &str {
+    let Some((_, month)) = label.split_once('-') else {
+        return label;
+    };
+    month_name_from_number(month)
+}
+
+fn month_name_from_number(month: &str) -> &str {
+    match month {
         "01" => "Jan",
         "02" => "Feb",
         "03" => "Mar",
@@ -699,8 +720,7 @@ fn short_month_label(label: &str) -> String {
         "11" => "Nov",
         "12" => "Dec",
         _ => month,
-    };
-    format!("{month} {}", year.chars().skip(2).collect::<String>())
+    }
 }
 
 fn axis_money_labels(min: f64, max: f64) -> Vec<Line<'static>> {
