@@ -20,8 +20,6 @@ use std::sync::LazyLock;
 static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
     Migrations::new(vec![
         M::up(include_str!("schema.sql")),
-        M::up(include_str!("migrations/002_first_class_series.sql")),
-        M::up(include_str!("migrations/003_credit_card_model.sql")),
     ])
 });
 
@@ -73,7 +71,7 @@ mod tests {
     }
 
     #[test]
-    fn account_migrated_to_card_model() {
+    fn account_uses_card_model() {
         let conn = open_in_memory().expect("schema should apply");
         let cols: Vec<String> = conn
             .prepare("SELECT name FROM pragma_table_info('account')")

@@ -3,26 +3,30 @@
 //! data. A web or desktop frontend could call `MonthView::build` and render it too.
 
 use crate::calc::{self, WhatsLeft};
-use crate::models::{Account, AccountType, Direction, Envelope, Mode, Month, Txn};
+use crate::models::{Account, AccountType, Direction, Envelope, Month, Txn};
 use crate::money::Money;
 use crate::queries;
 use anyhow::Result;
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use rusqlite::Connection;
 
 /// One envelope with its computed state for this point in the month.
 pub struct EnvelopeRow {
     pub envelope: Envelope,
-    pub effective_mode: Mode,
     pub consumed: Money,
     pub remaining: Money,
 }
 
-/// Everything the dashboard needs for the current month.
+/// Everything the dashboard needs for one viewed month.
 pub struct MonthView {
     pub month: Month,
     pub days_elapsed: i64,
     pub elapsed_fraction: f64,
+    /// Whether the viewed period is the real calendar month. It drives two things: the live
+    /// account balances only feed "what's left" when true (spec: off-month is a plain
+    /// balance of that month's transactions + envelopes), and the header labels it as
+    /// current vs. past/upcoming.
+    pub is_current: bool,
     pub whats_left: WhatsLeft,
     /// Every account, in name order — the editable ground-truth balances.
     pub accounts: Vec<Account>,
@@ -32,27 +36,53 @@ pub struct MonthView {
 }
 
 impl MonthView {
-    /// Build the view for the most recent month as of `today`. `None` if nothing stamped.
+    /// Build the view for the calendar month containing `today`. `None` if it isn't stamped.
+    /// A thin wrapper over `build_for` kept for callers (and tests) that just want "now".
     pub fn build(conn: &Connection, today: NaiveDate) -> Result<Option<MonthView>> {
-        let Some(month) = queries::current_month(conn)? else {
+        Self::build_for(conn, today, today.year(), today.month())
+    }
+
+    /// Build the view for a specific `year`-`month` period. Returns `None` when that period
+    /// has no stamped month — the dashboard renders a "not stamped" prompt in that case and
+    /// still lets you keep navigating.
+    pub fn build_for(
+        conn: &Connection,
+        today: NaiveDate,
+        year: i32,
+        month: u32,
+    ) -> Result<Option<MonthView>> {
+        let label = format!("{year:04}-{month:02}");
+        let Some(month_row) = queries::month_by_label(conn, &label)? else {
             return Ok(None);
         };
 
-        let default_mode = queries::default_mode(conn)?;
+        // The one calendar month we're actually living in. Only then are the real-world
+        // account balances part of the headline; past/future months are self-contained.
+        let is_current = year == today.year() && month == today.month();
+
         let accounts = queries::load_accounts(conn)?;
-        let all_txns = queries::load_txns(conn, &month.id)?;
-        let envelopes_raw = queries::load_envelopes(conn, &month.id)?;
+        let all_txns = queries::load_txns(conn, &month_row.id)?;
+        let envelopes_raw = queries::load_envelopes(conn, &month_row.id)?;
 
-        let fraction = calc::elapsed_fraction(month.start_date, month.days_in_month, today);
-        let days_elapsed = calc::days_elapsed(month.start_date, month.days_in_month, today);
+        let fraction = calc::elapsed_fraction(month_row.start_date, month_row.days_in_month, today);
+        let days_elapsed = calc::days_elapsed(month_row.start_date, month_row.days_in_month, today);
 
-        // Cash-flow roles by account type: checking is spendable, credit cards are debt.
-        let funds_available: Money = accounts
-            .iter()
-            .filter(|a| a.account_type == AccountType::Checking)
-            .map(|a| a.balance)
-            .sum();
-        let card_debt: Money = accounts.iter().map(|a| a.owed()).sum();
+        // Cash-flow roles by account type: checking is spendable, credit cards are debt, and
+        // carry balances net out (buffers −, card carryovers +). These three account-derived
+        // terms only apply to the current month — off-month we zero them so "what's left" is
+        // purely income − bills − envelopes for that period.
+        let (funds_available, card_debt, carry_adjustment) = if is_current {
+            let funds: Money = accounts
+                .iter()
+                .filter(|a| a.account_type == AccountType::Checking)
+                .map(|a| a.balance)
+                .sum();
+            let debt: Money = accounts.iter().map(|a| a.owed()).sum();
+            let carry: Money = accounts.iter().map(|a| a.carry_adjustment()).sum();
+            (funds, debt, carry)
+        } else {
+            (Money::ZERO, Money::ZERO, Money::ZERO)
+        };
 
         // Standalone transactions (envelope_id IS NULL) drive income/bills remaining.
         let standalone: Vec<Txn> = all_txns
@@ -75,15 +105,15 @@ impl MonthView {
         // Each envelope's remaining, using its own transactions when manual.
         let mut envelopes = Vec::new();
         for env in envelopes_raw {
-            let mode = calc::effective_mode(&env, default_mode);
+            // `env.mode` is the frozen snapshot from stamp time — no global re-resolution.
             let env_txns: Vec<Txn> = all_txns
                 .iter()
                 .filter(|t| t.envelope_id.as_deref() == Some(env.id.as_str()))
                 .cloned()
                 .collect();
-            let consumed = calc::envelope_consumed(&env, mode, &env_txns, fraction);
+            let consumed = calc::envelope_consumed(&env, env.mode, &env_txns, fraction);
             let remaining = calc::envelope_remaining(&env, consumed);
-            envelopes.push(EnvelopeRow { envelope: env, effective_mode: mode, consumed, remaining });
+            envelopes.push(EnvelopeRow { envelope: env, consumed, remaining });
         }
         let envelopes_remaining: Money = envelopes.iter().map(|e| e.remaining).sum();
 
@@ -100,12 +130,14 @@ impl MonthView {
             income_remaining,
             bills_remaining,
             envelopes_remaining,
+            carry_adjustment,
         );
 
         Ok(Some(MonthView {
-            month,
+            month: month_row,
             days_elapsed,
             elapsed_fraction: fraction,
+            is_current,
             whats_left,
             accounts, // moved in after its balances were summed above
             standalone,
@@ -179,5 +211,47 @@ mod tests {
         let after = MonthView::build(&conn, today).unwrap().unwrap();
         assert_eq!(after.whats_left.card_debt, before.whats_left.card_debt + Money::from_dollars(100.0));
         assert_eq!(after.whats_left.whats_left, before.whats_left.whats_left - Money::from_dollars(100.0));
+    }
+
+    #[test]
+    fn off_month_excludes_account_balances() {
+        use crate::ops;
+        let mut conn = db::open_in_memory().unwrap();
+        ops::seed_demo(&mut conn).unwrap(); // stamps the current calendar month
+        let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+
+        // Stamp a clearly non-current period (next year) from the same demo plan.
+        let plan_id = queries::plans(&conn).unwrap()[0].id.clone();
+        let start = NaiveDate::from_ymd_opt(2027, 3, 1).unwrap();
+        ops::stamp(&mut conn, &plan_id, "2027-03", start, 31).unwrap();
+
+        let future = MonthView::build_for(&conn, today, 2027, 3).unwrap().unwrap();
+
+        // Off-month: the three account-derived terms drop out entirely...
+        assert!(!future.is_current);
+        assert_eq!(future.whats_left.funds_available, Money::ZERO);
+        assert_eq!(future.whats_left.card_debt, Money::ZERO);
+        assert_eq!(future.whats_left.carry_adjustment, Money::ZERO);
+        // ...leaving a plain income − bills − envelopes balance.
+        let wl = &future.whats_left;
+        assert_eq!(
+            wl.whats_left,
+            wl.income_remaining - wl.bills_remaining - wl.envelopes_remaining
+        );
+
+        // The current month, by contrast, still folds the checking balance in.
+        let current = MonthView::build_for(&conn, today, 2026, 7).unwrap().unwrap();
+        assert!(current.is_current);
+        assert_eq!(current.whats_left.funds_available, Money::from_dollars(4200.0));
+    }
+
+    #[test]
+    fn unstamped_period_has_no_view() {
+        let mut conn = db::open_in_memory().unwrap();
+        ops::seed_demo(&mut conn).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        // A period nobody stamped returns None — the dashboard renders its "not stamped"
+        // prompt for this and still lets you navigate away.
+        assert!(MonthView::build_for(&conn, today, 2099, 1).unwrap().is_none());
     }
 }

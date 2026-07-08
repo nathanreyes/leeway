@@ -28,7 +28,8 @@ pub fn default_mode(conn: &Connection) -> Result<Mode> {
 
 pub fn load_accounts(conn: &Connection) -> Result<Vec<Account>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, type, balance_cents, credit_limit_cents, available_credit_cents
+        "SELECT id, name, type, balance_cents, credit_limit_cents, available_credit_cents,
+                carry_balance_cents
          FROM account ORDER BY name",
     )?;
     // `query_map` runs the SQL and applies the mapper to each row; `collect` gathers the
@@ -50,6 +51,21 @@ pub fn current_month(conn: &Connection) -> Result<Option<Month>> {
     match rows.next() {
         None => Ok(None),
         Some(raw) => Ok(Some(raw?.parse()?)), // parse the date string -> NaiveDate here
+    }
+}
+
+/// The stamped month for a specific `YYYY-MM` label, or `None` if that period was never
+/// stamped. This is the month-navigation counterpart to `current_month`: the dashboard now
+/// views one *chosen* period (which may not exist yet) rather than always the latest one.
+pub fn month_by_label(conn: &Connection, label: &str) -> Result<Option<Month>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, plan_id, label, start_date, days_in_month
+         FROM month WHERE label = ?1 LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map([label], map_month_raw)?;
+    match rows.next() {
+        None => Ok(None),
+        Some(raw) => Ok(Some(raw?.parse()?)), // same string -> NaiveDate parse as current_month
     }
 }
 
@@ -226,6 +242,7 @@ fn map_account(r: &Row) -> rusqlite::Result<Account> {
         balance: r.get("balance_cents")?, // Money::FromSql
         credit_limit: r.get("credit_limit_cents")?, // Option<Money>: NULL -> None
         available_credit: r.get("available_credit_cents")?,
+        carry_balance: r.get("carry_balance_cents")?, // Option<Money>: NULL -> None
     })
 }
 
@@ -239,7 +256,7 @@ fn map_envelope(r: &Row) -> rusqlite::Result<Envelope> {
         amount: r.get("amount_cents")?,
         stamped_amount: r.get("stamped_amount_cents")?,
         period_type: r.get("period_type")?,
-        mode: r.get("mode")?, // Option<Mode>: NULL -> None
+        mode: r.get("mode")?, // Mode: NOT NULL since migration 004 (frozen at stamp time)
     })
 }
 

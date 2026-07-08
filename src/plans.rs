@@ -189,11 +189,10 @@ pub fn handle_editor_key(app: &mut App, key: KeyEvent, plan: &Plan, entries: &[P
         KeyCode::Char('m') => {
             if let Some(en) = selected {
                 if en.series.kind == Kind::Envelope {
-                    // None (inherit) -> automatic -> manual -> None
+                    // Envelope series always carry a concrete mode; toggle automatic <-> manual.
                     let next = match en.series.mode {
-                        None => Some(Mode::Automatic),
-                        Some(Mode::Automatic) => Some(Mode::Manual),
-                        Some(Mode::Manual) => None,
+                        Some(Mode::Manual) => Mode::Automatic,
+                        _ => Mode::Manual,
                     };
                     ops::set_series_mode(&app.conn, &en.series.id, next)?;
                     app.status = Some("Mode changed (affects all plans using this series)".into());
@@ -288,10 +287,10 @@ fn entry_row(entry: &PlanEntry) -> ListItem<'static> {
                 Some(PeriodType::Weekly) => "weekly",
                 _ => "monthly",
             };
+            // Envelope series always carry a concrete mode; None is unreachable here.
             let mode = match s.mode {
-                None => "inherit",
-                Some(Mode::Automatic) => "auto",
                 Some(Mode::Manual) => "manual",
+                _ => "auto",
             };
             ("E", Color::Magenta, format!("{:<8}{:<8}", period, mode))
         }
