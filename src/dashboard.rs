@@ -523,7 +523,7 @@ fn account_block_height(view: &MonthView) -> u16 {
     if view.is_current {
         view.accounts.len().saturating_add(2).clamp(3, 7) as u16
     } else {
-        8
+        4
     }
 }
 
@@ -628,21 +628,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
 fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
     if !view.is_current {
         let lines = vec![
-            Line::raw(""),
             Line::from(Span::styled(
-                " Account balances only apply to the current month.",
+                " Account balances apply only to the current month.",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(Span::styled(
-                " Past and future months are plan snapshots:",
-                Style::default().fg(Color::Gray),
-            )),
-            Line::from(Span::styled(
-                " income left - bills left - envelopes left.",
-                Style::default().fg(Color::Gray),
-            )),
-            Line::from(Span::styled(
-                " Use the current month to update balances, buffers, and carry.",
+                " This month uses plan snapshot math: income - bills - envelopes.",
                 Style::default().fg(Color::Gray),
             )),
         ];
@@ -677,8 +668,8 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                         format!("{:<primary_width$}", format!("balance {}", a.balance)),
                         Style::default().fg(color),
                     ),
+                    carry_column("buffer", a.carry_balance, adjustment_width),
                     Span::raw(format!("{:<detail_width$}", "")),
-                    carry_column("buffer", a.carry_balance),
                 ]))
             }
             AccountType::CreditCard => {
@@ -698,9 +689,10 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                         format!("{:<primary_width$}", format!("owed {}", owed)),
                         Style::default().fg(owed_color),
                     ),
+                    carry_column("carry", a.carry_balance, adjustment_width),
                     Span::styled(
                         format!(
-                            "{:<detail_width$}",
+                            "{:>detail_width$}",
                             crate::truncate(
                                 &format!(
                                     "avail {} / limit {}",
@@ -712,7 +704,6 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                         ),
                         Style::default().fg(Color::DarkGray),
                     ),
-                    carry_column("carry", a.carry_balance),
                 ]))
             }
         })
@@ -734,14 +725,14 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn carry_column(label: &str, carry_balance: Option<Money>) -> Span<'static> {
+fn carry_column(label: &str, carry_balance: Option<Money>, width: usize) -> Span<'static> {
     let carry = carry_balance.unwrap_or(Money::ZERO);
     let style = if carry == Money::ZERO {
         Style::default().fg(Color::DarkGray)
     } else {
         Style::default().fg(Color::Yellow)
     };
-    Span::styled(format!("{label} {carry}"), style)
+    Span::styled(format!("{:<width$}", format!("{label} {carry}")), style)
 }
 
 /// A bordered block whose border turns cyan when its panel is focused.
@@ -815,12 +806,29 @@ fn draw_whats_left(frame: &mut Frame, area: Rect, view: &MonthView) {
     if view.is_current {
         let mut row = summary_term(wl.funds_available, "funds", Color::Cyan);
         row.push(Span::raw("  "));
+        if wl.checking_buffer != Money::ZERO {
+            row.extend(summary_term(
+                Money(-wl.checking_buffer.cents()),
+                "buffer",
+                Color::Yellow,
+            ));
+            row.push(Span::raw("  "));
+        }
         row.extend(summary_term(
             Money(-wl.card_debt.cents()),
             "card debt",
             Color::Red,
         ));
+        if wl.card_carry != Money::ZERO {
+            row.push(Span::raw("  "));
+            row.extend(summary_term(wl.card_carry, "carry", Color::Yellow));
+        }
         lines.push(Line::from(row));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "account balances count only in the current month",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     let mut row = summary_term(wl.income_remaining, "income left", Color::Green);
@@ -833,23 +841,16 @@ fn draw_whats_left(frame: &mut Frame, area: Rect, view: &MonthView) {
     lines.push(Line::from(row));
 
     if view.is_current {
-        let mut row = summary_term(
-            Money(-wl.envelopes_remaining.cents()),
-            "envelopes",
-            Color::Magenta,
-        );
-        row.push(Span::raw("  "));
-        row.extend(summary_term(wl.carry_adjustment, "carry", Color::Yellow));
-        lines.push(Line::from(row));
-    } else {
         lines.push(Line::from(summary_term(
             Money(-wl.envelopes_remaining.cents()),
             "envelopes",
             Color::Magenta,
         )));
-        lines.push(Line::from(Span::styled(
-            "  account balances count only in the current month",
-            Style::default().fg(Color::DarkGray),
+    } else {
+        lines.push(Line::from(summary_term(
+            Money(-wl.envelopes_remaining.cents()),
+            "envelopes",
+            Color::Magenta,
         )));
     }
 

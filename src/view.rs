@@ -71,17 +71,26 @@ impl MonthView {
         // carry balances net out (buffers −, card carryovers +). These three account-derived
         // terms only apply to the current month — off-month we zero them so "what's left" is
         // purely income − bills − envelopes for that period.
-        let (funds_available, card_debt, carry_adjustment) = if is_current {
+        let (funds_available, card_debt, checking_buffer, card_carry) = if is_current {
             let funds: Money = accounts
                 .iter()
                 .filter(|a| a.account_type == AccountType::Checking)
                 .map(|a| a.balance)
                 .sum();
             let debt: Money = accounts.iter().map(|a| a.owed()).sum();
-            let carry: Money = accounts.iter().map(|a| a.carry_adjustment()).sum();
-            (funds, debt, carry)
+            let buffer: Money = accounts
+                .iter()
+                .filter(|a| a.account_type == AccountType::Checking)
+                .map(|a| a.carry_balance.unwrap_or(Money::ZERO))
+                .sum();
+            let carry: Money = accounts
+                .iter()
+                .filter(|a| a.account_type == AccountType::CreditCard)
+                .map(|a| a.carry_balance.unwrap_or(Money::ZERO))
+                .sum();
+            (funds, debt, buffer, carry)
         } else {
-            (Money::ZERO, Money::ZERO, Money::ZERO)
+            (Money::ZERO, Money::ZERO, Money::ZERO, Money::ZERO)
         };
 
         // Standalone transactions (envelope_id IS NULL) drive income/bills remaining.
@@ -124,13 +133,14 @@ impl MonthView {
             dir.then_with(|| a.label.cmp(&b.label))
         });
 
-        let whats_left = WhatsLeft::compute(
+        let whats_left = WhatsLeft::compute_with_carry_parts(
             funds_available,
             card_debt,
             income_remaining,
             bills_remaining,
             envelopes_remaining,
-            carry_adjustment,
+            checking_buffer,
+            card_carry,
         );
 
         Ok(Some(MonthView {

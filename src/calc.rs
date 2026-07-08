@@ -65,6 +65,8 @@ pub struct WhatsLeft {
     pub income_remaining: Money,    // unsettled standalone income
     pub bills_remaining: Money,     // unsettled standalone bills
     pub envelopes_remaining: Money, // sum of every envelope's remaining
+    pub checking_buffer: Money,     // checking carry balances held back from spendable funds
+    pub card_carry: Money,          // credit-card carry balances not paid this month
     pub carry_adjustment: Money,    // net of checking buffers (−) and card carryovers (+)
     pub whats_left: Money,          // the headline
 }
@@ -78,6 +80,27 @@ impl WhatsLeft {
         envelopes_remaining: Money,
         carry_adjustment: Money,
     ) -> WhatsLeft {
+        WhatsLeft::compute_with_carry_parts(
+            funds_available,
+            card_debt,
+            income_remaining,
+            bills_remaining,
+            envelopes_remaining,
+            Money::ZERO,
+            carry_adjustment,
+        )
+    }
+
+    pub fn compute_with_carry_parts(
+        funds_available: Money,
+        card_debt: Money,
+        income_remaining: Money,
+        bills_remaining: Money,
+        envelopes_remaining: Money,
+        checking_buffer: Money,
+        card_carry: Money,
+    ) -> WhatsLeft {
+        let carry_adjustment = card_carry - checking_buffer;
         // `funds_available` and `card_debt` stay raw so the dashboard can show the real
         // cash and real debt; the carry balances land here as one already-signed term
         // (see Account::carry_adjustment for the per-type sign).
@@ -91,6 +114,8 @@ impl WhatsLeft {
             income_remaining,
             bills_remaining,
             envelopes_remaining,
+            checking_buffer,
+            card_carry,
             carry_adjustment,
             whats_left,
         }
@@ -172,6 +197,24 @@ mod tests {
         );
         // 5000 - 1200 + 800 - 1500 - 900 + 0 = 2200
         assert_eq!(wl.whats_left, Money::from_dollars(2200.0));
+    }
+
+    #[test]
+    fn whats_left_formula_with_split_buffer_and_carry() {
+        let wl = WhatsLeft::compute_with_carry_parts(
+            Money::from_dollars(5000.0), // funds
+            Money::from_dollars(1200.0), // card debt
+            Money::from_dollars(800.0),  // income remaining
+            Money::from_dollars(1500.0), // bills remaining
+            Money::from_dollars(900.0),  // envelopes remaining
+            Money::from_dollars(500.0),  // checking buffer
+            Money::from_dollars(300.0),  // card carry
+        );
+        // 5000 - 1200 + 800 - 1500 - 900 - 500 + 300 = 2000
+        assert_eq!(wl.checking_buffer, Money::from_dollars(500.0));
+        assert_eq!(wl.card_carry, Money::from_dollars(300.0));
+        assert_eq!(wl.carry_adjustment, Money::from_dollars(-200.0));
+        assert_eq!(wl.whats_left, Money::from_dollars(2000.0));
     }
 
     #[test]

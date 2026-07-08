@@ -1474,6 +1474,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
+            after.whats_left.checking_buffer,
+            Money::from_dollars(500.0)
+        );
+        assert_eq!(after.whats_left.card_carry, Money::from_dollars(300.0));
+        assert_eq!(
             after.whats_left.carry_adjustment,
             Money::from_dollars(-200.0)
         );
