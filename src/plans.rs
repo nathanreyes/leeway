@@ -528,6 +528,7 @@ mod tests {
             pending_select: None,
             pending_dash_txn: None,
             pending_dash_env: None,
+            pending_dash_account: None,
             modal: None,
             status: None,
         };

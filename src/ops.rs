@@ -434,6 +434,84 @@ pub fn set_available_credit(conn: &Connection, account_id: &str, available: Mone
     Ok(())
 }
 
+/// Create a checking account. Carry balance starts unset, which the calculation treats as
+/// zero; it can be edited later from the Accounts panel.
+pub fn create_checking_account(conn: &Connection, name: &str, balance: Money) -> Result<String> {
+    let id = new_id();
+    conn.execute(
+        "INSERT INTO account
+            (id, name, type, balance_cents, credit_limit_cents, available_credit_cents,
+             carry_balance_cents)
+         VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL)",
+        rusqlite::params![id, name, AccountType::Checking.as_str(), balance],
+    )?;
+    Ok(id)
+}
+
+/// Create a credit-card account. `balance_cents` is unused for cards; owed is derived from
+/// limit minus available credit.
+pub fn create_credit_card_account(
+    conn: &Connection,
+    name: &str,
+    credit_limit: Money,
+    available_credit: Money,
+) -> Result<String> {
+    let id = new_id();
+    conn.execute(
+        "INSERT INTO account
+            (id, name, type, balance_cents, credit_limit_cents, available_credit_cents,
+             carry_balance_cents)
+         VALUES (?1, ?2, ?3, 0, ?4, ?5, NULL)",
+        rusqlite::params![
+            id,
+            name,
+            AccountType::CreditCard.as_str(),
+            credit_limit,
+            available_credit
+        ],
+    )?;
+    Ok(id)
+}
+
+/// Rename an account. The name is cosmetic; transactions reference the id.
+pub fn rename_account(conn: &Connection, account_id: &str, name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE account SET name = ?1 WHERE id = ?2",
+        rusqlite::params![name, account_id],
+    )?;
+    Ok(())
+}
+
+/// Set an account's carry balance. The stored amount is unsigned-by-convention; the sign
+/// is derived from the account type by `Account::carry_adjustment`.
+pub fn set_account_carry_balance(
+    conn: &Connection,
+    account_id: &str,
+    carry_balance: Money,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE account SET carry_balance_cents = ?1 WHERE id = ?2",
+        rusqlite::params![carry_balance, account_id],
+    )?;
+    Ok(())
+}
+
+/// Delete an account if it is not referenced by transactions. Returns `false` when the
+/// delete is blocked so the UI can show a status instead of surfacing a SQLite FK error.
+pub fn delete_account(conn: &Connection, account_id: &str) -> Result<bool> {
+    let references: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM txn WHERE account_id = ?1",
+        [account_id],
+        |r| r.get(0),
+    )?;
+    if references > 0 {
+        return Ok(false);
+    }
+
+    conn.execute("DELETE FROM account WHERE id = ?1", [account_id])?;
+    Ok(true)
+}
+
 // --- Plan management -----------------------------------------------------------
 
 /// Create an empty plan and return its id.
@@ -1301,6 +1379,143 @@ mod tests {
         let accts = queries::load_accounts(&conn).unwrap();
         let card = accts.iter().find(|a| a.id == card_id).unwrap();
         assert_eq!(card.owed(), Money::from_dollars(1850.0)); // 6000 − 4150
+    }
+
+    #[test]
+    fn creates_accounts_without_carry_balance() {
+        let conn = db::open_in_memory().unwrap();
+
+        let checking_id =
+            create_checking_account(&conn, "Everyday", Money::from_dollars(1200.0)).unwrap();
+        let card_id = create_credit_card_account(
+            &conn,
+            "Rewards",
+            Money::from_dollars(5000.0),
+            Money::from_dollars(4250.0),
+        )
+        .unwrap();
+
+        let accounts = queries::load_accounts(&conn).unwrap();
+        let checking = accounts.iter().find(|a| a.id == checking_id).unwrap();
+        assert_eq!(checking.account_type, AccountType::Checking);
+        assert_eq!(checking.balance, Money::from_dollars(1200.0));
+        assert_eq!(checking.credit_limit, None);
+        assert_eq!(checking.available_credit, None);
+        assert_eq!(checking.carry_balance, None);
+
+        let card = accounts.iter().find(|a| a.id == card_id).unwrap();
+        assert_eq!(card.account_type, AccountType::CreditCard);
+        assert_eq!(card.balance, Money::ZERO);
+        assert_eq!(card.credit_limit, Some(Money::from_dollars(5000.0)));
+        assert_eq!(card.available_credit, Some(Money::from_dollars(4250.0)));
+        assert_eq!(card.carry_balance, None);
+        assert_eq!(card.owed(), Money::from_dollars(750.0));
+    }
+
+    #[test]
+    fn accounts_sort_by_type_then_display_balance_descending() {
+        let conn = db::open_in_memory().unwrap();
+        create_credit_card_account(
+            &conn,
+            "Low Owed Card",
+            Money::from_dollars(1000.0),
+            Money::from_dollars(900.0),
+        )
+        .unwrap();
+        create_checking_account(&conn, "Low Checking", Money::from_dollars(100.0)).unwrap();
+        create_credit_card_account(
+            &conn,
+            "High Owed Card",
+            Money::from_dollars(1000.0),
+            Money::from_dollars(300.0),
+        )
+        .unwrap();
+        create_checking_account(&conn, "High Checking", Money::from_dollars(200.0)).unwrap();
+
+        let names: Vec<_> = queries::load_accounts(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "High Checking",
+                "Low Checking",
+                "High Owed Card",
+                "Low Owed Card"
+            ]
+        );
+    }
+
+    #[test]
+    fn account_carry_balance_flows_into_whats_left() {
+        let mut conn = db::open_in_memory().unwrap();
+        seed_demo(&mut conn).unwrap();
+        let today = Local::now().date_naive();
+        let before = crate::view::MonthView::build_for(&conn, today, today.year(), today.month())
+            .unwrap()
+            .unwrap();
+
+        let checking = before
+            .accounts
+            .iter()
+            .find(|a| a.account_type == AccountType::Checking)
+            .unwrap();
+        let card = before
+            .accounts
+            .iter()
+            .find(|a| a.account_type == AccountType::CreditCard)
+            .unwrap();
+        set_account_carry_balance(&conn, &checking.id, Money::from_dollars(500.0)).unwrap();
+        set_account_carry_balance(&conn, &card.id, Money::from_dollars(300.0)).unwrap();
+
+        let after = crate::view::MonthView::build_for(&conn, today, today.year(), today.month())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.whats_left.carry_adjustment,
+            Money::from_dollars(-200.0)
+        );
+        assert_eq!(
+            after.whats_left.whats_left,
+            before.whats_left.whats_left - Money::from_dollars(200.0)
+        );
+    }
+
+    #[test]
+    fn delete_account_is_blocked_while_referenced_by_transactions() {
+        let mut conn = db::open_in_memory().unwrap();
+        seed_demo(&mut conn).unwrap();
+        let month = queries::current_month(&conn).unwrap().unwrap();
+        let account_id =
+            create_checking_account(&conn, "Bills", Money::from_dollars(100.0)).unwrap();
+
+        conn.execute(
+            "INSERT INTO txn (id, month_id, account_id, label, direction, amount_cents, settled)
+             VALUES ('linked', ?1, ?2, 'Linked Bill', 'out', 1000, 0)",
+            rusqlite::params![month.id, account_id],
+        )
+        .unwrap();
+
+        assert!(
+            !delete_account(&conn, &account_id).unwrap(),
+            "delete is rejected while txns reference the account"
+        );
+        assert!(
+            queries::load_accounts(&conn)
+                .unwrap()
+                .iter()
+                .any(|a| a.id == account_id),
+            "blocked account remains"
+        );
+
+        conn.execute("UPDATE txn SET account_id = NULL WHERE id = 'linked'", [])
+            .unwrap();
+        assert!(
+            delete_account(&conn, &account_id).unwrap(),
+            "delete succeeds once unreferenced"
+        );
     }
 
     #[test]

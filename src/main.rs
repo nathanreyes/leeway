@@ -16,7 +16,7 @@ mod dashboard;
 mod plans;
 
 use anyhow::Result;
-use ballpark::models::{Direction, Kind, PeriodType, Series};
+use ballpark::models::{AccountType, Direction, Kind, PeriodType, Series};
 use ballpark::money::Money;
 use ballpark::{db, ops, queries};
 use chrono::{Datelike, Local, NaiveDate};
@@ -110,6 +110,9 @@ pub struct ChoiceOption {
 /// self-contained when it fires (the modal is already closed by then).
 #[derive(Clone)]
 pub enum ModalAction {
+    BeginNewAccount {
+        account_type: AccountType,
+    },
     RestampMerge {
         month_id: String,
         plan_id: String,
@@ -131,6 +134,7 @@ pub enum ModalAction {
 pub struct TextPrompt {
     pub title: String,
     pub buffer: String,
+    pub help: Vec<String>,
     pub replace_on_next_char: bool,
     pub kind: PromptKind,
 }
@@ -167,6 +171,25 @@ pub enum PromptKind {
         id: String,
     },
     CardLimit {
+        id: String,
+    },
+    NewAccountName {
+        account_type: AccountType,
+    },
+    NewCheckingBalance {
+        name: String,
+    },
+    NewCardLimit {
+        name: String,
+    },
+    NewCardAvailable {
+        name: String,
+        limit: Money,
+    },
+    AccountName {
+        id: String,
+    },
+    AccountCarry {
         id: String,
     },
     /// Edit a month transaction's label (this instance only).
@@ -219,6 +242,10 @@ pub enum ConfirmAction {
     DeleteEnvelope {
         id: String,
     },
+    /// Delete an account when no transactions reference it.
+    DeleteAccount {
+        id: String,
+    },
 }
 
 /// All mutable UI state. Each screen keeps its own selection index so moving between
@@ -251,6 +278,7 @@ pub struct App {
     /// reload (the lists are sorted, so the position isn't known until then).
     pub pending_dash_txn: Option<String>,
     pub pending_dash_env: Option<String>,
+    pub pending_dash_account: Option<String>,
     pub modal: Option<Modal>,
     /// A transient one-liner (errors, confirmations) shown in the footer.
     pub status: Option<String>,
@@ -261,6 +289,23 @@ impl App {
         self.modal = Some(Modal::Text(TextPrompt {
             title: title.into(),
             buffer: buffer.into(),
+            help: Vec::new(),
+            replace_on_next_char: false,
+            kind,
+        }));
+    }
+
+    fn open_text_with_help(
+        &mut self,
+        title: impl Into<String>,
+        buffer: impl Into<String>,
+        help: Vec<String>,
+        kind: PromptKind,
+    ) {
+        self.modal = Some(Modal::Text(TextPrompt {
+            title: title.into(),
+            buffer: buffer.into(),
+            help,
             replace_on_next_char: false,
             kind,
         }));
@@ -275,6 +320,7 @@ impl App {
         self.modal = Some(Modal::Text(TextPrompt {
             title: title.into(),
             buffer: buffer.into(),
+            help: Vec::new(),
             replace_on_next_char: true,
             kind,
         }));
@@ -340,6 +386,7 @@ fn main() -> Result<()> {
         pending_select: None,
         pending_dash_txn: None,
         pending_dash_env: None,
+        pending_dash_account: None,
         modal: None,
         status: None,
     };
@@ -397,6 +444,24 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                                 app.dash_focus = DashFocus::Envelopes;
                             }
                         }
+                        if let Some(target) = app.pending_dash_account.take() {
+                            if v.is_current {
+                                if let Some(idx) =
+                                    v.accounts.iter().position(|a| a.id == target)
+                                {
+                                    app.dash_acct_sel = idx;
+                                    app.dash_focus = DashFocus::Accounts;
+                                }
+                            }
+                        }
+                        if v.is_current {
+                            clamp(&mut app.dash_acct_sel, v.accounts.len());
+                        } else {
+                            app.dash_acct_sel = 0;
+                            if app.dash_focus == DashFocus::Accounts {
+                                app.dash_focus = DashFocus::Income;
+                            }
+                        }
                         clamp(
                             &mut app.dash_income_sel,
                             dashboard_txn_count(v, DashFocus::Income),
@@ -406,7 +471,6 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             dashboard_txn_count(v, DashFocus::Expenses),
                         );
                         clamp(&mut app.dash_env_sel, v.envelopes.len());
-                        clamp(&mut app.dash_acct_sel, v.accounts.len());
                     }
                     // No month for this period → the header is the only sensible control, so
                     // pin focus there. That keeps j/k/m navigation working with nothing else
@@ -685,6 +749,17 @@ fn handle_choice_key(app: &mut App, key: KeyEvent) -> Result<()> {
 /// has rows outside the target plan, so we never silently wipe them.
 fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
     match action {
+        ModalAction::BeginNewAccount { account_type } => {
+            let title = match account_type {
+                AccountType::Checking => "New checking account name",
+                AccountType::CreditCard => "New credit card name",
+            };
+            app.open_text(
+                title,
+                String::new(),
+                PromptKind::NewAccountName { account_type },
+            );
+        }
         ModalAction::RestampMerge { month_id, plan_id } => {
             ops::restamp_merge(&mut app.conn, &month_id, &plan_id)?;
             finish_restamp(app, "Merged plan into the month");
@@ -984,6 +1059,80 @@ fn submit_text(app: &mut App) -> Result<()> {
             Some(limit) => ops::set_credit_limit(&app.conn, &id, limit)?,
             None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
         },
+        PromptKind::NewAccountName { account_type } => {
+            if text.is_empty() {
+                app.status = Some("Account name can't be empty".into());
+                return Ok(());
+            }
+            match account_type {
+                AccountType::Checking => app.open_text_replace_on_type(
+                    format!("Starting balance for {text}"),
+                    amount_edit_string(Money::ZERO),
+                    PromptKind::NewCheckingBalance { name: text },
+                ),
+                AccountType::CreditCard => app.open_text_replace_on_type(
+                    format!("Credit limit for {text}"),
+                    amount_edit_string(Money::ZERO),
+                    PromptKind::NewCardLimit { name: text },
+                ),
+            }
+        }
+        PromptKind::NewCheckingBalance { name } => match Money::parse_dollars(&text) {
+            Some(balance) => {
+                let id = ops::create_checking_account(&app.conn, &name, balance)?;
+                app.pending_dash_account = Some(id);
+                app.status = Some(format!("Created account “{name}”"));
+            }
+            None => {
+                app.status = Some(format!("Couldn't read “{text}” as an amount"));
+                app.open_text(
+                    format!("Starting balance for {name}"),
+                    text,
+                    PromptKind::NewCheckingBalance { name },
+                );
+            }
+        },
+        PromptKind::NewCardLimit { name } => match Money::parse_dollars(&text) {
+            Some(limit) => app.open_text_replace_on_type(
+                format!("Available credit for {name}"),
+                amount_edit_string(limit),
+                PromptKind::NewCardAvailable { name, limit },
+            ),
+            None => {
+                app.status = Some(format!("Couldn't read “{text}” as an amount"));
+                app.open_text(
+                    format!("Credit limit for {name}"),
+                    text,
+                    PromptKind::NewCardLimit { name },
+                );
+            }
+        },
+        PromptKind::NewCardAvailable { name, limit } => match Money::parse_dollars(&text) {
+            Some(available) => {
+                let id = ops::create_credit_card_account(&app.conn, &name, limit, available)?;
+                app.pending_dash_account = Some(id);
+                app.status = Some(format!("Created account “{name}”"));
+            }
+            None => {
+                app.status = Some(format!("Couldn't read “{text}” as an amount"));
+                app.open_text(
+                    format!("Available credit for {name}"),
+                    text,
+                    PromptKind::NewCardAvailable { name, limit },
+                );
+            }
+        },
+        PromptKind::AccountName { id } => {
+            if !text.is_empty() {
+                ops::rename_account(&app.conn, &id, &text)?;
+            } else {
+                app.status = Some("Account name can't be empty".into());
+            }
+        }
+        PromptKind::AccountCarry { id } => match Money::parse_dollars(&text) {
+            Some(carry) => ops::set_account_carry_balance(&app.conn, &id, carry)?,
+            None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
+        },
         PromptKind::TxnLabel { id } => {
             if !text.is_empty() {
                 ops::set_txn_label(&app.conn, &id, &text)?;
@@ -1036,6 +1185,13 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                     ConfirmAction::DeleteEnvelope { id } => {
                         ops::delete_envelope(&mut app.conn, &id)?;
                         app.status = Some("Deleted".into());
+                    }
+                    ConfirmAction::DeleteAccount { id } => {
+                        if ops::delete_account(&app.conn, &id)? {
+                            app.status = Some("Account deleted".into());
+                        } else {
+                            app.status = Some("Account is used by transactions".into());
+                        }
                     }
                 }
             }
@@ -1135,7 +1291,8 @@ fn draw_modal(frame: &mut Frame, app: &App) {
 
     match modal {
         Modal::Text(prompt) => {
-            let area = centered_rect(60, 20, frame.area());
+            let height = if prompt.help.is_empty() { 20 } else { 34 };
+            let area = centered_rect(60, height, frame.area());
             frame.render_widget(Clear, area); // erase whatever's underneath so the box is opaque
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -1150,15 +1307,24 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 input.push(Span::raw(&prompt.buffer));
             }
             input.push(Span::styled("▏", Style::default().fg(Color::Cyan)));
-            let body = vec![
+            let mut body = vec![
                 Line::raw(""),
                 Line::from(input),
                 Line::raw(""),
-                Line::from(Span::styled(
-                    " Enter to confirm · Esc to cancel",
-                    Style::default().fg(Color::DarkGray),
-                )),
             ];
+            if !prompt.help.is_empty() {
+                for line in &prompt.help {
+                    body.push(Line::from(Span::styled(
+                        format!(" {line}"),
+                        Style::default().fg(Color::Gray),
+                    )));
+                }
+                body.push(Line::raw(""));
+            }
+            body.push(Line::from(Span::styled(
+                " Enter to confirm · Esc to cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
             frame.render_widget(Paragraph::new(body).block(block), area);
         }
         Modal::SeriesSearch(prompt) => draw_series_search_modal(frame, prompt),

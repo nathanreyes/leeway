@@ -3,18 +3,21 @@
 //! Two public entry points, mirroring every screen module: `draw` renders a frame from
 //! read-only data, and `handle_key` mutates `App` (and the database) in response to a key.
 
-use crate::{AddDestination, App, BudgetBlock, ConfirmAction, DashFocus, PromptKind, Screen};
+use crate::{
+    AddDestination, App, BudgetBlock, ChoiceOption, ConfirmAction, DashFocus, ModalAction,
+    PromptKind, Screen,
+};
 use anyhow::Result;
 use ballpark::models::{AccountType, Direction, Mode, PeriodType};
 use ballpark::money::Money;
 use ballpark::ops;
 use ballpark::view::{EnvelopeRow, MonthView};
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
 pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Result<()> {
     // Clear any leftover status the moment the user acts again.
@@ -50,7 +53,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
                 PromptKind::GoToMonth,
             ),
             // Only leave the header if there's a month whose panels we can move onto.
-            KeyCode::Tab if view.is_some() => app.dash_focus = DashFocus::Accounts,
+            // Off-month account balances are explanatory only, so skip Accounts there.
+            KeyCode::Tab => {
+                if let Some(view) = view {
+                    app.dash_focus = if view.is_current {
+                        DashFocus::Accounts
+                    } else {
+                        DashFocus::Income
+                    };
+                }
+            }
             _ => {}
         }
         return Ok(());
@@ -60,14 +72,21 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
     let Some(view) = view else { return Ok(()) };
 
     match key.code {
-        // Tab cycles Accounts → Income → Expenses → Envelopes → Header (Header→Accounts above).
+        // Tab cycles Accounts → Income → Expenses → Envelopes → Header on the current
+        // month. Off-month, Accounts is explanatory only and is skipped.
         KeyCode::Tab => {
             app.dash_focus = match app.dash_focus {
                 DashFocus::Accounts => DashFocus::Income,
                 DashFocus::Income => DashFocus::Expenses,
                 DashFocus::Expenses => DashFocus::Envelopes,
                 DashFocus::Envelopes => DashFocus::Header,
-                DashFocus::Header => DashFocus::Accounts, // unreachable; keeps match total
+                DashFocus::Header => {
+                    if view.is_current {
+                        DashFocus::Accounts
+                    } else {
+                        DashFocus::Income
+                    }
+                } // unreachable; keeps match total
             };
         }
 
@@ -106,8 +125,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         // Enter / Space = the focused panel's primary action.
         KeyCode::Enter | KeyCode::Char(' ') => act_on_focus(app, view)?,
 
-        // `n` = add a series-backed item to the focused list (reuse or create series).
-        KeyCode::Char('n') => add_adhoc(app, view)?,
+        // `n` = create something in the focused panel.
+        KeyCode::Char('n') => {
+            if app.dash_focus == DashFocus::Accounts {
+                add_account(app);
+            } else {
+                add_adhoc(app, view)?;
+            }
+        }
 
         // The edit verbs mirror the plan editor's keys, but here they edit this month's
         // independent snapshot. Direction changes intentionally stay out of this fast path:
@@ -118,6 +143,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         KeyCode::Char('t') => cycle_period(app, view)?, // envelope period type
         KeyCode::Char('s') => feed_spending(app, view), // file spending into a manual envelope
         KeyCode::Char('x') => delete_selected(app, view), // delete this month's row
+
+        // Carry balance is account-only: checking reserves cash, cards forgive deferred debt.
+        KeyCode::Char('c') => {
+            if app.dash_focus == DashFocus::Accounts {
+                edit_account_carry(app, view);
+            }
+        }
 
         // `e` is the Accounts panel's edit alias (Enter also works there).
         KeyCode::Char('e') => {
@@ -210,7 +242,30 @@ fn add_adhoc(app: &mut App, view: &MonthView) -> Result<()> {
     Ok(())
 }
 
-/// `r`: edit the label of the selected month txn or envelope.
+/// Start account creation with an explicit type choice.
+fn add_account(app: &mut App) {
+    app.open_choice(
+        "Create which account type?",
+        vec![
+            ChoiceOption {
+                key: 'h',
+                label: "Checking".into(),
+                action: Some(ModalAction::BeginNewAccount {
+                    account_type: AccountType::Checking,
+                }),
+            },
+            ChoiceOption {
+                key: 'c',
+                label: "Credit card".into(),
+                action: Some(ModalAction::BeginNewAccount {
+                    account_type: AccountType::CreditCard,
+                }),
+            },
+        ],
+    );
+}
+
+/// `r`: edit the label/name of the selected row.
 fn edit_label(app: &mut App, view: &MonthView) {
     if let Some(t) = selected_txn(app, view) {
         app.open_text_replace_on_type(
@@ -224,6 +279,46 @@ fn edit_label(app: &mut App, view: &MonthView) {
             e.envelope.label.clone(),
             PromptKind::EnvelopeLabel {
                 id: e.envelope.id.clone(),
+            },
+        );
+    } else if app.dash_focus == DashFocus::Accounts {
+        if let Some(acct) = view.accounts.get(app.dash_acct_sel) {
+            app.open_text_replace_on_type(
+                "Account name",
+                acct.name.clone(),
+                PromptKind::AccountName {
+                    id: acct.id.clone(),
+                },
+            );
+        }
+    }
+}
+
+/// `c`: edit the selected account's carry balance.
+fn edit_account_carry(app: &mut App, view: &MonthView) {
+    if let Some(acct) = view.accounts.get(app.dash_acct_sel) {
+        let help = match acct.account_type {
+            AccountType::Checking => vec![
+                "Buffer is cash you want to keep parked in this account.".into(),
+                "It is subtracted from what's left, so a $500 buffer".into(),
+                "makes $500 unavailable to spend.".into(),
+                "Use it for minimum balance, cushion, or money you".into(),
+                "do not want counted.".into(),
+            ],
+            AccountType::CreditCard => vec![
+                "Carry is card debt you do not plan to pay this month.".into(),
+                "It is added back to what's left, offsetting that much".into(),
+                "of the card's owed balance.".into(),
+                "Use it for planned carryover, promo balances, or debt".into(),
+                "handled outside this month.".into(),
+            ],
+        };
+        app.open_text_with_help(
+            format!("Carry balance for {}", acct.name),
+            crate::amount_edit_string(acct.carry_balance.unwrap_or(Money::ZERO)),
+            help,
+            PromptKind::AccountCarry {
+                id: acct.id.clone(),
             },
         );
     }
@@ -312,6 +407,15 @@ fn delete_selected(app: &mut App, view: &MonthView) {
                 id: e.envelope.id.clone(),
             },
         );
+    } else if app.dash_focus == DashFocus::Accounts {
+        if let Some(acct) = view.accounts.get(app.dash_acct_sel) {
+            app.open_confirm(
+                format!("Delete account “{}”?", acct.name),
+                ConfirmAction::DeleteAccount {
+                    id: acct.id.clone(),
+                },
+            );
+        }
     }
 }
 
@@ -387,18 +491,19 @@ pub fn draw(frame: &mut Frame, app: &App, view: &Option<MonthView>) {
     draw_footer(frame, footer, app, view);
 }
 
-/// The full month view: compact accounts and the "what's left" rollup on top, then
-/// budget blocks below (income/expenses stacked, envelopes beside them).
+/// The full month view: accounts at the top, budget blocks in the middle, and the
+/// "what's left" summary across the bottom.
 fn draw_month_body(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
-    // 7 rows for "what's left" so all breakdown lines (funds/card, income/bills/envelopes,
-    // carry) fit inside the borders.
-    let [top, body] = Layout::vertical([Constraint::Length(7), Constraint::Min(0)]).areas(area);
-
-    let [acct_area, whats_left] =
-        Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(top);
-
+    let [acct_area, body, summary_area] = Layout::vertical([
+        Constraint::Length(account_block_height(view)),
+        Constraint::Min(0),
+        // 7 rows so all breakdown lines (funds/card, income/bills/envelopes, carry)
+        // fit inside the summary border.
+        Constraint::Length(7),
+    ])
+    .areas(area);
     let [left_items, env_area] =
-        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)]).areas(body);
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
     let [income_area, expense_area] = Layout::vertical([
         Constraint::Length(crate::income_block_height(txn_count(view, Direction::In))),
         Constraint::Min(0),
@@ -406,10 +511,20 @@ fn draw_month_body(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
     .areas(left_items);
 
     draw_accounts(frame, acct_area, app, view);
-    draw_whats_left(frame, whats_left, view);
     draw_transactions(frame, income_area, app, view, Direction::In);
     draw_transactions(frame, expense_area, app, view, Direction::Out);
     draw_envelopes(frame, env_area, app, view);
+    draw_whats_left(frame, summary_area, view);
+}
+
+/// One row per account plus the bordered block, capped so a large account list does not
+/// crowd out the budget blocks.
+fn account_block_height(view: &MonthView) -> u16 {
+    if view.is_current {
+        view.accounts.len().saturating_add(2).clamp(3, 7) as u16
+    } else {
+        8
+    }
 }
 
 /// Shown when the viewed period isn't stamped: name the period and point at the ways
@@ -487,8 +602,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             Span::raw(" move  "),
             key(" Enter "),
             Span::raw(" edit  "),
+            key(" n "),
+            Span::raw(" new  "),
+            key(" r "),
+            Span::raw(" name  "),
+            key(" c "),
+            Span::raw(" carry  "),
             key(" l "),
-            Span::raw(" card limit"),
+            Span::raw(" limit  "),
+            key(" x "),
+            Span::raw(" del"),
         ]),
     };
     let nav_hints = Line::from(vec![
@@ -500,9 +623,41 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
     crate::draw_split_status_footer(frame, area, left_hints, nav_hints, &app.status);
 }
 
-/// The accounts panel. Checking shows its balance; a credit card shows what's owed plus a
-/// dim "avail / limit" detail line. Highlighted only when this panel has focus.
+/// The accounts panel. Full-width rows keep the current balance/owed amount near the
+/// account name and reserve the final column for each account's buffer/carry setting.
 fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
+    if !view.is_current {
+        let lines = vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                " Account balances only apply to the current month.",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(Span::styled(
+                " Past and future months are plan snapshots:",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(Span::styled(
+                " income left - bills left - envelopes left.",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(Span::styled(
+                " Use the current month to update balances, buffers, and carry.",
+                Style::default().fg(Color::Gray),
+            )),
+        ];
+        let p = Paragraph::new(lines).block(panel_block(" Accounts ", false));
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let name_width = inner_width.saturating_mul(22).checked_div(100).unwrap_or(18).clamp(14, 26);
+    let primary_width = 20;
+    let adjustment_width = 18;
+    let fixed_width = name_width + primary_width + adjustment_width;
+    let detail_width = inner_width.saturating_sub(fixed_width).max(1);
+
     let items: Vec<ListItem> = view
         .accounts
         .iter()
@@ -514,11 +669,16 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                     Color::Green
                 };
                 ListItem::new(Line::from(vec![
-                    Span::raw(format!("{:<13}", crate::truncate(&a.name, 13))),
+                    Span::raw(format!(
+                        "{:<name_width$}",
+                        crate::truncate(&a.name, name_width)
+                    )),
                     Span::styled(
-                        format!("{:>10}", a.balance.to_string()),
+                        format!("{:<primary_width$}", format!("balance {}", a.balance)),
                         Style::default().fg(color),
                     ),
+                    Span::raw(format!("{:<detail_width$}", "")),
+                    carry_column("buffer", a.carry_balance),
                 ]))
             }
             AccountType::CreditCard => {
@@ -529,19 +689,31 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                 } else {
                     Color::Green
                 };
-                let line1 = Line::from(vec![
-                    Span::raw(format!("{:<13}", crate::truncate(&a.name, 13))),
-                    Span::styled(format!("owed {}", owed), Style::default().fg(owed_color)),
-                ]);
-                let line2 = Line::from(Span::styled(
-                    format!(
-                        "  avail {} / limit {}",
-                        a.available_credit.unwrap_or(Money::ZERO),
-                        a.credit_limit.unwrap_or(Money::ZERO)
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!(
+                        "{:<name_width$}",
+                        crate::truncate(&a.name, name_width)
+                    )),
+                    Span::styled(
+                        format!("{:<primary_width$}", format!("owed {}", owed)),
+                        Style::default().fg(owed_color),
                     ),
-                    Style::default().fg(Color::DarkGray),
-                ));
-                ListItem::new(vec![line1, line2])
+                    Span::styled(
+                        format!(
+                            "{:<detail_width$}",
+                            crate::truncate(
+                                &format!(
+                                    "avail {} / limit {}",
+                                    a.available_credit.unwrap_or(Money::ZERO),
+                                    a.credit_limit.unwrap_or(Money::ZERO)
+                                ),
+                                detail_width
+                            )
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    carry_column("carry", a.carry_balance),
+                ]))
             }
         })
         .collect();
@@ -560,6 +732,16 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▌");
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn carry_column(label: &str, carry_balance: Option<Money>) -> Span<'static> {
+    let carry = carry_balance.unwrap_or(Money::ZERO);
+    let style = if carry == Money::ZERO {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    Span::styled(format!("{label} {carry}"), style)
 }
 
 /// A bordered block whose border turns cyan when its panel is focused.
@@ -872,6 +1054,7 @@ mod tests {
             pending_select: None,
             pending_dash_txn: None,
             pending_dash_env: None,
+            pending_dash_account: None,
             modal: None,
             status: None,
         }
@@ -888,12 +1071,58 @@ mod tests {
         .unwrap()
     }
 
+    fn off_month_view(app: &App) -> MonthView {
+        MonthView::build_for(
+            &app.conn,
+            NaiveDate::from_ymd_opt(2026, 10, 15).unwrap(),
+            app.viewed_year,
+            app.viewed_month,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn tab_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+    }
+
     fn delete_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
     }
 
+    fn new_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)
+    }
+
+    fn carry_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)
+    }
+
     fn direction_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn header_tab_enters_accounts_only_for_current_month() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Header;
+        let view = month_view(&app);
+
+        handle_key(&mut app, tab_key(), &Some(view)).unwrap();
+
+        assert!(app.dash_focus == DashFocus::Accounts);
+    }
+
+    #[test]
+    fn header_tab_skips_accounts_off_month() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Header;
+        let view = off_month_view(&app);
+        assert!(!view.is_current);
+
+        handle_key(&mut app, tab_key(), &Some(view)).unwrap();
+
+        assert!(app.dash_focus == DashFocus::Income);
     }
 
     #[test]
@@ -923,6 +1152,72 @@ mod tests {
     }
 
     #[test]
+    fn new_key_opens_account_type_choice_on_accounts() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Accounts;
+        let view = month_view(&app);
+
+        handle_key(&mut app, new_key(), &Some(view)).unwrap();
+
+        match app.modal {
+            Some(crate::Modal::Choice(choice)) => {
+                assert_eq!(choice.title, "Create which account type?");
+                let checking = choice.options.iter().find(|o| o.key == 'h').unwrap();
+                match checking.action.as_ref() {
+                    Some(ModalAction::BeginNewAccount { account_type }) => {
+                        assert_eq!(*account_type, AccountType::Checking);
+                    }
+                    _ => panic!("expected checking account action"),
+                }
+                let card = choice.options.iter().find(|o| o.key == 'c').unwrap();
+                match card.action.as_ref() {
+                    Some(ModalAction::BeginNewAccount { account_type }) => {
+                        assert_eq!(*account_type, AccountType::CreditCard);
+                    }
+                    _ => panic!("expected credit card account action"),
+                }
+            }
+            _ => panic!("expected account type choice modal"),
+        }
+    }
+
+    #[test]
+    fn new_key_keeps_budget_item_flow_outside_accounts() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Expenses;
+        let view = month_view(&app);
+
+        handle_key(&mut app, new_key(), &Some(view)).unwrap();
+
+        match app.modal {
+            Some(crate::Modal::SeriesSearch(prompt)) => {
+                assert!(prompt.block == BudgetBlock::Expenses);
+            }
+            _ => panic!("expected series search modal"),
+        }
+    }
+
+    #[test]
+    fn carry_key_edits_selected_account_carry_balance() {
+        let mut app = app_with_stamped_month();
+        let account_id =
+            ops::create_checking_account(&app.conn, "Everyday", Money::from_dollars(100.0))
+                .unwrap();
+        app.dash_focus = DashFocus::Accounts;
+        let view = month_view(&app);
+
+        handle_key(&mut app, carry_key(), &Some(view)).unwrap();
+
+        match app.modal {
+            Some(crate::Modal::Text(prompt)) => match prompt.kind {
+                PromptKind::AccountCarry { id } => assert_eq!(id, account_id),
+                _ => panic!("expected account carry prompt"),
+            },
+            _ => panic!("expected text prompt"),
+        }
+    }
+
+    #[test]
     fn delete_key_allows_stamped_transaction_instances() {
         let mut app = app_with_stamped_month();
         app.dash_focus = DashFocus::Expenses;
@@ -942,6 +1237,26 @@ mod tests {
             Some(crate::Modal::Confirm(confirm)) => match confirm.action {
                 ConfirmAction::DeleteTxn { id } => assert_eq!(id, expected_id),
                 _ => panic!("expected delete transaction confirmation"),
+            },
+            _ => panic!("expected confirmation modal"),
+        }
+    }
+
+    #[test]
+    fn delete_key_confirms_account_delete_on_accounts() {
+        let mut app = app_with_stamped_month();
+        let account_id =
+            ops::create_checking_account(&app.conn, "Everyday", Money::from_dollars(100.0))
+                .unwrap();
+        app.dash_focus = DashFocus::Accounts;
+        let view = month_view(&app);
+
+        handle_key(&mut app, delete_key(), &Some(view)).unwrap();
+
+        match app.modal {
+            Some(crate::Modal::Confirm(confirm)) => match confirm.action {
+                ConfirmAction::DeleteAccount { id } => assert_eq!(id, account_id),
+                _ => panic!("expected delete account confirmation"),
             },
             _ => panic!("expected confirmation modal"),
         }

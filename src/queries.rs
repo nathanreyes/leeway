@@ -30,7 +30,15 @@ pub fn load_accounts(conn: &Connection) -> Result<Vec<Account>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, type, balance_cents, credit_limit_cents, available_credit_cents,
                 carry_balance_cents
-         FROM account ORDER BY name",
+         FROM account
+         ORDER BY
+             CASE type WHEN 'checking' THEN 0 WHEN 'credit_card' THEN 1 ELSE 2 END,
+             CASE type
+                 WHEN 'checking' THEN balance_cents
+                 WHEN 'credit_card' THEN COALESCE(credit_limit_cents, 0) - COALESCE(available_credit_cents, 0)
+                 ELSE 0
+             END DESC,
+             name",
     )?;
     // `query_map` runs the SQL and applies the mapper to each row; `collect` gathers the
     // results, and the `?` after it fails fast if any row failed to map.
