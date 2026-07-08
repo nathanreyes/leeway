@@ -12,9 +12,8 @@ use chrono::{Datelike, NaiveDate};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Chart, Dataset, GraphType, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Bar, BarChart, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 enum SidebarRow {
@@ -435,53 +434,25 @@ fn draw_chart(frame: &mut Frame, area: Rect, detail: &SeriesDetailView, range_la
         return;
     }
 
-    let values: Vec<f64> = detail
-        .points
-        .iter()
-        .filter_map(|point| point.effective)
-        .map(money_as_dollars)
-        .collect();
-    let (y_min, y_max) = y_bounds(&values);
-    let x_max = detail.points.len().saturating_sub(1).max(1) as f64;
-    let bar_data: Vec<(f64, f64)> = detail
-        .points
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, point)| Some((idx as f64, money_as_dollars(point.effective?))))
-        .collect();
+    let block = crate::titled_block(format!(" Amount - {range_label} "));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let dataset = Dataset::default()
-        .name("effective")
-        .marker(Marker::Block)
-        .graph_type(GraphType::Bar)
-        .style(Color::Cyan)
-        .data(bar_data.as_slice());
-
-    let x_axis = Axis::default()
-        .title("month")
-        .bounds([0.0, x_max])
-        .labels(axis_month_labels(&detail.points));
-    let y_axis = Axis::default()
-        .title("amount")
-        .bounds([y_min, y_max])
-        .labels(axis_money_labels(y_min, y_max));
-    let chart = Chart::new(vec![dataset])
-        .block(crate::titled_block(format!(" Amount - {range_label} ")))
-        .x_axis(x_axis)
-        .y_axis(y_axis);
-
-    if area.height >= 8 {
-        let [chart_area, labels_area] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
-        frame.render_widget(chart, chart_area);
-        frame.render_widget(
-            Paragraph::new(month_bar_labels(&detail.points, labels_area.width as usize))
-                .alignment(Alignment::Center),
-            labels_area,
-        );
-    } else {
-        frame.render_widget(chart, area);
-    }
+    let bars = trend_bars(&detail.points);
+    let (bar_width, bar_gap) = bar_chart_spacing(inner.width, bars.len());
+    let chart_area = centered_bar_chart_area(inner, bars.len(), bar_width, bar_gap);
+    let chart = BarChart::new(bars)
+        .bar_width(bar_width)
+        .bar_gap(bar_gap)
+        .bar_style(Style::default().fg(Color::Cyan))
+        .value_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .label_style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(chart, chart_area);
 }
 
 fn draw_empty_chart(frame: &mut Frame, area: Rect, msg: &str, range_label: &str) {
@@ -635,56 +606,58 @@ fn visible_indices(app: &App, view: &SeriesPageView) -> Vec<usize> {
         .collect()
 }
 
-fn y_bounds(values: &[f64]) -> (f64, f64) {
-    let min = values
+fn trend_bars(points: &[SeriesTrendPoint]) -> Vec<Bar<'static>> {
+    points
         .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min)
-        .min(0.0);
-    let max = values
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max)
-        .max(0.0);
-    if (max - min).abs() < f64::EPSILON {
-        let pad = (max.abs() * 0.10).max(1.0);
-        (min - pad, max + pad)
+        .map(|point| {
+            let label = short_month_label(&point.month_label);
+            match point.effective {
+                Some(amount) => {
+                    Bar::with_label(label, bar_value(amount)).text_value(compact_money(amount))
+                }
+                None => Bar::with_label(label, 0)
+                    .text_value("")
+                    .style(Style::default().fg(Color::DarkGray)),
+            }
+        })
+        .collect()
+}
+
+fn bar_chart_spacing(width: u16, bar_count: usize) -> (u16, u16) {
+    let count = u16::try_from(bar_count).unwrap_or(u16::MAX).max(1);
+    let desired_bar_width = 6;
+    let bar_gap = if width >= count.saturating_mul(desired_bar_width + 1) {
+        1
     } else {
-        let pad = ((max - min) * 0.10).max(1.0);
-        let lower = if min >= 0.0 { 0.0 } else { min - pad };
-        let upper = if max <= 0.0 { 0.0 } else { max + pad };
-        (lower, upper)
+        0
+    };
+    let gap_width = count.saturating_sub(1).saturating_mul(bar_gap);
+    let bar_width = width
+        .saturating_sub(gap_width)
+        .checked_div(count)
+        .unwrap_or(1)
+        .clamp(1, desired_bar_width);
+    (bar_width, bar_gap)
+}
+
+fn centered_bar_chart_area(area: Rect, bar_count: usize, bar_width: u16, bar_gap: u16) -> Rect {
+    let count = u16::try_from(bar_count).unwrap_or(u16::MAX);
+    let content_width = count
+        .saturating_mul(bar_width)
+        .saturating_add(count.saturating_sub(1).saturating_mul(bar_gap));
+    if content_width == 0 || content_width >= area.width {
+        area
+    } else {
+        Rect {
+            x: area.x + (area.width - content_width) / 2,
+            width: content_width,
+            ..area
+        }
     }
 }
 
-fn month_bar_labels(points: &[SeriesTrendPoint], width: usize) -> Line<'static> {
-    let labels: Vec<String> = points
-        .iter()
-        .map(|point| month_name(&point.month_label).to_string())
-        .collect();
-    let full = labels.join(" ");
-    if full.len() <= width {
-        Line::from(Span::styled(full, Style::default().fg(Color::DarkGray)))
-    } else if let (Some(first), Some(last)) = (labels.first(), labels.last()) {
-        Line::from(Span::styled(
-            format!("{first} ... {last}"),
-            Style::default().fg(Color::DarkGray),
-        ))
-    } else {
-        Line::raw("")
-    }
-}
-
-fn axis_month_labels(points: &[SeriesTrendPoint]) -> Vec<Line<'static>> {
-    if points.is_empty() {
-        return vec!["".into(), "".into()];
-    }
-    let mid = points.len() / 2;
-    vec![
-        short_month_label(&points[0].month_label).into(),
-        short_month_label(&points[mid].month_label).into(),
-        short_month_label(&points[points.len() - 1].month_label).into(),
-    ]
+fn bar_value(value: Money) -> u64 {
+    value.cents().unsigned_abs()
 }
 
 fn short_month_label(label: &str) -> String {
@@ -696,13 +669,6 @@ fn short_month_label(label: &str) -> String {
         month_name_from_number(month),
         year.chars().skip(2).collect::<String>()
     )
-}
-
-fn month_name(label: &str) -> &str {
-    let Some((_, month)) = label.split_once('-') else {
-        return label;
-    };
-    month_name_from_number(month)
 }
 
 fn month_name_from_number(month: &str) -> &str {
@@ -723,22 +689,17 @@ fn month_name_from_number(month: &str) -> &str {
     }
 }
 
-fn axis_money_labels(min: f64, max: f64) -> Vec<Line<'static>> {
-    let mid = min + (max - min) / 2.0;
-    vec![
-        compact_dollars(min).into(),
-        compact_dollars(mid).into(),
-        compact_dollars(max).into(),
-    ]
-}
-
-fn compact_dollars(value: f64) -> String {
-    let sign = if value < 0.0 { "-" } else { "" };
-    let abs = value.abs();
-    if abs >= 1000.0 {
-        format!("{sign}${:.1}k", abs / 1000.0)
+fn compact_money(value: Money) -> String {
+    let sign = if value.cents() < 0 { "-" } else { "" };
+    let abs_cents = value.cents().unsigned_abs();
+    if abs_cents >= 100_000_000 {
+        format!("{sign}${:.1}m", abs_cents as f64 / 100_000_000.0)
+    } else if abs_cents >= 1_000_000 {
+        format!("{sign}${:.0}k", abs_cents as f64 / 100_000.0)
+    } else if abs_cents >= 100_000 {
+        format!("{sign}${:.1}k", abs_cents as f64 / 100_000.0)
     } else {
-        format!("{sign}${:.0}", abs)
+        format!("{sign}${}", abs_cents / 100)
     }
 }
 
@@ -752,8 +713,4 @@ fn format_signed_money(value: Money) -> String {
     } else {
         value.to_string()
     }
-}
-
-fn money_as_dollars(value: Money) -> f64 {
-    value.cents() as f64 / 100.0
 }
