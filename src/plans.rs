@@ -1,22 +1,21 @@
 //! The plans screens: a list of templates, and an editor for one plan's items.
 //!
-//! Editing model: focus Income, Expenses, or Envelopes, press `n` to insert a new item
-//! there, then immediately fill label and amount through a short prompt chain. Later edits
-//! still use single-key actions (`r` label, `a` amount, `m`/`p` cycle envelope coded fields).
+//! Editing model: focus Income, Expenses, or Envelopes, press `n` to search/create a
+//! series in that block, then fill the plan amount. Later edits still use single-key
+//! actions (`r` label, `a` amount, `m`/`p` cycle envelope coded fields).
 
-use crate::{App, ConfirmAction, PlanFocus, PromptKind, Screen};
+use crate::{AddDestination, App, BudgetBlock, ConfirmAction, PlanFocus, PromptKind, Screen};
 use anyhow::Result;
-use ballpark::models::{Direction, Kind, Mode, PeriodType, Plan, PlanEntry, Series};
+use ballpark::models::{Direction, Kind, Mode, PeriodType, Plan, PlanEntry};
 use ballpark::ops;
 use ballpark::queries::PlanSummary;
 use chrono::Local;
-use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use std::collections::HashSet;
+use ratatui::Frame;
 
 // --- Plans list ----------------------------------------------------------------
 
@@ -176,29 +175,13 @@ pub fn handle_editor_key(
             set_plan_selection(app, selected.saturating_sub(1));
         }
 
-        // Start a pending new item for this block. The row is inserted only after label
-        // and amount are both submitted.
-        KeyCode::Char('n') => {
-            let title = match app.plan_focus {
-                PlanFocus::Income | PlanFocus::Expenses => "Series label (shared across plans)",
-                PlanFocus::Envelopes => "Envelope label (shared across plans)",
-            };
-            app.open_text(
-                title,
-                "",
-                PromptKind::DraftPlanItemLabel {
-                    plan_id: plan.id.clone(),
-                    focus: app.plan_focus,
-                },
-            );
-        }
-        // Insert an EXISTING series (the reuse picker).
-        KeyCode::Char('i') => {
-            app.picker_sel = 0;
-            app.screen = Screen::SeriesPicker {
+        // Search existing series in this block, or create one from the typed label.
+        KeyCode::Char('n') => app.open_series_search(
+            AddDestination::Plan {
                 plan_id: plan.id.clone(),
-            };
-        }
+            },
+            budget_block_for_focus(app.plan_focus),
+        )?,
 
         // `r` edits the shared series label (affects every plan); `a` edits this plan's amount.
         KeyCode::Char('r') => {
@@ -313,6 +296,14 @@ fn entry_matches_focus(entry: &PlanEntry, focus: PlanFocus) -> bool {
     }
 }
 
+fn budget_block_for_focus(focus: PlanFocus) -> BudgetBlock {
+    match focus {
+        PlanFocus::Income => BudgetBlock::Income,
+        PlanFocus::Expenses => BudgetBlock::Expenses,
+        PlanFocus::Envelopes => BudgetBlock::Envelopes,
+    }
+}
+
 pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEntry]) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
@@ -335,7 +326,10 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
     let [left_items, env_area] =
         Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)]).areas(body);
     let [income_area, expense_area] = Layout::vertical([
-        Constraint::Length(crate::income_block_height(entry_count(entries, PlanFocus::Income))),
+        Constraint::Length(crate::income_block_height(entry_count(
+            entries,
+            PlanFocus::Income,
+        ))),
         Constraint::Min(0),
     ])
     .areas(left_items);
@@ -352,10 +346,8 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
             Span::raw(" move  "),
             key(" n "),
             Span::raw(" new  "),
-            key(" i "),
-            Span::raw(" insert  "),
             key(" r "),
-            Span::raw(" label  "),
+            Span::raw(" rename  "),
             key(" a "),
             Span::raw(" amount  "),
             key(" x "),
@@ -370,10 +362,8 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
             Span::raw(" move  "),
             key(" n "),
             Span::raw(" new  "),
-            key(" i "),
-            Span::raw(" insert  "),
             key(" r "),
-            Span::raw(" label  "),
+            Span::raw(" rename  "),
             key(" a "),
             Span::raw(" amount  "),
             key(" m/p "),
@@ -472,118 +462,6 @@ fn entry_row(entry: &PlanEntry, focus: PlanFocus) -> ListItem<'static> {
     ListItem::new(line)
 }
 
-// --- Series picker (reuse an existing series in this plan) ---------------------
-
-pub fn handle_series_picker_key(
-    app: &mut App,
-    key: KeyEvent,
-    plan_id: &str,
-    all: &[Series],
-    in_plan: &HashSet<String>,
-) -> Result<()> {
-    app.status = None;
-    let selected = all.get(app.picker_sel);
-
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => {
-            app.screen = Screen::PlanEditor {
-                plan_id: plan_id.to_string(),
-            };
-        }
-        KeyCode::Char('j') | KeyCode::Down => {
-            if !all.is_empty() && app.picker_sel + 1 < all.len() {
-                app.picker_sel += 1;
-            }
-        }
-        KeyCode::Char('k') | KeyCode::Up => app.picker_sel = app.picker_sel.saturating_sub(1),
-        KeyCode::Enter => {
-            if let Some(s) = selected {
-                if in_plan.contains(&s.id) {
-                    app.status = Some(format!("“{}” is already in this plan", s.label));
-                } else {
-                    let item_id = ops::add_existing_series(&app.conn, plan_id, &s.id)?;
-                    app.pending_select = Some(item_id);
-                    app.screen = Screen::PlanEditor {
-                        plan_id: plan_id.to_string(),
-                    };
-                    app.status = Some(format!("Added “{}” — set its amount (a)", s.label));
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-pub fn draw_series_picker(frame: &mut Frame, app: &App, all: &[Series], in_plan: &HashSet<String>) {
-    let [header, body, footer] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
-
-    let title = Paragraph::new(Line::from(" Insert an existing series ".bold()))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, header);
-
-    if all.is_empty() {
-        let p = Paragraph::new("No series exist yet. Go back and create one with n.")
-            .block(Block::default().borders(Borders::ALL).title(" Series "));
-        frame.render_widget(p, body);
-    } else {
-        let rows: Vec<ListItem> = all
-            .iter()
-            .map(|s| {
-                let (tag, tag_color) = match s.kind {
-                    Kind::Transaction => ("T", Color::Cyan),
-                    Kind::Envelope => ("E", Color::Magenta),
-                };
-                let already = in_plan.contains(&s.id);
-                let mut spans = vec![
-                    Span::styled(
-                        format!("{} ", tag),
-                        Style::default().fg(tag_color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!("{:<24}", crate::truncate(&s.label, 24))),
-                ];
-                if already {
-                    spans.push(Span::styled(
-                        "(in plan)",
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                }
-                // Dim rows already in the plan so it's clear they'd be a no-op.
-                let style = if already {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default()
-                };
-                ListItem::new(Line::from(spans)).style(style)
-            })
-            .collect();
-
-        let mut state = ListState::default();
-        state.select(Some(app.picker_sel));
-        let list = List::new(rows)
-            .block(Block::default().borders(Borders::ALL).title(" Series "))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .highlight_symbol("▌");
-        frame.render_stateful_widget(list, body, &mut state);
-    }
-
-    let hints = Line::from(vec![
-        key(" j/k "),
-        Span::raw(" move  "),
-        key(" Enter "),
-        Span::raw(" add to plan  "),
-        key(" Esc "),
-        Span::raw(" back"),
-    ]);
-    crate::draw_status_footer(frame, footer, hints, &app.status);
-}
-
 /// A small pill-styled key hint, e.g. ` n `.
 fn key(label: &str) -> Span<'static> {
     Span::styled(
@@ -647,7 +525,6 @@ mod tests {
             editor_income_sel: 0,
             editor_expense_sel: 0,
             editor_env_sel: 0,
-            picker_sel: 0,
             pending_select: None,
             pending_dash_txn: None,
             pending_dash_env: None,
@@ -675,12 +552,9 @@ mod tests {
 
         assert!(app.status.is_none());
         assert!(app.pending_select.is_none());
-        let refreshed: Direction = app
-            .conn
-            .query_row("SELECT direction FROM series WHERE id = ?1", [&rent_series_id], |row| {
-                row.get(0)
-            })
+        let refreshed = queries::get_series(&app.conn, &rent_series_id)
+            .unwrap()
             .unwrap();
-        assert_eq!(refreshed, Direction::Out);
+        assert_eq!(refreshed.direction, Some(Direction::Out));
     }
 }

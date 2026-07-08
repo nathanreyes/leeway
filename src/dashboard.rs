@@ -3,12 +3,12 @@
 //! Two public entry points, mirroring every screen module: `draw` renders a frame from
 //! read-only data, and `handle_key` mutates `App` (and the database) in response to a key.
 
-use crate::{App, ConfirmAction, DashFocus, PromptKind, Screen};
+use crate::{AddDestination, App, BudgetBlock, ConfirmAction, DashFocus, PromptKind, Screen};
 use anyhow::Result;
 use ballpark::models::{AccountType, Direction, Mode, PeriodType};
 use ballpark::money::Money;
+use ballpark::ops;
 use ballpark::view::{EnvelopeRow, MonthView};
-use ballpark::{ops, queries};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -106,12 +106,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         // Enter / Space = the focused panel's primary action.
         KeyCode::Enter | KeyCode::Char(' ') => act_on_focus(app, view)?,
 
-        // `n` = add a new ad-hoc item to the focused list (a bill/income, or an envelope).
+        // `n` = add a series-backed item to the focused list (reuse or create series).
         KeyCode::Char('n') => add_adhoc(app, view)?,
 
-        // The edit verbs mirror the plan editor's keys and remain ad-hoc-only here.
-        // Direction changes intentionally stay out of this fast path: moving between
-        // income and expenses is safer as remove/re-add.
+        // The edit verbs mirror the plan editor's keys, but here they edit this month's
+        // independent snapshot. Direction changes intentionally stay out of this fast path:
+        // moving between income and expenses is safer as remove/re-add.
         KeyCode::Char('r') => edit_label(app, view), // rename / label
         KeyCode::Char('a') => edit_amount(app, view), // amount
         KeyCode::Char('m') => cycle_mode(app, view)?, // envelope mode
@@ -182,138 +182,100 @@ fn selected_env<'v>(app: &App, view: &'v MonthView) -> Option<&'v EnvelopeRow> {
         .flatten()
 }
 
-/// The nudge shown when an edit key is pressed on a plan-derived row. Deletion is different:
-/// once stamped, rows are month-owned instances and can be removed from that month.
-const PLAN_EDIT_HINT: &str = "That's a plan item — edit it in Plans (p), or add an ad-hoc one (n)";
-
-/// Start a pending ad-hoc item for whichever budget block is focused. Nothing is inserted
-/// until the label and amount prompts both complete.
+/// Start a reusable-series add flow for whichever budget block is focused. Nothing is
+/// inserted until the user selects/creates a series and confirms an amount.
 fn add_adhoc(app: &mut App, view: &MonthView) -> Result<()> {
     match app.dash_focus {
-        DashFocus::Income => app.open_text(
-            "Label",
-            "",
-            PromptKind::DraftTxnLabel {
+        DashFocus::Income => app.open_series_search(
+            AddDestination::Month {
                 month_id: view.month.id.clone(),
-                direction: Direction::In,
             },
-        ),
-        DashFocus::Expenses => app.open_text(
-            "Label",
-            "",
-            PromptKind::DraftTxnLabel {
+            BudgetBlock::Income,
+        )?,
+        DashFocus::Expenses => app.open_series_search(
+            AddDestination::Month {
                 month_id: view.month.id.clone(),
-                direction: Direction::Out,
             },
-        ),
-        DashFocus::Envelopes => {
-            // Seed the mode from the global default, exactly like a new series does.
-            let mode = queries::default_mode(&app.conn)?;
-            app.open_text(
-                "Envelope label",
-                "",
-                PromptKind::DraftEnvelopeLabel {
-                    month_id: view.month.id.clone(),
-                    mode,
-                },
-            );
-        }
+            BudgetBlock::Expenses,
+        )?,
+        DashFocus::Envelopes => app.open_series_search(
+            AddDestination::Month {
+                month_id: view.month.id.clone(),
+            },
+            BudgetBlock::Envelopes,
+        )?,
         // The other panels have their own creation flows (accounts) or none (header).
-        _ => app.status = Some("Focus Income, Expenses, or Envelopes to add an ad-hoc item".into()),
+        _ => app.status = Some("Focus Income, Expenses, or Envelopes to add an item".into()),
     }
     Ok(())
 }
 
-/// `r`: edit the label of the selected ad-hoc txn or envelope.
+/// `r`: edit the label of the selected month txn or envelope.
 fn edit_label(app: &mut App, view: &MonthView) {
     if let Some(t) = selected_txn(app, view) {
-        if t.series_id.is_some() {
-            app.status = Some(PLAN_EDIT_HINT.into());
-        } else {
-            app.open_text_replace_on_type(
-                "Label",
-                t.label.clone(),
-                PromptKind::TxnLabel { id: t.id.clone() },
-            );
-        }
+        app.open_text_replace_on_type(
+            "Label",
+            t.label.clone(),
+            PromptKind::TxnLabel { id: t.id.clone() },
+        );
     } else if let Some(e) = selected_env(app, view) {
-        if e.envelope.series_id.is_some() {
-            app.status = Some(PLAN_EDIT_HINT.into());
-        } else {
-            app.open_text_replace_on_type(
-                "Envelope label",
-                e.envelope.label.clone(),
-                PromptKind::EnvelopeLabel {
-                    id: e.envelope.id.clone(),
-                },
-            );
-        }
+        app.open_text_replace_on_type(
+            "Envelope label",
+            e.envelope.label.clone(),
+            PromptKind::EnvelopeLabel {
+                id: e.envelope.id.clone(),
+            },
+        );
     }
 }
 
-/// `a`: edit the amount of the selected ad-hoc txn or envelope.
+/// `a`: edit the amount of the selected month txn or envelope.
 fn edit_amount(app: &mut App, view: &MonthView) {
     if let Some(t) = selected_txn(app, view) {
-        if t.series_id.is_some() {
-            app.status = Some(PLAN_EDIT_HINT.into());
-        } else {
-            app.open_text(
-                "Amount (dollars)",
-                crate::amount_edit_string(t.amount),
-                PromptKind::TxnAmount { id: t.id.clone() },
-            );
-        }
+        app.open_text(
+            "Amount (dollars)",
+            crate::amount_edit_string(t.amount),
+            PromptKind::TxnAmount { id: t.id.clone() },
+        );
     } else if let Some(e) = selected_env(app, view) {
-        if e.envelope.series_id.is_some() {
-            app.status = Some(PLAN_EDIT_HINT.into());
-        } else {
-            app.open_text(
-                "Envelope amount (dollars)",
-                crate::amount_edit_string(e.envelope.amount),
-                PromptKind::EnvelopeAmount {
-                    id: e.envelope.id.clone(),
-                },
-            );
-        }
+        app.open_text(
+            "Envelope amount (dollars)",
+            crate::amount_edit_string(e.envelope.amount),
+            PromptKind::EnvelopeAmount {
+                id: e.envelope.id.clone(),
+            },
+        );
     }
 }
 
-/// `m`: flip an ad-hoc envelope's mode (automatic ⇄ manual).
+/// `m`: flip a month envelope's mode (automatic ⇄ manual).
 fn cycle_mode(app: &mut App, view: &MonthView) -> Result<()> {
     if let Some(e) = selected_env(app, view) {
-        if e.envelope.series_id.is_some() {
-            app.status = Some(PLAN_EDIT_HINT.into());
-        } else {
-            let next = match e.envelope.mode {
-                Mode::Manual => Mode::Automatic,
-                Mode::Automatic => Mode::Manual,
-            };
-            ops::set_envelope_mode(&app.conn, &e.envelope.id, next)?;
-        }
+        let next = match e.envelope.mode {
+            Mode::Manual => Mode::Automatic,
+            Mode::Automatic => Mode::Manual,
+        };
+        ops::set_envelope_mode(&app.conn, &e.envelope.id, next)?;
     }
     Ok(())
 }
 
-/// `t`: cycle an ad-hoc envelope's period type (daily → weekly → monthly → …).
+/// `t`: cycle a month envelope's period type (daily → weekly → monthly → …).
 fn cycle_period(app: &mut App, view: &MonthView) -> Result<()> {
     if let Some(e) = selected_env(app, view) {
-        if e.envelope.series_id.is_some() {
-            app.status = Some(PLAN_EDIT_HINT.into());
-        } else {
-            let next = match e.envelope.period_type {
-                PeriodType::Daily => PeriodType::Weekly,
-                PeriodType::Weekly => PeriodType::Monthly,
-                PeriodType::Monthly => PeriodType::Daily,
-            };
-            ops::set_envelope_period(&app.conn, &e.envelope.id, next)?;
-        }
+        let next = match e.envelope.period_type {
+            PeriodType::Daily => PeriodType::Weekly,
+            PeriodType::Weekly => PeriodType::Monthly,
+            PeriodType::Monthly => PeriodType::Daily,
+        };
+        ops::set_envelope_period(&app.conn, &e.envelope.id, next)?;
     }
     Ok(())
 }
 
 /// `s` (and Enter on the Envelopes panel): file a spend into the selected manual envelope.
-/// Works for any manual envelope — plan-derived or ad-hoc — since that's the only way to
-/// feed one. Automatic envelopes accrue by time, so there's nothing to file.
+/// Works for any manual envelope. Automatic envelopes accrue by time, so there's nothing
+/// to file.
 fn feed_spending(app: &mut App, view: &MonthView) {
     if let Some(e) = selected_env(app, view) {
         match e.envelope.mode {
@@ -502,7 +464,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             key(" Enter "),
             Span::raw(" paid  "),
             key(" n "),
-            Span::raw(" add  "),
+            Span::raw(" new  "),
             key(" r/a "),
             Span::raw(" edit item  "),
             key(" x "),
@@ -518,7 +480,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             key(" s "),
             Span::raw(" spend  "),
             key(" n "),
-            Span::raw(" add  "),
+            Span::raw(" new  "),
             key(" r/a/m/t "),
             Span::raw(" edit  "),
             key(" x "),
@@ -771,7 +733,6 @@ fn draw_transactions(
                 Span::raw(format!("{} ", check)),
                 Span::raw(format!("{:<18}", crate::truncate(&t.label, 18))),
                 Span::styled(format!("{:>10}", amount), style),
-                origin_marker(t.series_id.is_none()),
             ]);
             ListItem::new(line).style(style)
         })
@@ -816,7 +777,6 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                 Span::styled(format!("{} ", mode), Style::default().fg(Color::DarkGray)),
                 Span::styled(meter, Style::default().fg(Color::Magenta)),
                 Span::raw(format!("  {:>9} left", e.remaining.to_string())),
-                origin_marker(e.envelope.series_id.is_none()),
             ]);
             ListItem::new(line)
         })
@@ -833,17 +793,6 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▌");
     frame.render_stateful_widget(list, area, &mut state);
-}
-
-/// The trailing plan-vs-ad-hoc marker, rendered as its own right-hand column so the rows'
-/// left edges (checkboxes, labels) stay aligned: `⟳` (dim) = came from a stamped plan,
-/// `+` (yellow) = ad-hoc, added straight into this month.
-fn origin_marker(is_adhoc: bool) -> Span<'static> {
-    if is_adhoc {
-        Span::styled("  +", Style::default().fg(Color::Yellow))
-    } else {
-        Span::styled("  ⟳", Style::default().fg(Color::DarkGray))
-    }
 }
 
 /// A `██████░░░░`-style bar showing `consumed / total`, `width` chars wide.
@@ -926,7 +875,6 @@ mod tests {
             editor_income_sel: 0,
             editor_expense_sel: 0,
             editor_env_sel: 0,
-            picker_sel: 0,
             pending_select: None,
             pending_dash_txn: None,
             pending_dash_env: None,

@@ -6,9 +6,9 @@
 use crate::models::*;
 use crate::money::Money;
 use crate::queries;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Datelike, Local, NaiveDate};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -105,9 +105,9 @@ fn insert_instance_from_entry(conn: &Connection, month_id: &str, entry: &PlanEnt
 
 // --- Restamp: Merge / Replace --------------------------------------------------
 
-/// Does this month contain hand-entered data — standalone one-offs, manual-envelope
-/// spending, OR an ad-hoc envelope? All are marked the same way: `series_id IS NULL` (they
-/// didn't come from a plan). Drives whether Replace stops to ask before wiping.
+/// Legacy predicate for seriesless hand-entered data — standalone one-offs,
+/// manual-envelope spending, OR an ad-hoc envelope. The active Replace UI uses
+/// `month_has_items_outside_plan` because series-backed month additions are now normal.
 pub fn month_has_handentered(conn: &Connection, month_id: &str) -> Result<bool> {
     // Two `series_id IS NULL` checks, one per table — a hand-entered txn or an ad-hoc
     // envelope each counts. `OR EXISTS` short-circuits, so we stop at the first hit.
@@ -120,27 +120,77 @@ pub fn month_has_handentered(conn: &Connection, month_id: &str) -> Result<bool> 
     Ok(has)
 }
 
+/// Does this month contain data outside the target plan? This is the Replace guard in the
+/// universal-series model: rows are preserved or wiped based on plan membership, not on
+/// whether they carry a series id.
+pub fn month_has_items_outside_plan(
+    conn: &Connection,
+    month_id: &str,
+    plan_id: &str,
+) -> Result<bool> {
+    let entries = queries::load_plan_entries(conn, plan_id)?;
+    let mut remaining = occurrence_counts(&entries);
+
+    for txn in queries::load_txns(conn, month_id)? {
+        let Some(series_id) = txn.series_id.as_deref() else {
+            return Ok(true);
+        };
+        if txn.envelope_id.is_some() {
+            return Ok(true);
+        }
+        if !consume_occurrence(&mut remaining, Kind::Transaction, series_id) {
+            return Ok(true);
+        }
+    }
+
+    for envelope in queries::load_envelopes(conn, month_id)? {
+        let Some(series_id) = envelope.series_id.as_deref() else {
+            return Ok(true);
+        };
+        if !consume_occurrence(&mut remaining, Kind::Envelope, series_id) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// Merge a plan into an existing month: additive, refreshing the planned baseline.
 /// - A matching **unsettled** instance is refreshed to the plan's values.
 /// - A matching **settled** transaction is left untouched (it holds a real actual).
 /// - A plan entry with no instance is inserted.
-/// Nothing is ever deleted. Works with ANY plan because matching is by shared `series_id`.
+/// Nothing is ever deleted. Repeated occurrences of a series are matched in stable row
+/// order.
 pub fn restamp_merge(conn: &mut Connection, month_id: &str, plan_id: &str) -> Result<()> {
     let tx = conn.transaction()?;
-    for entry in queries::load_plan_entries(&tx, plan_id)? {
+    let entries = queries::load_plan_entries(&tx, plan_id)?;
+    let txns = queries::load_txns(&tx, month_id)?;
+    let envelopes = queries::load_envelopes(&tx, month_id)?;
+    let mut matched_txns: HashSet<String> = HashSet::new();
+    let mut matched_envelopes: HashSet<String> = HashSet::new();
+
+    for entry in &entries {
         match entry.series.kind {
-            Kind::Envelope => match find_month_envelope(&tx, month_id, &entry.series.id)? {
-                Some(id) => refresh_envelope(&tx, &id, &entry)?,
-                None => insert_instance_from_entry(&tx, month_id, &entry)?,
-            },
-            Kind::Transaction => match find_month_txn(&tx, month_id, &entry.series.id)? {
-                Some((id, settled)) => {
-                    if !settled {
-                        refresh_txn(&tx, &id, &entry)?;
-                    }
+            Kind::Envelope => {
+                if let Some(envelope) =
+                    next_matching_envelope(&envelopes, &matched_envelopes, &entry.series.id)
+                {
+                    matched_envelopes.insert(envelope.id.clone());
+                    refresh_envelope(&tx, &envelope.id, entry)?;
+                } else {
+                    insert_instance_from_entry(&tx, month_id, entry)?;
                 }
-                None => insert_instance_from_entry(&tx, month_id, &entry)?,
-            },
+            }
+            Kind::Transaction => {
+                if let Some(txn) = next_matching_txn(&txns, &matched_txns, &entry.series.id) {
+                    matched_txns.insert(txn.id.clone());
+                    if !txn.settled {
+                        refresh_txn(&tx, &txn.id, entry)?;
+                    }
+                } else {
+                    insert_instance_from_entry(&tx, month_id, entry)?;
+                }
+            }
         }
     }
     tx.execute(
@@ -151,81 +201,61 @@ pub fn restamp_merge(conn: &mut Connection, month_id: &str, plan_id: &str) -> Re
     Ok(())
 }
 
-/// Replace a month from a plan (clean slate). Plan-derived instances are reset in place
-/// (amount & stamped reset, unsettled, coded fields refreshed) — resetting rather than
-/// delete+recreate keeps instance ids stable so manual-envelope spending stays linked.
-/// Plan-derived instances no longer in the plan are removed. Hand-entered data (one-offs
-/// and manual spending) is wiped unless `keep_handentered`.
+/// Replace a month from a plan (clean slate). Instances whose series is in the target plan
+/// are reset in place (amount & stamped reset, unsettled, coded fields refreshed) —
+/// resetting rather than delete+recreate keeps instance ids stable so manual-envelope
+/// spending stays linked. Rows outside the target plan are wiped unless
+/// `keep_outside_plan`.
 pub fn restamp_replace(
     conn: &mut Connection,
     month_id: &str,
     plan_id: &str,
-    keep_handentered: bool,
+    keep_outside_plan: bool,
 ) -> Result<()> {
     let tx = conn.transaction()?;
     let entries = queries::load_plan_entries(&tx, plan_id)?;
-    let entry_by_series: HashMap<&str, &PlanEntry> =
-        entries.iter().map(|e| (e.series.id.as_str(), e)).collect();
-
     let txns = queries::load_txns(&tx, month_id)?;
     let envelopes = queries::load_envelopes(&tx, month_id)?;
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut matched_txns: HashSet<String> = HashSet::new();
+    let mut matched_envelopes: HashSet<String> = HashSet::new();
 
-    // Transactions.
-    for t in &txns {
-        match t.series_id.as_deref() {
-            None => {
-                // Hand-entered (one-off or manual-envelope spending).
-                if !keep_handentered {
-                    tx.execute("DELETE FROM txn WHERE id = ?1", [&t.id])?;
-                }
-            }
-            Some(sid) => {
-                if let Some(entry) = entry_by_series.get(sid) {
-                    refresh_txn(&tx, &t.id, entry)?; // reset in place (unsettles it)
-                    seen.insert(sid.to_string());
-                } else {
-                    // Plan-derived but removed from the plan.
-                    tx.execute("DELETE FROM txn WHERE id = ?1", [&t.id])?;
-                }
-            }
-        }
-    }
-
-    // Envelopes. `series_id` splits them three ways now that ad-hoc envelopes exist.
-    for e in &envelopes {
-        match e.series_id.as_deref() {
-            // Ad-hoc envelope (hand-entered): follow the exact rule the txn loop above used
-            // for one-offs. On a wipe, drop it; its manual spending (also series_id NULL)
-            // was already deleted by that loop, so no child txn is left to violate the FK.
-            // On keep, leave both the envelope and its spending untouched.
-            None => {
-                if !keep_handentered {
-                    tx.execute("DELETE FROM envelope WHERE id = ?1", [&e.id])?;
-                }
-            }
-            Some(sid) => {
-                if let Some(entry) = entry_by_series.get(sid) {
-                    refresh_envelope(&tx, &e.id, entry)?;
-                    seen.insert(sid.to_string());
-                } else {
-                    // Plan-derived but removed from the plan: detach any surviving manual
-                    // spending to standalone (so kept hand-entered data isn't orphaned by
-                    // the FK), then drop the envelope.
-                    tx.execute(
-                        "UPDATE txn SET envelope_id = NULL WHERE envelope_id = ?1",
-                        [&e.id],
-                    )?;
-                    tx.execute("DELETE FROM envelope WHERE id = ?1", [&e.id])?;
-                }
-            }
-        }
-    }
-
-    // Plan entries with no existing instance → insert fresh.
     for entry in &entries {
-        if !seen.contains(&entry.series.id) {
-            insert_instance_from_entry(&tx, month_id, entry)?;
+        match entry.series.kind {
+            Kind::Envelope => {
+                if let Some(envelope) =
+                    next_matching_envelope(&envelopes, &matched_envelopes, &entry.series.id)
+                {
+                    matched_envelopes.insert(envelope.id.clone());
+                    refresh_envelope(&tx, &envelope.id, entry)?;
+                } else {
+                    insert_instance_from_entry(&tx, month_id, entry)?;
+                }
+            }
+            Kind::Transaction => {
+                if let Some(txn) = next_matching_txn(&txns, &matched_txns, &entry.series.id) {
+                    matched_txns.insert(txn.id.clone());
+                    refresh_txn(&tx, &txn.id, entry)?;
+                } else {
+                    insert_instance_from_entry(&tx, month_id, entry)?;
+                }
+            }
+        }
+    }
+
+    if !keep_outside_plan {
+        for txn in &txns {
+            if !matched_txns.contains(&txn.id) {
+                tx.execute("DELETE FROM txn WHERE id = ?1", [&txn.id])?;
+            }
+        }
+        for envelope in &envelopes {
+            if !matched_envelopes.contains(&envelope.id) {
+                tx.execute(
+                    "UPDATE txn SET envelope_id = NULL WHERE envelope_id = ?1",
+                    [&envelope.id],
+                )?;
+                tx.execute("DELETE FROM envelope WHERE id = ?1", [&envelope.id])?;
+            }
         }
     }
 
@@ -237,36 +267,51 @@ pub fn restamp_replace(
     Ok(())
 }
 
-/// Find a month's envelope instance for a series, if present.
-fn find_month_envelope(
-    conn: &Connection,
-    month_id: &str,
+fn next_matching_txn<'a>(
+    txns: &'a [Txn],
+    matched: &HashSet<String>,
     series_id: &str,
-) -> Result<Option<String>> {
-    let id = conn
-        .query_row(
-            "SELECT id FROM envelope WHERE month_id = ?1 AND series_id = ?2 LIMIT 1",
-            rusqlite::params![month_id, series_id],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?;
-    Ok(id)
+) -> Option<&'a Txn> {
+    txns.iter().find(|txn| {
+        txn.envelope_id.is_none()
+            && txn.series_id.as_deref() == Some(series_id)
+            && !matched.contains(&txn.id)
+    })
 }
 
-/// Find a month's standalone txn instance for a series, returning its id and settled flag.
-fn find_month_txn(
-    conn: &Connection,
-    month_id: &str,
+fn next_matching_envelope<'a>(
+    envelopes: &'a [Envelope],
+    matched: &HashSet<String>,
     series_id: &str,
-) -> Result<Option<(String, bool)>> {
-    let row = conn
-        .query_row(
-            "SELECT id, settled FROM txn WHERE month_id = ?1 AND series_id = ?2 LIMIT 1",
-            rusqlite::params![month_id, series_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)),
-        )
-        .optional()?;
-    Ok(row)
+) -> Option<&'a Envelope> {
+    envelopes.iter().find(|envelope| {
+        envelope.series_id.as_deref() == Some(series_id) && !matched.contains(&envelope.id)
+    })
+}
+
+fn occurrence_counts(entries: &[PlanEntry]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for entry in entries {
+        *counts
+            .entry(occurrence_key(entry.series.kind, &entry.series.id))
+            .or_insert(0) += 1;
+    }
+    counts
+}
+
+fn consume_occurrence(counts: &mut HashMap<String, usize>, kind: Kind, series_id: &str) -> bool {
+    let Some(count) = counts.get_mut(&occurrence_key(kind, series_id)) else {
+        return false;
+    };
+    if *count == 0 {
+        return false;
+    }
+    *count -= 1;
+    true
+}
+
+fn occurrence_key(kind: Kind, series_id: &str) -> String {
+    format!("{}:{series_id}", kind.as_str())
 }
 
 /// Reset an envelope instance to a plan entry's planned values.
@@ -580,12 +625,82 @@ pub fn delete_series(conn: &Connection, series_id: &str) -> Result<()> {
     Ok(())
 }
 
-// --- Ad-hoc month items (§ not-from-a-plan) ------------------------------------
+// --- Month items ---------------------------------------------------------------
+
+/// Add a standalone transaction instance for an existing series to a month. This is the
+/// dashboard's normal add path: the row is month-owned, but still carries the durable
+/// series id so trends and restamp matching can recognize it.
+pub fn add_series_txn_instance(
+    conn: &Connection,
+    month_id: &str,
+    series_id: &str,
+    amount: Money,
+) -> Result<String> {
+    let series = queries::get_series(conn, series_id)?
+        .with_context(|| format!("series not found: {series_id}"))?;
+    if series.kind != Kind::Transaction {
+        anyhow::bail!("series is not a transaction");
+    }
+
+    let id = new_id();
+    conn.execute(
+        "INSERT INTO txn
+           (id, month_id, series_id, label, category, direction,
+            amount_cents, stamped_amount_cents, settled)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+        rusqlite::params![
+            id,
+            month_id,
+            series.id,
+            series.label,
+            series.category,
+            series.direction.unwrap_or(Direction::Out),
+            amount,
+            amount,
+        ],
+    )?;
+    Ok(id)
+}
+
+/// Add an envelope instance for an existing series to a month.
+pub fn add_series_envelope_instance(
+    conn: &Connection,
+    month_id: &str,
+    series_id: &str,
+    amount: Money,
+) -> Result<String> {
+    let series = queries::get_series(conn, series_id)?
+        .with_context(|| format!("series not found: {series_id}"))?;
+    if series.kind != Kind::Envelope {
+        anyhow::bail!("series is not an envelope");
+    }
+
+    let id = new_id();
+    conn.execute(
+        "INSERT INTO envelope
+           (id, month_id, series_id, label, category, amount_cents,
+            stamped_amount_cents, period_type, mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            id,
+            month_id,
+            series.id,
+            series.label,
+            series.category,
+            amount,
+            amount,
+            series.period_type.unwrap_or(PeriodType::Monthly),
+            series.mode.expect("envelope series must have a mode"),
+        ],
+    )?;
+    Ok(id)
+}
+
+// --- Legacy/seriesless month items --------------------------------------------
 //
-// These write instances straight into a *month*, with `series_id = NULL` to mark them
-// hand-entered (the same signal one-off txns have always used). They never touch `plan`,
-// `plan_item`, or `series`, so they can't accidentally become part of a template. Restamp
-// Merge ignores them (it matches by series id) and Replace treats them as hand-entered.
+// The normal dashboard add path now creates or reuses a series and calls the helpers
+// above. These older helpers still support legacy rows and manual-envelope spending,
+// where `series_id = NULL` marks data outside the plan's series set.
 
 /// Add a standalone (no-envelope) one-off transaction to a month — an ad-hoc bill or bit of
 /// income. `series_id` and `stamped_amount` stay NULL (nothing to revert to), and it starts
@@ -648,9 +763,8 @@ pub fn add_envelope_spending(
     Ok(id)
 }
 
-// Per-field editors for a month's instances. These edit the *instance* (this month's copy),
-// never a series — so they're safe for ad-hoc items and never leak into a plan. The
-// dashboard gates them to ad-hoc rows; plan-derived instances are managed via Plans.
+// Per-field editors for a month's instances. These edit the *instance* (this month's
+// copy), never the shared series.
 
 pub fn set_txn_label(conn: &Connection, txn_id: &str, label: &str) -> Result<()> {
     conn.execute(
@@ -1262,6 +1376,206 @@ mod tests {
             month_has_handentered(&conn, &month.id).unwrap(),
             "ad-hoc envelope alone trips the flag"
         );
+    }
+
+    #[test]
+    fn month_adds_series_backed_budget_items() {
+        let mut conn = db::open_in_memory().unwrap();
+        seed_demo(&mut conn).unwrap();
+        let month = queries::current_month(&conn).unwrap().unwrap();
+        let plan_id = queries::plans(&conn).unwrap()[0].id.clone();
+
+        let concert = create_series(
+            &conn,
+            Kind::Transaction,
+            "Concert",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        let txn_id =
+            add_series_txn_instance(&conn, &month.id, &concert, Money::from_dollars(120.0))
+                .unwrap();
+        let second_txn_id =
+            add_series_txn_instance(&conn, &month.id, &concert, Money::from_dollars(80.0)).unwrap();
+
+        let fun = create_series(
+            &conn,
+            Kind::Envelope,
+            "Fun",
+            None,
+            Some(PeriodType::Monthly),
+            Some(Mode::Manual),
+        )
+        .unwrap();
+        let env_id =
+            add_series_envelope_instance(&conn, &month.id, &fun, Money::from_dollars(200.0))
+                .unwrap();
+
+        let txn = queries::load_txns(&conn, &month.id)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == txn_id)
+            .unwrap();
+        assert_eq!(txn.series_id.as_deref(), Some(concert.as_str()));
+        assert_eq!(txn.stamped_amount, Some(Money::from_dollars(120.0)));
+        let second_txn = queries::load_txns(&conn, &month.id)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == second_txn_id)
+            .unwrap();
+        assert_eq!(second_txn.series_id.as_deref(), Some(concert.as_str()));
+        assert_ne!(txn.id, second_txn.id);
+        assert_eq!(second_txn.amount, Money::from_dollars(80.0));
+
+        let env = queries::load_envelopes(&conn, &month.id)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == env_id)
+            .unwrap();
+        assert_eq!(env.series_id.as_deref(), Some(fun.as_str()));
+        assert_eq!(env.stamped_amount, Money::from_dollars(200.0));
+        assert!(
+            month_has_items_outside_plan(&conn, &month.id, &plan_id).unwrap(),
+            "series-backed month additions are outside the stamped plan until added there"
+        );
+    }
+
+    #[test]
+    fn replace_can_wipe_or_keep_series_backed_items_outside_plan() {
+        fn setup() -> (Connection, String, String, String) {
+            let mut conn = db::open_in_memory().unwrap();
+            let plan = create_plan(&conn, "P").unwrap();
+            let rent = create_series(
+                &conn,
+                Kind::Transaction,
+                "Rent",
+                Some(Direction::Out),
+                None,
+                None,
+            )
+            .unwrap();
+            add_plan_item(&conn, &plan, &rent, Money::from_dollars(1000.0)).unwrap();
+            let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+            let month_id = stamp(&mut conn, &plan, "2026-09", start, 30).unwrap();
+
+            let concert = create_series(
+                &conn,
+                Kind::Transaction,
+                "Concert",
+                Some(Direction::Out),
+                None,
+                None,
+            )
+            .unwrap();
+            add_series_txn_instance(&conn, &month_id, &concert, Money::from_dollars(120.0))
+                .unwrap();
+            (conn, plan, month_id, concert)
+        }
+
+        {
+            let (mut conn, plan, month_id, concert) = setup();
+            restamp_replace(&mut conn, &month_id, &plan, false).unwrap();
+            let txns = queries::load_txns(&conn, &month_id).unwrap();
+            assert!(
+                txns.iter()
+                    .all(|t| t.series_id.as_deref() != Some(concert.as_str())),
+                "outside-plan series wiped"
+            );
+        }
+
+        {
+            let (mut conn, plan, month_id, concert) = setup();
+            restamp_replace(&mut conn, &month_id, &plan, true).unwrap();
+            let txns = queries::load_txns(&conn, &month_id).unwrap();
+            assert!(
+                txns.iter()
+                    .any(|t| t.series_id.as_deref() == Some(concert.as_str())),
+                "outside-plan series kept"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_adds_repeated_plan_occurrences_without_collapsing_series() {
+        let mut conn = db::open_in_memory().unwrap();
+        let plan = create_plan(&conn, "P").unwrap();
+        let paycheck = create_series(
+            &conn,
+            Kind::Transaction,
+            "Solace Paycheck",
+            Some(Direction::In),
+            None,
+            None,
+        )
+        .unwrap();
+        add_plan_item(&conn, &plan, &paycheck, Money::from_dollars(5000.0)).unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let month_id = stamp(&mut conn, &plan, "2026-09", start, 30).unwrap();
+        add_plan_item(&conn, &plan, &paycheck, Money::from_dollars(4500.0)).unwrap();
+
+        restamp_merge(&mut conn, &month_id, &plan).unwrap();
+
+        let mut amounts = queries::load_txns(&conn, &month_id)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.series_id.as_deref() == Some(paycheck.as_str()))
+            .map(|t| t.amount)
+            .collect::<Vec<_>>();
+        amounts.sort_by_key(|amount| amount.cents());
+        assert_eq!(
+            amounts,
+            vec![Money::from_dollars(4500.0), Money::from_dollars(5000.0)]
+        );
+    }
+
+    #[test]
+    fn replace_matches_repeated_occurrences_and_can_keep_extras() {
+        fn setup() -> (Connection, String, String, String) {
+            let mut conn = db::open_in_memory().unwrap();
+            let plan = create_plan(&conn, "P").unwrap();
+            let paycheck = create_series(
+                &conn,
+                Kind::Transaction,
+                "Solace Paycheck",
+                Some(Direction::In),
+                None,
+                None,
+            )
+            .unwrap();
+            add_plan_item(&conn, &plan, &paycheck, Money::from_dollars(5000.0)).unwrap();
+            let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+            let month_id = stamp(&mut conn, &plan, "2026-09", start, 30).unwrap();
+            add_series_txn_instance(&conn, &month_id, &paycheck, Money::from_dollars(4500.0))
+                .unwrap();
+            (conn, plan, month_id, paycheck)
+        }
+
+        {
+            let (mut conn, plan, month_id, paycheck) = setup();
+            assert!(month_has_items_outside_plan(&conn, &month_id, &plan).unwrap());
+            restamp_replace(&mut conn, &month_id, &plan, false).unwrap();
+            let rows = queries::load_txns(&conn, &month_id)
+                .unwrap()
+                .into_iter()
+                .filter(|t| t.series_id.as_deref() == Some(paycheck.as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 1, "extra occurrence wiped");
+            assert_eq!(rows[0].amount, Money::from_dollars(5000.0));
+        }
+
+        {
+            let (mut conn, plan, month_id, paycheck) = setup();
+            restamp_replace(&mut conn, &month_id, &plan, true).unwrap();
+            let rows = queries::load_txns(&conn, &month_id)
+                .unwrap()
+                .into_iter()
+                .filter(|t| t.series_id.as_deref() == Some(paycheck.as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 2, "extra occurrence kept");
+        }
     }
 
     #[test]

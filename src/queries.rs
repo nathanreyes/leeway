@@ -73,7 +73,7 @@ pub fn load_envelopes(conn: &Connection, month_id: &str) -> Result<Vec<Envelope>
     let mut stmt = conn.prepare(
         "SELECT id, month_id, series_id, label, category, amount_cents,
                 stamped_amount_cents, period_type, mode
-         FROM envelope WHERE month_id = ?1 ORDER BY label",
+         FROM envelope WHERE month_id = ?1 ORDER BY label, id",
     )?;
     let rows = stmt
         .query_map([month_id], map_envelope)?
@@ -85,7 +85,7 @@ pub fn load_txns(conn: &Connection, month_id: &str) -> Result<Vec<Txn>> {
     let mut stmt = conn.prepare(
         "SELECT id, month_id, series_id, envelope_id, account_id, label, category,
                 direction, amount_cents, stamped_amount_cents, settled, date_paid
-         FROM txn WHERE month_id = ?1 ORDER BY direction DESC, label",
+         FROM txn WHERE month_id = ?1 ORDER BY direction DESC, label, id",
     )?;
     let rows = stmt
         .query_map([month_id], map_txn)?
@@ -125,7 +125,10 @@ pub fn plan_summaries(conn: &Connection) -> Result<Vec<PlanSummary>> {
     let rows = stmt
         .query_map([], |r| {
             Ok(PlanSummary {
-                plan: Plan { id: r.get("id")?, name: r.get("name")? },
+                plan: Plan {
+                    id: r.get("id")?,
+                    name: r.get("name")?,
+                },
                 item_count: r.get("item_count")?,
             })
         })?
@@ -137,7 +140,10 @@ pub fn plan_summaries(conn: &Connection) -> Result<Vec<PlanSummary>> {
 pub fn get_plan(conn: &Connection, plan_id: &str) -> Result<Option<Plan>> {
     let mut stmt = conn.prepare("SELECT id, name FROM plan WHERE id = ?1")?;
     let mut rows = stmt.query_map([plan_id], |r| {
-        Ok(Plan { id: r.get("id")?, name: r.get("name")? })
+        Ok(Plan {
+            id: r.get("id")?,
+            name: r.get("name")?,
+        })
     })?;
     match rows.next() {
         None => Ok(None),
@@ -154,7 +160,7 @@ pub fn load_plan_entries(conn: &Connection, plan_id: &str) -> Result<Vec<PlanEnt
                 s.direction AS direction, s.period_type AS period_type, s.mode AS mode
          FROM plan_item pi JOIN series s ON s.id = pi.series_id
          WHERE pi.plan_id = ?1
-         ORDER BY s.kind, s.label",
+         ORDER BY s.kind, s.label, pi.id",
     )?;
     let rows = stmt
         .query_map([plan_id], map_plan_entry)?
@@ -172,6 +178,52 @@ pub fn list_series(conn: &Connection) -> Result<Vec<Series>> {
         .query_map([], map_series)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+pub fn get_series(conn: &Connection, series_id: &str) -> Result<Option<Series>> {
+    let row = conn
+        .query_row(
+            "SELECT id, kind, label, category, direction, period_type, mode
+             FROM series WHERE id = ?1",
+            [series_id],
+            map_series,
+        )
+        .optional()?;
+    Ok(row)
+}
+
+pub fn plan_has_series(conn: &Connection, plan_id: &str, series_id: &str) -> Result<bool> {
+    let has: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM plan_item WHERE plan_id = ?1 AND series_id = ?2
+         )",
+        rusqlite::params![plan_id, series_id],
+        |r| r.get(0),
+    )?;
+    Ok(has)
+}
+
+pub fn month_has_budget_series(
+    conn: &Connection,
+    month_id: &str,
+    series_id: &str,
+    kind: Kind,
+) -> Result<bool> {
+    let sql = match kind {
+        Kind::Transaction => {
+            "SELECT EXISTS(
+                 SELECT 1 FROM txn
+                 WHERE month_id = ?1 AND series_id = ?2 AND envelope_id IS NULL
+             )"
+        }
+        Kind::Envelope => {
+            "SELECT EXISTS(
+                 SELECT 1 FROM envelope WHERE month_id = ?1 AND series_id = ?2
+             )"
+        }
+    };
+    let has: bool = conn.query_row(sql, rusqlite::params![month_id, series_id], |r| r.get(0))?;
+    Ok(has)
 }
 
 /// The set of series ids already included in a plan — so the picker can mark/skip them.
@@ -225,9 +277,11 @@ pub fn month_label_exists(conn: &Connection, label: &str) -> Result<bool> {
 /// The id of the month with this label, if any — so a restamp can target it.
 pub fn month_id_for_label(conn: &Connection, label: &str) -> Result<Option<String>> {
     let id = conn
-        .query_row("SELECT id FROM month WHERE label = ?1 LIMIT 1", [label], |r| {
-            r.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT id FROM month WHERE label = ?1 LIMIT 1",
+            [label],
+            |r| r.get::<_, String>(0),
+        )
         .optional()?;
     Ok(id)
 }
@@ -238,7 +292,7 @@ fn map_account(r: &Row) -> rusqlite::Result<Account> {
     Ok(Account {
         id: r.get("id")?,
         name: r.get("name")?,
-        account_type: r.get("type")?, // AccountType::FromSql
+        account_type: r.get("type")?,     // AccountType::FromSql
         balance: r.get("balance_cents")?, // Money::FromSql
         credit_limit: r.get("credit_limit_cents")?, // Option<Money>: NULL -> None
         available_credit: r.get("available_credit_cents")?,
@@ -290,8 +344,13 @@ struct MonthRaw {
 
 impl MonthRaw {
     fn parse(self) -> Result<Month> {
-        let start_date = NaiveDate::parse_from_str(&self.start_date, "%Y-%m-%d")
-            .with_context(|| format!("month {} has invalid start_date {:?}", self.id, self.start_date))?;
+        let start_date =
+            NaiveDate::parse_from_str(&self.start_date, "%Y-%m-%d").with_context(|| {
+                format!(
+                    "month {} has invalid start_date {:?}",
+                    self.id, self.start_date
+                )
+            })?;
         Ok(Month {
             id: self.id,
             plan_id: self.plan_id,

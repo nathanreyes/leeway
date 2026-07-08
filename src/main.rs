@@ -16,7 +16,7 @@ mod dashboard;
 mod plans;
 
 use anyhow::Result;
-use ballpark::models::{Direction, Mode, PeriodType};
+use ballpark::models::{Direction, Kind, PeriodType, Series};
 use ballpark::money::Money;
 use ballpark::{db, ops, queries};
 use chrono::{Datelike, Local, NaiveDate};
@@ -35,13 +35,7 @@ use std::time::Duration;
 pub enum Screen {
     Dashboard,
     Plans,
-    PlanEditor {
-        plan_id: String,
-    },
-    /// Pick an existing series to add to a plan (the reuse picker).
-    SeriesPicker {
-        plan_id: String,
-    },
+    PlanEditor { plan_id: String },
 }
 
 /// Which control the dashboard's keys act on. The month header owns month navigation; the
@@ -69,8 +63,34 @@ pub enum PlanFocus {
 /// to stamp), a destructive-action confirm, or a hotkey menu (Merge/Replace/Cancel).
 pub enum Modal {
     Text(TextPrompt),
+    SeriesSearch(SeriesSearch),
     Confirm(Confirm),
     Choice(Choice),
+}
+
+/// A shared budget block vocabulary for add flows that work in both the dashboard and
+/// plan editor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BudgetBlock {
+    Income,
+    Expenses,
+    Envelopes,
+}
+
+#[derive(Clone)]
+pub enum AddDestination {
+    Plan { plan_id: String },
+    Month { month_id: String },
+}
+
+/// Search existing series in the focused block, or create one if there are no matches.
+pub struct SeriesSearch {
+    pub title: String,
+    pub buffer: String,
+    pub selected: usize,
+    pub block: BudgetBlock,
+    pub destination: AddDestination,
+    pub all_series: Vec<Series>,
 }
 
 /// A little menu: each option has a hotkey, a label, and an action (`None` = just cancel).
@@ -94,7 +114,8 @@ pub enum ModalAction {
         month_id: String,
         plan_id: String,
     },
-    /// Replace, but scope (wipe vs keep hand-entered) is decided in a follow-up choice.
+    /// Replace, but scope (wipe vs keep items outside the target plan) is decided in a
+    /// follow-up choice.
     RestampReplace {
         month_id: String,
         plan_id: String,
@@ -102,7 +123,7 @@ pub enum ModalAction {
     RestampReplaceScoped {
         month_id: String,
         plan_id: String,
-        keep_handentered: bool,
+        keep_outside_plan: bool,
     },
 }
 
@@ -128,16 +149,11 @@ pub enum PromptKind {
     ItemAmount {
         id: String,
     },
-    /// Collect the label for a plan item that has not been inserted yet.
-    DraftPlanItemLabel {
-        plan_id: String,
-        focus: PlanFocus,
-    },
-    /// Collect the amount, then insert the pending plan item.
-    DraftPlanItemAmount {
-        plan_id: String,
-        focus: PlanFocus,
-        label: String,
+    /// Collect the amount, then add a selected or newly-created series to a plan/month.
+    SeriesAddAmount {
+        destination: AddDestination,
+        block: BudgetBlock,
+        selection: SeriesSelection,
     },
     StampMonth {
         plan_id: String,
@@ -153,41 +169,19 @@ pub enum PromptKind {
     CardLimit {
         id: String,
     },
-    /// Edit an ad-hoc transaction's label (this instance only — no series).
+    /// Edit a month transaction's label (this instance only).
     TxnLabel {
         id: String,
     },
-    /// Collect the label for an ad-hoc transaction that has not been inserted yet.
-    DraftTxnLabel {
-        month_id: String,
-        direction: Direction,
-    },
-    /// Collect the amount, then insert the pending ad-hoc transaction.
-    DraftTxnAmount {
-        month_id: String,
-        direction: Direction,
-        label: String,
-    },
-    /// Edit an ad-hoc transaction's amount.
+    /// Edit a month transaction's amount.
     TxnAmount {
         id: String,
     },
-    /// Edit an ad-hoc envelope's label.
+    /// Edit a month envelope's label.
     EnvelopeLabel {
         id: String,
     },
-    /// Collect the label for an ad-hoc envelope that has not been inserted yet.
-    DraftEnvelopeLabel {
-        month_id: String,
-        mode: Mode,
-    },
-    /// Collect the amount, then insert the pending ad-hoc envelope.
-    DraftEnvelopeAmount {
-        month_id: String,
-        mode: Mode,
-        label: String,
-    },
-    /// Edit an ad-hoc envelope's monthly amount.
+    /// Edit a month envelope's monthly amount.
     EnvelopeAmount {
         id: String,
     },
@@ -197,6 +191,11 @@ pub enum PromptKind {
         envelope_id: String,
         month_id: String,
     },
+}
+
+pub enum SeriesSelection {
+    Existing { series_id: String, label: String },
+    New { label: String },
 }
 
 pub struct Confirm {
@@ -243,14 +242,13 @@ pub struct App {
     pub editor_income_sel: usize,
     pub editor_expense_sel: usize,
     pub editor_env_sel: usize,
-    pub picker_sel: usize,
     /// After creating an item we want to jump the selection onto it, but its list
     /// position isn't known until the next reload (rows are sorted). We stash the id
     /// here and the loop resolves it to an index once the items are loaded.
     pub pending_select: Option<String>,
-    /// The dashboard's counterparts to `pending_select`: after creating an ad-hoc txn or
-    /// envelope we stash its id here, and the event loop resolves it to a list index on the
-    /// next reload (the lists are sorted, so the position isn't known until then).
+    /// The dashboard's counterparts to `pending_select`: after creating a txn or envelope
+    /// we stash its id here, and the event loop resolves it to a list index on the next
+    /// reload (the lists are sorted, so the position isn't known until then).
     pub pending_dash_txn: Option<String>,
     pub pending_dash_env: Option<String>,
     pub modal: Option<Modal>,
@@ -280,6 +278,22 @@ impl App {
             replace_on_next_char: true,
             kind,
         }));
+    }
+
+    fn open_series_search(
+        &mut self,
+        destination: AddDestination,
+        block: BudgetBlock,
+    ) -> Result<()> {
+        self.modal = Some(Modal::SeriesSearch(SeriesSearch {
+            title: format!("Add {}", block.noun()),
+            buffer: String::new(),
+            selected: 0,
+            block,
+            destination,
+            all_series: queries::list_series(&self.conn)?,
+        }));
+        Ok(())
     }
 
     fn open_confirm(&mut self, title: impl Into<String>, action: ConfirmAction) {
@@ -323,7 +337,6 @@ fn main() -> Result<()> {
         editor_income_sel: 0,
         editor_expense_sel: 0,
         editor_env_sel: 0,
-        picker_sel: 0,
         pending_select: None,
         pending_dash_txn: None,
         pending_dash_env: None,
@@ -476,25 +489,6 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     }
                 }
             }
-
-            Screen::SeriesPicker { plan_id } => {
-                let plan_id = plan_id.clone();
-                let all_series = queries::list_series(&app.conn)?;
-                let in_plan = queries::series_in_plan(&app.conn, &plan_id)?;
-                clamp(&mut app.picker_sel, all_series.len());
-
-                terminal.draw(|f| {
-                    plans::draw_series_picker(f, app, &all_series, &in_plan);
-                    draw_modal(f, app);
-                })?;
-                if let Some(key) = read_key()? {
-                    if app.modal.is_some() {
-                        handle_modal_key(app, key)?;
-                    } else {
-                        plans::handle_series_picker_key(app, key, &plan_id, &all_series, &in_plan)?;
-                    }
-                }
-            }
         }
     }
     Ok(())
@@ -525,6 +519,43 @@ fn clamp(sel: &mut usize, len: usize) {
         *sel = 0;
     } else if *sel >= len {
         *sel = len - 1;
+    }
+}
+
+impl BudgetBlock {
+    fn noun(self) -> &'static str {
+        match self {
+            BudgetBlock::Income => "income",
+            BudgetBlock::Expenses => "expense",
+            BudgetBlock::Envelopes => "envelope",
+        }
+    }
+
+    fn kind(self) -> Kind {
+        match self {
+            BudgetBlock::Income | BudgetBlock::Expenses => Kind::Transaction,
+            BudgetBlock::Envelopes => Kind::Envelope,
+        }
+    }
+
+    fn direction(self) -> Option<Direction> {
+        match self {
+            BudgetBlock::Income => Some(Direction::In),
+            BudgetBlock::Expenses => Some(Direction::Out),
+            BudgetBlock::Envelopes => None,
+        }
+    }
+
+    fn matches_series(self, series: &Series) -> bool {
+        match self {
+            BudgetBlock::Income => {
+                series.kind == Kind::Transaction && series.direction == Some(Direction::In)
+            }
+            BudgetBlock::Expenses => {
+                series.kind == Kind::Transaction && series.direction == Some(Direction::Out)
+            }
+            BudgetBlock::Envelopes => series.kind == Kind::Envelope,
+        }
     }
 }
 
@@ -619,6 +650,7 @@ fn plan_entry_matches(entry: &ballpark::models::PlanEntry, focus: PlanFocus) -> 
 fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match app.modal.as_ref() {
         Some(Modal::Text(_)) => handle_text_key(app, key),
+        Some(Modal::SeriesSearch(_)) => handle_series_search_key(app, key),
         Some(Modal::Confirm(_)) => handle_confirm_key(app, key),
         Some(Modal::Choice(_)) => handle_choice_key(app, key),
         None => Ok(()),
@@ -650,7 +682,7 @@ fn handle_choice_key(app: &mut App, key: KeyEvent) -> Result<()> {
 }
 
 /// Execute a chosen restamp action. Replace fans out into a scope choice when the month
-/// holds hand-entered data, so we never silently wipe it.
+/// has rows outside the target plan, so we never silently wipe them.
 fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
     match action {
         ModalAction::RestampMerge { month_id, plan_id } => {
@@ -658,26 +690,26 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
             finish_restamp(app, "Merged plan into the month");
         }
         ModalAction::RestampReplace { month_id, plan_id } => {
-            if ops::month_has_handentered(&app.conn, &month_id)? {
+            if ops::month_has_items_outside_plan(&app.conn, &month_id, &plan_id)? {
                 app.open_choice(
-                    "This month has hand-entered items. Replace how?",
+                    "This month has items outside this plan. Replace how?",
                     vec![
                         ChoiceOption {
                             key: 'w',
-                            label: "Wipe everything".into(),
+                            label: "Wipe outside-plan items".into(),
                             action: Some(ModalAction::RestampReplaceScoped {
                                 month_id: month_id.clone(),
                                 plan_id: plan_id.clone(),
-                                keep_handentered: false,
+                                keep_outside_plan: false,
                             }),
                         },
                         ChoiceOption {
                             key: 'k',
-                            label: "Keep hand-entered".into(),
+                            label: "Keep outside-plan items".into(),
                             action: Some(ModalAction::RestampReplaceScoped {
                                 month_id,
                                 plan_id,
-                                keep_handentered: true,
+                                keep_outside_plan: true,
                             }),
                         },
                         ChoiceOption {
@@ -695,11 +727,11 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
         ModalAction::RestampReplaceScoped {
             month_id,
             plan_id,
-            keep_handentered,
+            keep_outside_plan,
         } => {
-            ops::restamp_replace(&mut app.conn, &month_id, &plan_id, keep_handentered)?;
-            let msg = if keep_handentered {
-                "Replaced (kept hand-entered items)"
+            ops::restamp_replace(&mut app.conn, &month_id, &plan_id, keep_outside_plan)?;
+            let msg = if keep_outside_plan {
+                "Replaced (kept outside-plan items)"
             } else {
                 "Replaced the month"
             };
@@ -738,11 +770,144 @@ fn handle_text_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-fn plan_item_label_title(focus: PlanFocus) -> &'static str {
-    match focus {
-        PlanFocus::Income | PlanFocus::Expenses => "Series label (shared across plans)",
-        PlanFocus::Envelopes => "Envelope label (shared across plans)",
+fn handle_series_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => app.modal = None,
+        KeyCode::Enter => submit_series_search(app)?,
+        KeyCode::Backspace => {
+            if let Some(Modal::SeriesSearch(p)) = &mut app.modal {
+                p.buffer.pop();
+                p.selected = 0;
+            }
+        }
+        KeyCode::Down => {
+            if let Some(Modal::SeriesSearch(p)) = &mut app.modal {
+                let count = series_search_matches(p).len();
+                if count > 0 && p.selected + 1 < count {
+                    p.selected += 1;
+                }
+            }
+        }
+        KeyCode::Up => {
+            if let Some(Modal::SeriesSearch(p)) = &mut app.modal {
+                p.selected = p.selected.saturating_sub(1);
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(Modal::SeriesSearch(p)) = &mut app.modal {
+                p.buffer.push(c);
+                p.selected = 0;
+            }
+        }
+        _ => {}
     }
+    Ok(())
+}
+
+fn series_search_matches(prompt: &SeriesSearch) -> Vec<&Series> {
+    let needle = prompt.buffer.trim().to_lowercase();
+    prompt
+        .all_series
+        .iter()
+        .filter(|series| prompt.block.matches_series(series))
+        .filter(|series| needle.is_empty() || series.label.to_lowercase().contains(&needle))
+        .collect()
+}
+
+fn submit_series_search(app: &mut App) -> Result<()> {
+    let Some(Modal::SeriesSearch(prompt)) = app.modal.take() else {
+        return Ok(());
+    };
+
+    let matches = series_search_matches(&prompt);
+    let selected = matches
+        .get(prompt.selected.min(matches.len().saturating_sub(1)))
+        .map(|series| (series.id.clone(), series.label.clone()));
+
+    match selected {
+        Some((series_id, label)) => {
+            app.open_text_replace_on_type(
+                format!("Amount for {}", label),
+                amount_edit_string(Money::ZERO),
+                PromptKind::SeriesAddAmount {
+                    destination: prompt.destination,
+                    block: prompt.block,
+                    selection: SeriesSelection::Existing { series_id, label },
+                },
+            );
+        }
+        None => {
+            let label = prompt.buffer.trim().to_string();
+            if label.is_empty() {
+                app.status = Some(format!("Type a {} name", prompt.block.noun()));
+            } else {
+                app.open_text_replace_on_type(
+                    format!("Amount for new {}", prompt.block.noun()),
+                    amount_edit_string(Money::ZERO),
+                    PromptKind::SeriesAddAmount {
+                        destination: prompt.destination,
+                        block: prompt.block,
+                        selection: SeriesSelection::New { label },
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+impl SeriesSelection {
+    fn label(&self) -> &str {
+        match self {
+            SeriesSelection::Existing { label, .. } | SeriesSelection::New { label } => label,
+        }
+    }
+}
+
+fn add_selected_series(
+    app: &mut App,
+    destination: AddDestination,
+    block: BudgetBlock,
+    selection: SeriesSelection,
+    amount: Money,
+) -> Result<()> {
+    let label = selection.label().to_string();
+    let series_id = match selection {
+        SeriesSelection::Existing { series_id, .. } => series_id,
+        SeriesSelection::New { label } => ops::create_series(
+            &app.conn,
+            block.kind(),
+            &label,
+            block.direction(),
+            (block == BudgetBlock::Envelopes).then_some(PeriodType::Monthly),
+            None,
+        )?,
+    };
+
+    match destination {
+        AddDestination::Plan { plan_id } => {
+            let id = ops::add_plan_item(&app.conn, &plan_id, &series_id, amount)?;
+            app.pending_select = Some(id);
+            app.status = Some(format!("Added “{label}”"));
+        }
+        AddDestination::Month { month_id } => {
+            match block {
+                BudgetBlock::Income | BudgetBlock::Expenses => {
+                    let id =
+                        ops::add_series_txn_instance(&app.conn, &month_id, &series_id, amount)?;
+                    app.pending_dash_txn = Some(id);
+                }
+                BudgetBlock::Envelopes => {
+                    let id = ops::add_series_envelope_instance(
+                        &app.conn, &month_id, &series_id, amount,
+                    )?;
+                    app.pending_dash_env = Some(id);
+                }
+            }
+            app.status = Some(format!("Added “{label}”"));
+        }
+    }
+    Ok(())
 }
 
 /// Apply a submitted text prompt. We `take()` the modal first so it closes exactly once,
@@ -774,62 +939,25 @@ fn submit_text(app: &mut App) -> Result<()> {
                 ops::set_series_label(&app.conn, &series_id, &text)?;
             }
         }
-        PromptKind::DraftPlanItemLabel { plan_id, focus } => {
-            if text.is_empty() {
-                app.status = Some("Label can't be empty".into());
-                app.open_text(
-                    plan_item_label_title(focus),
-                    "",
-                    PromptKind::DraftPlanItemLabel { plan_id, focus },
-                );
-            } else {
-                app.open_text_replace_on_type(
-                    "Amount for this plan (dollars)",
-                    amount_edit_string(Money::ZERO),
-                    PromptKind::DraftPlanItemAmount {
-                        plan_id,
-                        focus,
-                        label: text,
-                    },
-                );
-            }
-        }
-        PromptKind::DraftPlanItemAmount {
-            plan_id,
-            focus,
-            label,
+        PromptKind::SeriesAddAmount {
+            destination,
+            block,
+            selection,
         } => match Money::parse_dollars(&text) {
-            Some(amount) => {
-                let id = match focus {
-                    PlanFocus::Income => {
-                        ops::add_new_transaction(&app.conn, &plan_id, &label, Direction::In, amount)?
-                    }
-                    PlanFocus::Expenses => ops::add_new_transaction(
-                        &app.conn,
-                        &plan_id,
-                        &label,
-                        Direction::Out,
-                        amount,
-                    )?,
-                    PlanFocus::Envelopes => {
-                        ops::add_new_envelope(&app.conn, &plan_id, &label, amount)?
-                    }
-                };
-                app.pending_select = Some(id);
-            }
+            Some(amount) => add_selected_series(app, destination, block, selection, amount)?,
             None => {
                 app.status = Some(format!("Couldn't read “{text}” as an amount"));
                 app.open_text(
-                    "Amount for this plan (dollars)",
+                    format!("Amount for {}", selection.label()),
                     text,
-                    PromptKind::DraftPlanItemAmount {
-                        plan_id,
-                        focus,
-                        label,
+                    PromptKind::SeriesAddAmount {
+                        destination,
+                        block,
+                        selection,
                     },
                 );
             }
-        }
+        },
         PromptKind::ItemAmount { id } => match Money::parse_dollars(&text) {
             Some(amount) => ops::set_item_amount(&app.conn, &id, amount)?,
             None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
@@ -861,54 +989,6 @@ fn submit_text(app: &mut App) -> Result<()> {
                 ops::set_txn_label(&app.conn, &id, &text)?;
             }
         }
-        PromptKind::DraftTxnLabel {
-            month_id,
-            direction,
-        } => {
-            if text.is_empty() {
-                app.status = Some("Label can't be empty".into());
-                app.open_text(
-                    "Label",
-                    "",
-                    PromptKind::DraftTxnLabel {
-                        month_id,
-                        direction,
-                    },
-                );
-            } else {
-                app.open_text_replace_on_type(
-                    "Amount (dollars)",
-                    amount_edit_string(Money::ZERO),
-                    PromptKind::DraftTxnAmount {
-                        month_id,
-                        direction,
-                        label: text,
-                    },
-                );
-            }
-        }
-        PromptKind::DraftTxnAmount {
-            month_id,
-            direction,
-            label,
-        } => match Money::parse_dollars(&text) {
-            Some(amount) => {
-                let id = ops::add_oneoff_txn(&app.conn, &month_id, &label, direction, amount)?;
-                app.pending_dash_txn = Some(id);
-            }
-            None => {
-                app.status = Some(format!("Couldn't read “{text}” as an amount"));
-                app.open_text(
-                    "Amount (dollars)",
-                    text,
-                    PromptKind::DraftTxnAmount {
-                        month_id,
-                        direction,
-                        label,
-                    },
-                );
-            }
-        }
         PromptKind::TxnAmount { id } => match Money::parse_dollars(&text) {
             Some(amount) => ops::set_txn_amount(&app.conn, &id, amount)?,
             None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
@@ -916,55 +996,6 @@ fn submit_text(app: &mut App) -> Result<()> {
         PromptKind::EnvelopeLabel { id } => {
             if !text.is_empty() {
                 ops::set_envelope_label(&app.conn, &id, &text)?;
-            }
-        }
-        PromptKind::DraftEnvelopeLabel { month_id, mode } => {
-            if text.is_empty() {
-                app.status = Some("Label can't be empty".into());
-                app.open_text(
-                    "Envelope label",
-                    "",
-                    PromptKind::DraftEnvelopeLabel { month_id, mode },
-                );
-            } else {
-                app.open_text_replace_on_type(
-                    "Envelope amount (dollars)",
-                    amount_edit_string(Money::ZERO),
-                    PromptKind::DraftEnvelopeAmount {
-                        month_id,
-                        mode,
-                        label: text,
-                    },
-                );
-            }
-        }
-        PromptKind::DraftEnvelopeAmount {
-            month_id,
-            mode,
-            label,
-        } => match Money::parse_dollars(&text) {
-            Some(amount) => {
-                let id = ops::add_oneoff_envelope(
-                    &app.conn,
-                    &month_id,
-                    &label,
-                    amount,
-                    PeriodType::Monthly,
-                    mode,
-                )?;
-                app.pending_dash_env = Some(id);
-            }
-            None => {
-                app.status = Some(format!("Couldn't read “{text}” as an amount"));
-                app.open_text(
-                    "Envelope amount (dollars)",
-                    text,
-                    PromptKind::DraftEnvelopeAmount {
-                        month_id,
-                        mode,
-                        label,
-                    },
-                );
             }
         }
         PromptKind::EnvelopeAmount { id } => match Money::parse_dollars(&text) {
@@ -1101,11 +1132,11 @@ pub(crate) fn suggested_stamp_label(conn: &Connection, today: NaiveDate) -> Resu
 /// Draw the open modal (if any) as a centered popup over the current screen.
 fn draw_modal(frame: &mut Frame, app: &App) {
     let Some(modal) = &app.modal else { return };
-    let area = centered_rect(60, 20, frame.area());
-    frame.render_widget(Clear, area); // erase whatever's underneath so the box is opaque
 
     match modal {
         Modal::Text(prompt) => {
+            let area = centered_rect(60, 20, frame.area());
+            frame.render_widget(Clear, area); // erase whatever's underneath so the box is opaque
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" {} ", prompt.title));
@@ -1130,7 +1161,10 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             ];
             frame.render_widget(Paragraph::new(body).block(block), area);
         }
+        Modal::SeriesSearch(prompt) => draw_series_search_modal(frame, prompt),
         Modal::Confirm(confirm) => {
+            let area = centered_rect(60, 20, frame.area());
+            frame.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Red))
@@ -1149,6 +1183,8 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(Paragraph::new(body).block(block), area);
         }
         Modal::Choice(choice) => {
+            let area = centered_rect(60, 20, frame.area());
+            frame.render_widget(Clear, area);
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
@@ -1170,6 +1206,86 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(Paragraph::new(body).block(block), area);
         }
     }
+}
+
+fn draw_series_search_modal(frame: &mut Frame, prompt: &SeriesSearch) {
+    let area = centered_rect(70, 42, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" {} ", prompt.title));
+
+    let mut body = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw(" > "),
+            Span::raw(&prompt.buffer),
+            Span::styled("▏", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::raw(""),
+    ];
+
+    let matches = series_search_matches(prompt);
+    if matches.is_empty() {
+        let label = prompt.buffer.trim();
+        if label.is_empty() {
+            body.push(Line::from(Span::styled(
+                format!(" Type a {} name", prompt.block.noun()),
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            body.push(Line::from(vec![
+                Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(format!(
+                    " Create new {} named \"{}\"",
+                    prompt.block.noun(),
+                    truncate(label, 34)
+                )),
+            ]));
+        }
+    } else {
+        let selected_idx = prompt.selected.min(matches.len().saturating_sub(1));
+        let start = selected_idx.saturating_sub(5);
+        for (idx, series) in matches.iter().enumerate().skip(start).take(6) {
+            let is_selected = idx == selected_idx;
+            let marker = if is_selected { "▌" } else { " " };
+            let style = if is_selected {
+                Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            body.push(Line::from(vec![
+                Span::styled(marker, Style::default().fg(Color::Cyan)),
+                Span::styled(format!(" {:<36}", truncate(&series.label, 36)), style),
+            ]));
+        }
+        if start > 0 {
+            body.insert(
+                3,
+                Line::from(Span::styled(
+                    format!("   {} more above", start),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            );
+        }
+        let remaining = matches.len().saturating_sub(start + 6);
+        if remaining > 0 {
+            body.push(Line::from(Span::styled(
+                format!("   {remaining} more"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    body.push(Line::raw(""));
+    body.push(Line::from(Span::styled(
+        " Enter to select/create · ↑/↓ to choose · Esc to cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(body).block(block), area);
 }
 
 /// Compute a centered rectangle `percent_x` × `percent_y` of `area`. `Flex::Center` does
