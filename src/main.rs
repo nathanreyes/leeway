@@ -325,7 +325,7 @@ fn main() -> Result<()> {
         conn,
         screen: Screen::Dashboard,
         should_quit: false,
-        dash_focus: DashFocus::Income,
+        dash_focus: DashFocus::Header,
         viewed_year: today.year(),
         viewed_month: today.month(),
         dash_income_sel: 0,
@@ -1317,6 +1317,44 @@ pub(crate) fn draw_status_footer(
         )))
         .alignment(Alignment::Right);
         frame.render_widget(p, area);
+    }
+}
+
+/// A footer with context hints on the left and global navigation on the right. Status
+/// messages take the right side while present.
+pub(crate) fn draw_split_status_footer(
+    frame: &mut Frame,
+    area: Rect,
+    left_hints: Line,
+    right_hints: Line,
+    status: &Option<String>,
+) {
+    let right_line = match status {
+        Some(s) => Line::from(Span::styled(
+            format!("{s} "),
+            Style::default().fg(Color::Yellow),
+        )),
+        None => right_hints,
+    };
+    let right_width = (right_line.width() as u16).min(area.width);
+    let left_width = area.width.saturating_sub(right_width);
+
+    if left_width > 0 {
+        let left_area = Rect {
+            width: left_width,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(left_hints), left_area);
+    }
+
+    if right_width > 0 {
+        let right_area = Rect {
+            x: area.x + left_width,
+            width: right_width,
+            ..area
+        };
+        let p = Paragraph::new(right_line).alignment(Alignment::Right);
+        frame.render_widget(p, right_area);
     }
 }
 

@@ -437,7 +437,7 @@ fn draw_missing_month(frame: &mut Frame, area: Rect, app: &App) {
 /// Footer hints, adapted to the focused control (and to whether a month exists — with none,
 /// there are no panels to Tab to).
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView>) {
-    let hints = match app.dash_focus {
+    let left_hints = match app.dash_focus {
         DashFocus::Header => {
             let mut spans = Vec::new();
             if view.is_some() {
@@ -448,11 +448,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
                 key(" k/j "),
                 Span::raw(" prev/next month  "),
                 key(" m "),
-                Span::raw(" go to month  "),
-                key(" p "),
-                Span::raw(" plans  "),
-                key(" q "),
-                Span::raw(" quit"),
+                Span::raw(" go to month"),
             ]);
             Line::from(spans)
         }
@@ -468,9 +464,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             key(" r/a "),
             Span::raw(" edit item  "),
             key(" x "),
-            Span::raw(" del  "),
-            key(" q "),
-            Span::raw(" quit"),
+            Span::raw(" del"),
         ]),
         DashFocus::Envelopes => Line::from(vec![
             key(" Tab "),
@@ -484,9 +478,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             key(" r/a/m/t "),
             Span::raw(" edit  "),
             key(" x "),
-            Span::raw(" del  "),
-            key(" q "),
-            Span::raw(" quit"),
+            Span::raw(" del"),
         ]),
         DashFocus::Accounts => Line::from(vec![
             key(" Tab "),
@@ -496,14 +488,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             key(" Enter "),
             Span::raw(" edit  "),
             key(" l "),
-            Span::raw(" card limit  "),
-            key(" p "),
-            Span::raw(" plans  "),
-            key(" q "),
-            Span::raw(" quit"),
+            Span::raw(" card limit"),
         ]),
     };
-    crate::draw_status_footer(frame, area, hints, &app.status);
+    let nav_hints = Line::from(vec![
+        key(" p "),
+        Span::raw(" plans  "),
+        key(" q "),
+        Span::raw(" quit"),
+    ]);
+    crate::draw_split_status_footer(frame, area, left_hints, nav_hints, &app.status);
 }
 
 /// The accounts panel. Checking shows its balance; a credit card shows what's owed plus a
