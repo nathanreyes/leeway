@@ -17,7 +17,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{ListItem, ListState, Paragraph};
 
 pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Result<()> {
     // Clear any leftover status the moment the user acts again.
@@ -56,11 +56,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
             // Off-month account balances are explanatory only, so skip Accounts there.
             KeyCode::Tab => {
                 if let Some(view) = view {
-                    app.dash_focus = if view.is_current {
-                        DashFocus::Accounts
-                    } else {
-                        DashFocus::Income
-                    };
+                    app.dash_focus = next_dash_focus(app.dash_focus, view.is_current);
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(view) = view {
+                    app.dash_focus = previous_dash_focus(app.dash_focus, view.is_current);
                 }
             }
             _ => {}
@@ -75,19 +76,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         // Tab cycles Accounts → Income → Expenses → Envelopes → Header on the current
         // month. Off-month, Accounts is explanatory only and is skipped.
         KeyCode::Tab => {
-            app.dash_focus = match app.dash_focus {
-                DashFocus::Accounts => DashFocus::Income,
-                DashFocus::Income => DashFocus::Expenses,
-                DashFocus::Expenses => DashFocus::Envelopes,
-                DashFocus::Envelopes => DashFocus::Header,
-                DashFocus::Header => {
-                    if view.is_current {
-                        DashFocus::Accounts
-                    } else {
-                        DashFocus::Income
-                    }
-                } // unreachable; keeps match total
-            };
+            app.dash_focus = next_dash_focus(app.dash_focus, view.is_current);
+        }
+        KeyCode::BackTab => {
+            app.dash_focus = previous_dash_focus(app.dash_focus, view.is_current);
         }
 
         // j/k move within the *focused* list.
@@ -176,6 +168,38 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         _ => {}
     }
     Ok(())
+}
+
+fn next_dash_focus(current: DashFocus, is_current_month: bool) -> DashFocus {
+    match current {
+        DashFocus::Header => {
+            if is_current_month {
+                DashFocus::Accounts
+            } else {
+                DashFocus::Income
+            }
+        }
+        DashFocus::Accounts => DashFocus::Income,
+        DashFocus::Income => DashFocus::Expenses,
+        DashFocus::Expenses => DashFocus::Envelopes,
+        DashFocus::Envelopes => DashFocus::Header,
+    }
+}
+
+fn previous_dash_focus(current: DashFocus, is_current_month: bool) -> DashFocus {
+    match current {
+        DashFocus::Header => DashFocus::Envelopes,
+        DashFocus::Accounts => DashFocus::Header,
+        DashFocus::Income => {
+            if is_current_month {
+                DashFocus::Accounts
+            } else {
+                DashFocus::Header
+            }
+        }
+        DashFocus::Expenses => DashFocus::Income,
+        DashFocus::Envelopes => DashFocus::Expenses,
+    }
 }
 
 /// The currently-selected standalone transaction, if an income/expense panel is focused.
@@ -545,7 +569,7 @@ fn draw_missing_month(frame: &mut Frame, area: Rect, app: &App) {
             dim,
         )),
     ];
-    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Ballpark "));
+    let p = Paragraph::new(lines).block(crate::titled_block(" Ballpark "));
     frame.render_widget(p, area);
 }
 
@@ -637,13 +661,17 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                 Style::default().fg(Color::Gray),
             )),
         ];
-        let p = Paragraph::new(lines).block(panel_block(" Accounts ", false));
+        let p = Paragraph::new(lines).block(crate::focusable_block(" Accounts ", false));
         frame.render_widget(p, area);
         return;
     }
 
-    let inner_width = area.width.saturating_sub(2) as usize;
-    let name_width = inner_width.saturating_mul(22).checked_div(100).unwrap_or(18).clamp(14, 26);
+    let inner_width = crate::selectable_list_content_width(area);
+    let name_width = inner_width
+        .saturating_mul(22)
+        .checked_div(100)
+        .unwrap_or(18)
+        .clamp(14, 26);
     let primary_width = 20;
     let adjustment_width = 18;
     let fixed_width = name_width + primary_width + adjustment_width;
@@ -718,10 +746,7 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
         None
     });
 
-    let list = List::new(items)
-        .block(panel_block(" Accounts ", focused))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▌");
+    let list = crate::selectable_list(items).block(crate::selectable_block(" Accounts ", focused));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -733,18 +758,6 @@ fn carry_column(label: &str, carry_balance: Option<Money>, width: usize) -> Span
         Style::default().fg(Color::Yellow)
     };
     Span::styled(format!("{:<width$}", format!("{label} {carry}")), style)
-}
-
-/// A bordered block whose border turns cyan when its panel is focused.
-fn panel_block(title: &str, focused: bool) -> Block<'_> {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title.to_string());
-    if focused {
-        block.border_style(Style::default().fg(Color::Cyan))
-    } else {
-        block
-    }
 }
 
 /// The month header, and the handle for month navigation. Always drawn from `app`'s viewed
@@ -778,7 +791,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, view: Option<&MonthView
     };
 
     let focused = app.dash_focus == DashFocus::Header;
-    let block = Block::default().borders(Borders::ALL);
+    let block = crate::bordered_block();
     let block = if focused {
         block.border_style(Style::default().fg(Color::Cyan))
     } else {
@@ -866,7 +879,7 @@ fn draw_whats_left(frame: &mut Frame, area: Rect, view: &MonthView) {
         Span::raw("  what's left"),
     ]));
 
-    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Summary "));
+    let p = Paragraph::new(lines).block(crate::titled_block(" Summary "));
     frame.render_widget(p, area);
 }
 
@@ -932,10 +945,7 @@ fn draw_transactions(
         state.select(Some(selected));
     }
 
-    let list = List::new(items)
-        .block(panel_block(title, focused))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▌");
+    let list = crate::selectable_list(items).block(crate::selectable_block(title, focused));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -965,10 +975,7 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
         state.select(Some(app.dash_env_sel));
     }
 
-    let list = List::new(items)
-        .block(panel_block(" Envelopes ", focused))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▌");
+    let list = crate::selectable_list(items).block(crate::selectable_block(" Envelopes ", focused));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -1087,6 +1094,10 @@ mod tests {
         KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
     }
 
+    fn backtab_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)
+    }
+
     fn delete_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
     }
@@ -1124,6 +1135,40 @@ mod tests {
         handle_key(&mut app, tab_key(), &Some(view)).unwrap();
 
         assert!(app.dash_focus == DashFocus::Income);
+    }
+
+    #[test]
+    fn header_backtab_enters_envelopes_for_current_month() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Header;
+        let view = month_view(&app);
+
+        handle_key(&mut app, backtab_key(), &Some(view)).unwrap();
+
+        assert!(app.dash_focus == DashFocus::Envelopes);
+    }
+
+    #[test]
+    fn backtab_enters_accounts_only_for_current_month() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Income;
+        let view = month_view(&app);
+
+        handle_key(&mut app, backtab_key(), &Some(view)).unwrap();
+
+        assert!(app.dash_focus == DashFocus::Accounts);
+    }
+
+    #[test]
+    fn backtab_skips_accounts_off_month() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Income;
+        let view = off_month_view(&app);
+        assert!(!view.is_current);
+
+        handle_key(&mut app, backtab_key(), &Some(view)).unwrap();
+
+        assert!(app.dash_focus == DashFocus::Header);
     }
 
     #[test]

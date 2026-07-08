@@ -10,12 +10,12 @@ use ballpark::models::{Direction, Kind, Mode, PeriodType, Plan, PlanEntry};
 use ballpark::ops;
 use ballpark::queries::PlanSummary;
 use chrono::Local;
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
+use ratatui::widgets::{ListItem, ListState, Paragraph};
 
 // --- Plans list ----------------------------------------------------------------
 
@@ -94,12 +94,12 @@ pub fn draw_list(frame: &mut Frame, app: &App, summaries: &[PlanSummary]) {
 
     let title = Paragraph::new(Line::from(" Plans ".bold()))
         .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL));
+        .block(crate::bordered_block());
     frame.render_widget(title, header);
 
     if summaries.is_empty() {
         let p = Paragraph::new("No plans yet — press n to create one.")
-            .block(Block::default().borders(Borders::ALL).title(" Templates "));
+            .block(crate::titled_block(" Templates "));
         frame.render_widget(p, body);
     } else {
         let items: Vec<ListItem> = summaries
@@ -121,10 +121,8 @@ pub fn draw_list(frame: &mut Frame, app: &App, summaries: &[PlanSummary]) {
         let mut state = ListState::default();
         state.select(Some(app.plans_sel));
 
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" Templates "))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .highlight_symbol("▌");
+        let list =
+            crate::selectable_list(items).block(crate::selectable_block(" Templates ", false));
         frame.render_stateful_widget(list, body, &mut state);
     }
 
@@ -158,11 +156,10 @@ pub fn handle_editor_key(
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.screen = Screen::Plans,
         KeyCode::Tab => {
-            app.plan_focus = match app.plan_focus {
-                PlanFocus::Income => PlanFocus::Expenses,
-                PlanFocus::Expenses => PlanFocus::Envelopes,
-                PlanFocus::Envelopes => PlanFocus::Income,
-            };
+            app.plan_focus = next_plan_focus(app.plan_focus);
+        }
+        KeyCode::BackTab => {
+            app.plan_focus = previous_plan_focus(app.plan_focus);
         }
         KeyCode::Char('j') | KeyCode::Down => {
             let selected = current_plan_selection(app);
@@ -254,6 +251,22 @@ pub fn handle_editor_key(
     Ok(())
 }
 
+fn next_plan_focus(current: PlanFocus) -> PlanFocus {
+    match current {
+        PlanFocus::Income => PlanFocus::Expenses,
+        PlanFocus::Expenses => PlanFocus::Envelopes,
+        PlanFocus::Envelopes => PlanFocus::Income,
+    }
+}
+
+fn previous_plan_focus(current: PlanFocus) -> PlanFocus {
+    match current {
+        PlanFocus::Income => PlanFocus::Envelopes,
+        PlanFocus::Expenses => PlanFocus::Income,
+        PlanFocus::Envelopes => PlanFocus::Expenses,
+    }
+}
+
 fn selected_entry<'e>(app: &App, entries: &'e [PlanEntry]) -> Option<&'e PlanEntry> {
     entries
         .iter()
@@ -320,7 +333,7 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
     );
     let header_p = Paragraph::new(Line::from(title.bold()))
         .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL));
+        .block(crate::bordered_block());
     frame.render_widget(header_p, header);
 
     let [left_items, env_area] =
@@ -402,10 +415,8 @@ fn draw_plan_block(
         state.select(Some(selected));
     }
 
-    let list = List::new(rows)
-        .block(panel_block(plan_block_title(focus), focused))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▌");
+    let list = crate::selectable_list(rows)
+        .block(crate::selectable_block(plan_block_title(focus), focused));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -414,17 +425,6 @@ fn plan_block_title(focus: PlanFocus) -> &'static str {
         PlanFocus::Income => " Income ",
         PlanFocus::Expenses => " Expenses ",
         PlanFocus::Envelopes => " Envelopes ",
-    }
-}
-
-fn panel_block(title: &str, focused: bool) -> Block<'_> {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title.to_string());
-    if focused {
-        block.border_style(Style::default().fg(Color::Cyan))
-    } else {
-        block
     }
 }
 
@@ -538,6 +538,21 @@ mod tests {
 
     fn direction_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+    }
+
+    fn backtab_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn backtab_cycles_plan_blocks_backward() {
+        let (mut app, plan, entries, _) = app_with_transaction_plan();
+
+        handle_editor_key(&mut app, backtab_key(), &plan, &entries).unwrap();
+        assert!(app.plan_focus == PlanFocus::Income);
+
+        handle_editor_key(&mut app, backtab_key(), &plan, &entries).unwrap();
+        assert!(app.plan_focus == PlanFocus::Envelopes);
     }
 
     #[test]

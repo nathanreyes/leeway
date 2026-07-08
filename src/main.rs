@@ -22,9 +22,11 @@ use ballpark::{db, ops, queries};
 use chrono::{Datelike, Local, NaiveDate};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph,
+};
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -75,6 +77,56 @@ pub enum BudgetBlock {
     Income,
     Expenses,
     Envelopes,
+}
+
+const BOX_LEFT_PADDING: u16 = 0;
+const BOX_RIGHT_PADDING: u16 = 0;
+const LIST_HIGHLIGHT_SYMBOL: &str = "▌";
+const LIST_HIGHLIGHT_SYMBOL_WIDTH: u16 = 1;
+const LIST_RIGHT_PADDING: u16 = 1;
+
+pub(crate) fn bordered_block() -> Block<'static> {
+    Block::default().borders(Borders::ALL).padding(Padding::new(
+        BOX_LEFT_PADDING,
+        BOX_RIGHT_PADDING,
+        0,
+        0,
+    ))
+}
+
+pub(crate) fn titled_block(title: impl Into<String>) -> Block<'static> {
+    bordered_block().title(title.into())
+}
+
+pub(crate) fn focusable_block(title: impl Into<String>, focused: bool) -> Block<'static> {
+    let block = titled_block(title);
+    if focused {
+        block.border_style(Style::default().fg(Color::Cyan))
+    } else {
+        block
+    }
+}
+
+pub(crate) fn selectable_block(title: impl Into<String>, focused: bool) -> Block<'static> {
+    focusable_block(title, focused).padding(Padding::new(0, LIST_RIGHT_PADDING, 0, 0))
+}
+
+pub(crate) fn selectable_list<'a>(items: Vec<ListItem<'a>>) -> List<'a> {
+    List::new(items)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol(LIST_HIGHLIGHT_SYMBOL)
+        .highlight_spacing(HighlightSpacing::Always)
+}
+
+pub(crate) fn selectable_list_content_width(area: Rect) -> usize {
+    area.width
+        .saturating_sub(
+            2 + BOX_LEFT_PADDING
+                + BOX_RIGHT_PADDING
+                + LIST_RIGHT_PADDING
+                + LIST_HIGHLIGHT_SYMBOL_WIDTH,
+        )
+        .into()
 }
 
 #[derive(Clone)]
@@ -446,9 +498,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                         }
                         if let Some(target) = app.pending_dash_account.take() {
                             if v.is_current {
-                                if let Some(idx) =
-                                    v.accounts.iter().position(|a| a.id == target)
-                                {
+                                if let Some(idx) = v.accounts.iter().position(|a| a.id == target) {
                                     app.dash_acct_sel = idx;
                                     app.dash_focus = DashFocus::Accounts;
                                 }
@@ -1294,9 +1344,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             let height = if prompt.help.is_empty() { 20 } else { 34 };
             let area = centered_rect(60, height, frame.area());
             frame.render_widget(Clear, area); // erase whatever's underneath so the box is opaque
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {} ", prompt.title));
+            let block = titled_block(format!(" {} ", prompt.title));
             let mut input = vec![Span::raw(" > ")];
             if prompt.replace_on_next_char && !prompt.buffer.is_empty() {
                 input.push(Span::styled(
@@ -1307,11 +1355,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                 input.push(Span::raw(&prompt.buffer));
             }
             input.push(Span::styled("▏", Style::default().fg(Color::Cyan)));
-            let mut body = vec![
-                Line::raw(""),
-                Line::from(input),
-                Line::raw(""),
-            ];
+            let mut body = vec![Line::raw(""), Line::from(input), Line::raw("")];
             if !prompt.help.is_empty() {
                 for line in &prompt.help {
                     body.push(Line::from(Span::styled(
@@ -1331,10 +1375,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
         Modal::Confirm(confirm) => {
             let area = centered_rect(60, 20, frame.area());
             frame.render_widget(Clear, area);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red))
-                .title(" Confirm ");
+            let block = titled_block(" Confirm ").border_style(Style::default().fg(Color::Red));
             let body = vec![
                 Line::raw(""),
                 Line::from(Span::raw(format!(" {}", confirm.title))),
@@ -1351,10 +1392,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
         Modal::Choice(choice) => {
             let area = centered_rect(60, 20, frame.area());
             frame.render_widget(Clear, area);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(" Choose ");
+            let block = titled_block(" Choose ").border_style(Style::default().fg(Color::Cyan));
             let mut body = vec![
                 Line::raw(""),
                 Line::from(Span::raw(format!(" {}", choice.title))),
@@ -1378,10 +1416,8 @@ fn draw_series_search_modal(frame: &mut Frame, prompt: &SeriesSearch) {
     let area = centered_rect(70, 42, frame.area());
     frame.render_widget(Clear, area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(format!(" {} ", prompt.title));
+    let block =
+        titled_block(format!(" {} ", prompt.title)).border_style(Style::default().fg(Color::Cyan));
 
     let mut body = vec![
         Line::raw(""),
