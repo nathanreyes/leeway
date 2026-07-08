@@ -31,9 +31,11 @@ been inserted yet, canceling leaves no blank row behind.
 
 Existing edit commands stay intact:
 
-- `r` edits the selected label with the current value in the buffer.
+- `r` edits the selected label with the current value in the buffer, selected for
+  replacement on the first typed character.
 - `a` edits the selected amount with the current value in the buffer.
-- Only amount prompts reached from the new-item chain start replacement-ready.
+- New-item draft label prompts stay blank.
+- Amount prompts reached from the new-item chain start replacement-ready.
 
 ## Data Flow
 
@@ -50,6 +52,11 @@ Prompt submission gains draft-create variants that carry the target context:
 - Dashboard envelope label -> dashboard envelope amount -> insert one-off envelope.
 - Plan series label -> plan item amount -> insert recurring plan item.
 
+Rename and label-edit prompts reuse the same replacement mode when they open with an
+existing label. This applies to plan names, plan item series labels, dashboard ad-hoc
+transaction labels, and dashboard ad-hoc envelope labels. It does not apply to unrelated
+prefilled prompts such as month navigation or account balances.
+
 ## Testing
 
 Run the Rust test suite after implementation. Manual verification should check:
@@ -60,4 +67,5 @@ Run the Rust test suite after implementation. Manual verification should check:
 - Plan editor `n` in each block follows the same flow.
 - Typing in the chained amount prompt replaces `0.00` without backspacing.
 - `Esc` from either prompt creates nothing.
-- Existing `r` and `a` prompts still edit current values normally.
+- Existing `r` prompts show the current label selected, and typing replaces it.
+- Existing `a` prompts still edit current values normally.
