@@ -9,12 +9,12 @@ use ballpark::models::{AccountType, Direction, Mode, PeriodType};
 use ballpark::money::Money;
 use ballpark::view::{EnvelopeRow, MonthView};
 use ballpark::{ops, queries};
-use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::Frame;
 
 pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Result<()> {
     // Clear any leftover status the moment the user acts again.
@@ -109,16 +109,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         // `n` = add a new ad-hoc item to the focused list (a bill/income, or an envelope).
         KeyCode::Char('n') => add_adhoc(app, view)?,
 
-        // The create-then-edit verbs. Each mirrors the plan editor's keys and, on the
-        // transactions/envelopes panels, acts on the *selected ad-hoc row* (plan-derived
-        // rows are managed in Plans — `edit_target`/`selected_*` enforce that with a nudge).
+        // The edit verbs mirror the plan editor's keys and remain ad-hoc-only here.
+        // Deletion is separate: stamped rows are already month-owned snapshots.
         KeyCode::Char('r') => edit_label(app, view), // rename / label
         KeyCode::Char('a') => edit_amount(app, view), // amount
         KeyCode::Char('d') => cycle_direction(app, view)?, // transaction direction
         KeyCode::Char('m') => cycle_mode(app, view)?, // envelope mode
         KeyCode::Char('t') => cycle_period(app, view)?, // envelope period type
         KeyCode::Char('s') => feed_spending(app, view), // file spending into a manual envelope
-        KeyCode::Char('x') => delete_adhoc(app, view), // delete an ad-hoc row
+        KeyCode::Char('x') => delete_selected(app, view), // delete this month's row
 
         // `e` is the Accounts panel's edit alias (Enter also works there).
         KeyCode::Char('e') => {
@@ -183,9 +182,9 @@ fn selected_env<'v>(app: &App, view: &'v MonthView) -> Option<&'v EnvelopeRow> {
         .flatten()
 }
 
-/// The nudge shown when an edit/delete key is pressed on a plan-derived row: those are the
-/// stamped plan's snapshot, edited in Plans — the dashboard only edits ad-hoc rows.
-const PLAN_ROW_HINT: &str = "That's a plan item — edit it in Plans (p), or add an ad-hoc one (n)";
+/// The nudge shown when an edit key is pressed on a plan-derived row. Deletion is different:
+/// once stamped, rows are month-owned instances and can be removed from that month.
+const PLAN_EDIT_HINT: &str = "That's a plan item — edit it in Plans (p), or add an ad-hoc one (n)";
 
 /// Start a pending ad-hoc item for whichever budget block is focused. Nothing is inserted
 /// until the label and amount prompts both complete.
@@ -229,7 +228,7 @@ fn add_adhoc(app: &mut App, view: &MonthView) -> Result<()> {
 fn edit_label(app: &mut App, view: &MonthView) {
     if let Some(t) = selected_txn(app, view) {
         if t.series_id.is_some() {
-            app.status = Some(PLAN_ROW_HINT.into());
+            app.status = Some(PLAN_EDIT_HINT.into());
         } else {
             app.open_text_replace_on_type(
                 "Label",
@@ -239,7 +238,7 @@ fn edit_label(app: &mut App, view: &MonthView) {
         }
     } else if let Some(e) = selected_env(app, view) {
         if e.envelope.series_id.is_some() {
-            app.status = Some(PLAN_ROW_HINT.into());
+            app.status = Some(PLAN_EDIT_HINT.into());
         } else {
             app.open_text_replace_on_type(
                 "Envelope label",
@@ -256,7 +255,7 @@ fn edit_label(app: &mut App, view: &MonthView) {
 fn edit_amount(app: &mut App, view: &MonthView) {
     if let Some(t) = selected_txn(app, view) {
         if t.series_id.is_some() {
-            app.status = Some(PLAN_ROW_HINT.into());
+            app.status = Some(PLAN_EDIT_HINT.into());
         } else {
             app.open_text(
                 "Amount (dollars)",
@@ -266,7 +265,7 @@ fn edit_amount(app: &mut App, view: &MonthView) {
         }
     } else if let Some(e) = selected_env(app, view) {
         if e.envelope.series_id.is_some() {
-            app.status = Some(PLAN_ROW_HINT.into());
+            app.status = Some(PLAN_EDIT_HINT.into());
         } else {
             app.open_text(
                 "Envelope amount (dollars)",
@@ -283,7 +282,7 @@ fn edit_amount(app: &mut App, view: &MonthView) {
 fn cycle_direction(app: &mut App, view: &MonthView) -> Result<()> {
     if let Some(t) = selected_txn(app, view) {
         if t.series_id.is_some() {
-            app.status = Some(PLAN_ROW_HINT.into());
+            app.status = Some(PLAN_EDIT_HINT.into());
         } else {
             let next = match t.direction {
                 Direction::Out => Direction::In,
@@ -300,7 +299,7 @@ fn cycle_direction(app: &mut App, view: &MonthView) -> Result<()> {
 fn cycle_mode(app: &mut App, view: &MonthView) -> Result<()> {
     if let Some(e) = selected_env(app, view) {
         if e.envelope.series_id.is_some() {
-            app.status = Some(PLAN_ROW_HINT.into());
+            app.status = Some(PLAN_EDIT_HINT.into());
         } else {
             let next = match e.envelope.mode {
                 Mode::Manual => Mode::Automatic,
@@ -316,7 +315,7 @@ fn cycle_mode(app: &mut App, view: &MonthView) -> Result<()> {
 fn cycle_period(app: &mut App, view: &MonthView) -> Result<()> {
     if let Some(e) = selected_env(app, view) {
         if e.envelope.series_id.is_some() {
-            app.status = Some(PLAN_ROW_HINT.into());
+            app.status = Some(PLAN_EDIT_HINT.into());
         } else {
             let next = match e.envelope.period_type {
                 PeriodType::Daily => PeriodType::Weekly,
@@ -353,28 +352,21 @@ fn feed_spending(app: &mut App, view: &MonthView) {
     }
 }
 
-/// `x`: delete the selected ad-hoc row (with a confirm). Plan-derived rows are refused.
-fn delete_adhoc(app: &mut App, view: &MonthView) {
+/// `x`: delete the selected month instance (with a confirm). A stamped row carries its
+/// series id for trend/restamp matching, but it is still this month's copy.
+fn delete_selected(app: &mut App, view: &MonthView) {
     if let Some(t) = selected_txn(app, view) {
-        if t.series_id.is_some() {
-            app.status = Some(PLAN_ROW_HINT.into());
-        } else {
-            app.open_confirm(
-                format!("Delete “{}”?", t.label),
-                ConfirmAction::DeleteTxn { id: t.id.clone() },
-            );
-        }
+        app.open_confirm(
+            format!("Delete “{}”?", t.label),
+            ConfirmAction::DeleteTxn { id: t.id.clone() },
+        );
     } else if let Some(e) = selected_env(app, view) {
-        if e.envelope.series_id.is_some() {
-            app.status = Some(PLAN_ROW_HINT.into());
-        } else {
-            app.open_confirm(
-                format!("Delete envelope “{}” and its spending?", e.envelope.label),
-                ConfirmAction::DeleteEnvelope {
-                    id: e.envelope.id.clone(),
-                },
-            );
-        }
+        app.open_confirm(
+            format!("Delete envelope “{}” and its spending?", e.envelope.label),
+            ConfirmAction::DeleteEnvelope {
+                id: e.envelope.id.clone(),
+            },
+        );
     }
 }
 
@@ -889,4 +881,139 @@ fn key(label: &str) -> Span<'_> {
         label.to_string(),
         Style::default().fg(Color::Black).bg(Color::Gray),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ballpark::models::Kind;
+    use chrono::NaiveDate;
+    use ratatui::crossterm::event::KeyModifiers;
+    use rusqlite::Connection;
+    use uuid::Uuid;
+
+    fn open_test_conn() -> Connection {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ballpark-dashboard-{}.db", Uuid::new_v4()));
+        ballpark::db::open(&path).unwrap()
+    }
+
+    fn app_with_stamped_month() -> App {
+        let mut conn = open_test_conn();
+        let plan = ops::create_plan(&conn, "Normal").unwrap();
+
+        let rent = ops::create_series(
+            &conn,
+            Kind::Transaction,
+            "Rent",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        ops::add_plan_item(&conn, &plan, &rent, Money::from_dollars(1800.0)).unwrap();
+
+        let dining = ops::create_series(
+            &conn,
+            Kind::Envelope,
+            "Dining",
+            None,
+            Some(PeriodType::Monthly),
+            Some(Mode::Manual),
+        )
+        .unwrap();
+        ops::add_plan_item(&conn, &plan, &dining, Money::from_dollars(300.0)).unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        ops::stamp(&mut conn, &plan, "2026-09", start, 30).unwrap();
+
+        App {
+            conn,
+            screen: Screen::Dashboard,
+            should_quit: false,
+            dash_focus: DashFocus::Income,
+            viewed_year: 2026,
+            viewed_month: 9,
+            dash_income_sel: 0,
+            dash_expense_sel: 0,
+            dash_env_sel: 0,
+            dash_acct_sel: 0,
+            plans_sel: 0,
+            plan_focus: crate::PlanFocus::Income,
+            editor_income_sel: 0,
+            editor_expense_sel: 0,
+            editor_env_sel: 0,
+            picker_sel: 0,
+            pending_select: None,
+            pending_dash_txn: None,
+            pending_dash_env: None,
+            modal: None,
+            status: None,
+        }
+    }
+
+    fn month_view(app: &App) -> MonthView {
+        MonthView::build_for(
+            &app.conn,
+            NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+            app.viewed_year,
+            app.viewed_month,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn delete_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn delete_key_allows_stamped_transaction_instances() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Expenses;
+        let view = month_view(&app);
+        let rent = view
+            .standalone
+            .iter()
+            .find(|txn| txn.label == "Rent")
+            .unwrap();
+        assert!(rent.series_id.is_some());
+        let expected_id = rent.id.clone();
+
+        handle_key(&mut app, delete_key(), &Some(view)).unwrap();
+
+        assert!(app.status.is_none());
+        match app.modal {
+            Some(crate::Modal::Confirm(confirm)) => match confirm.action {
+                ConfirmAction::DeleteTxn { id } => assert_eq!(id, expected_id),
+                _ => panic!("expected delete transaction confirmation"),
+            },
+            _ => panic!("expected confirmation modal"),
+        }
+    }
+
+    #[test]
+    fn delete_key_allows_stamped_envelope_instances() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Envelopes;
+        let view = month_view(&app);
+        let dining = view
+            .envelopes
+            .iter()
+            .find(|row| row.envelope.label == "Dining")
+            .unwrap();
+        assert!(dining.envelope.series_id.is_some());
+        let expected_id = dining.envelope.id.clone();
+
+        handle_key(&mut app, delete_key(), &Some(view)).unwrap();
+
+        assert!(app.status.is_none());
+        match app.modal {
+            Some(crate::Modal::Confirm(confirm)) => match confirm.action {
+                ConfirmAction::DeleteEnvelope { id } => assert_eq!(id, expected_id),
+                _ => panic!("expected delete envelope confirmation"),
+            },
+            _ => panic!("expected confirmation modal"),
+        }
+    }
 }

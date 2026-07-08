@@ -212,11 +212,11 @@ pub enum ConfirmAction {
     DeleteItem {
         id: String,
     },
-    /// Delete an ad-hoc transaction from a month.
+    /// Delete a transaction instance from a month.
     DeleteTxn {
         id: String,
     },
-    /// Delete an ad-hoc envelope (and any spending filed in it) from a month.
+    /// Delete an envelope instance (and any spending filed in it) from a month.
     DeleteEnvelope {
         id: String,
     },

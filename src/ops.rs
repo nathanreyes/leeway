@@ -676,8 +676,8 @@ pub fn set_txn_direction(conn: &Connection, txn_id: &str, direction: Direction) 
     Ok(())
 }
 
-/// Delete a single transaction. Used for ad-hoc one-offs on the dashboard. (A standalone
-/// txn has no children; envelope-spending txns are deleted here too when their envelope is.)
+/// Delete a single transaction instance from a month. A standalone txn has no children;
+/// envelope-spending txns are deleted here too when their envelope is removed.
 pub fn delete_txn(conn: &Connection, txn_id: &str) -> Result<()> {
     conn.execute("DELETE FROM txn WHERE id = ?1", [txn_id])?;
     Ok(())
@@ -717,7 +717,7 @@ pub fn set_envelope_period(conn: &Connection, id: &str, period: PeriodType) -> R
 
 /// Delete an envelope instance and any spending filed in it. The `txn.envelope_id` foreign
 /// key means we must clear the children first, so this runs in a transaction: drop the
-/// envelope's txns, then the envelope. Used for ad-hoc envelopes on the dashboard.
+/// envelope's txns, then the envelope.
 pub fn delete_envelope(conn: &mut Connection, id: &str) -> Result<()> {
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM txn WHERE envelope_id = ?1", [id])?;
