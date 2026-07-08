@@ -136,11 +136,15 @@ pub fn draw_list(frame: &mut Frame, app: &App, summaries: &[PlanSummary]) {
         key(" s "),
         Span::raw(" stamp  "),
         key(" x "),
-        Span::raw(" delete  "),
+        Span::raw(" delete"),
+    ]);
+    let nav_hints = Line::from(vec![
+        key(" S "),
+        Span::raw(" series  "),
         key(" Esc "),
         Span::raw(" back"),
     ]);
-    crate::draw_status_footer(frame, footer, hints, &app.status);
+    crate::draw_split_status_footer(frame, footer, hints, nav_hints, &app.status);
 }
 
 // --- Plan editor ---------------------------------------------------------------
@@ -364,9 +368,7 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
             key(" a "),
             Span::raw(" amount  "),
             key(" x "),
-            Span::raw(" remove  "),
-            key(" Esc "),
-            Span::raw(" back"),
+            Span::raw(" remove"),
         ]),
         PlanFocus::Envelopes => Line::from(vec![
             key(" Tab "),
@@ -382,12 +384,16 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
             key(" m/p "),
             Span::raw(" mode/period  "),
             key(" x "),
-            Span::raw(" remove  "),
-            key(" Esc "),
-            Span::raw(" back"),
+            Span::raw(" remove"),
         ]),
     };
-    crate::draw_status_footer(frame, footer, hints, &app.status);
+    let nav_hints = Line::from(vec![
+        key(" S "),
+        Span::raw(" series  "),
+        key(" Esc "),
+        Span::raw(" back"),
+    ]);
+    crate::draw_split_status_footer(frame, footer, hints, nav_hints, &app.status);
 }
 
 fn draw_plan_block(
@@ -521,6 +527,10 @@ mod tests {
             dash_env_sel: 0,
             dash_acct_sel: 0,
             plans_sel: 0,
+            series_sel: 0,
+            series_search: String::new(),
+            series_search_active: false,
+            series_range: ballpark::view::SeriesTimeRange::Last12Stamped,
             plan_focus: PlanFocus::Expenses,
             editor_income_sel: 0,
             editor_expense_sel: 0,

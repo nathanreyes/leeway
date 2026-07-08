@@ -641,6 +641,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
     let nav_hints = Line::from(vec![
         key(" p "),
         Span::raw(" plans  "),
+        key(" S "),
+        Span::raw(" series  "),
         key(" q "),
         Span::raw(" quit"),
     ]);
@@ -1055,6 +1057,10 @@ mod tests {
             dash_env_sel: 0,
             dash_acct_sel: 0,
             plans_sel: 0,
+            series_sel: 0,
+            series_search: String::new(),
+            series_search_active: false,
+            series_range: ballpark::view::SeriesTimeRange::Last12Stamped,
             plan_focus: crate::PlanFocus::Income,
             editor_income_sel: 0,
             editor_expense_sel: 0,

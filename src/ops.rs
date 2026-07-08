@@ -647,6 +647,18 @@ pub fn set_series_label(conn: &Connection, series_id: &str, label: &str) -> Resu
     Ok(())
 }
 
+pub fn set_series_category(
+    conn: &Connection,
+    series_id: &str,
+    category: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE series SET category = ?1 WHERE id = ?2",
+        rusqlite::params![category, series_id],
+    )?;
+    Ok(())
+}
+
 pub fn set_series_direction(
     conn: &Connection,
     series_id: &str,

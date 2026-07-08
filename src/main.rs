@@ -14,10 +14,12 @@
 
 mod dashboard;
 mod plans;
+mod series;
 
 use anyhow::Result;
 use ballpark::models::{AccountType, Direction, Kind, PeriodType, Series};
 use ballpark::money::Money;
+use ballpark::view::SeriesTimeRange;
 use ballpark::{db, ops, queries};
 use chrono::{Datelike, Local, NaiveDate};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -36,6 +38,7 @@ use std::time::Duration;
 /// that's how the loop knows which plan's items to load.
 pub enum Screen {
     Dashboard,
+    Series,
     Plans,
     PlanEditor { plan_id: String },
 }
@@ -180,6 +183,9 @@ pub enum ModalAction {
         plan_id: String,
         keep_outside_plan: bool,
     },
+    SetSeriesRange {
+        range: SeriesTimeRange,
+    },
 }
 
 /// A single-line text input. `kind` records what to do with the text on submit.
@@ -199,6 +205,10 @@ pub enum PromptKind {
     },
     /// Edit a series' label — affects every plan that includes it.
     SeriesLabel {
+        series_id: String,
+    },
+    /// Edit a series' optional category — affects every plan that includes it.
+    SeriesCategory {
         series_id: String,
     },
     /// Edit a plan_item's per-plan budgeted amount.
@@ -317,6 +327,10 @@ pub struct App {
     pub dash_env_sel: usize,
     pub dash_acct_sel: usize,
     pub plans_sel: usize,
+    pub series_sel: usize,
+    pub series_search: String,
+    pub series_search_active: bool,
+    pub series_range: SeriesTimeRange,
     pub plan_focus: PlanFocus,
     pub editor_income_sel: usize,
     pub editor_expense_sel: usize,
@@ -431,6 +445,10 @@ fn main() -> Result<()> {
         dash_env_sel: 0,
         dash_acct_sel: 0,
         plans_sel: 0,
+        series_sel: 0,
+        series_search: String::new(),
+        series_search_active: false,
+        series_range: SeriesTimeRange::Last12Stamped,
         plan_focus: PlanFocus::Income,
         editor_income_sel: 0,
         editor_expense_sel: 0,
@@ -534,8 +552,28 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                 if let Some(key) = read_key()? {
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
+                    } else if handle_global_key(app, key) {
                     } else {
                         dashboard::handle_key(app, key, &view)?;
+                    }
+                }
+            }
+
+            Screen::Series => {
+                let view =
+                    ballpark::view::SeriesPageView::build(&app.conn, today, app.series_range)?;
+                let visible_count = series::visible_count(app, &view);
+                clamp(&mut app.series_sel, visible_count);
+                terminal.draw(|f| {
+                    series::draw(f, app, &view);
+                    draw_modal(f, app);
+                })?;
+                if let Some(key) = read_key()? {
+                    if app.modal.is_some() {
+                        handle_modal_key(app, key)?;
+                    } else if handle_global_key(app, key) {
+                    } else {
+                        series::handle_key(app, key, &view, today)?;
                     }
                 }
             }
@@ -550,6 +588,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                 if let Some(key) = read_key()? {
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
+                    } else if handle_global_key(app, key) {
                     } else {
                         plans::handle_list_key(app, key, &summaries)?;
                     }
@@ -598,6 +637,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                 if let Some(key) = read_key()? {
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
+                    } else if handle_global_key(app, key) {
                     } else {
                         plans::handle_editor_key(app, key, &plan, &entries)?;
                     }
@@ -624,6 +664,17 @@ fn read_key() -> Result<Option<KeyEvent>> {
     match event::read()? {
         Event::Key(key) if key.kind == KeyEventKind::Press => Ok(Some(key)),
         _ => Ok(None),
+    }
+}
+
+fn handle_global_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('S') => {
+            app.screen = Screen::Series;
+            app.status = None;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -862,6 +913,10 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
             };
             finish_restamp(app, msg);
         }
+        ModalAction::SetSeriesRange { range } => {
+            app.series_range = range;
+            app.status = Some(format!("Range: {}", range.label(Local::now().date_naive())));
+        }
     }
     Ok(())
 }
@@ -1062,6 +1117,13 @@ fn submit_text(app: &mut App) -> Result<()> {
         PromptKind::SeriesLabel { series_id } => {
             if !text.is_empty() {
                 ops::set_series_label(&app.conn, &series_id, &text)?;
+            }
+        }
+        PromptKind::SeriesCategory { series_id } => {
+            if text.is_empty() {
+                app.status = Some("Category can't be empty".into());
+            } else {
+                ops::set_series_category(&app.conn, &series_id, Some(&text))?;
             }
         }
         PromptKind::SeriesAddAmount {
@@ -1503,24 +1565,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 // --- Shared display helpers (used by more than one screen) ---------------------
-
-/// A footer that shows key hints on the left and the transient `status` on the right.
-pub(crate) fn draw_status_footer(
-    frame: &mut Frame,
-    area: Rect,
-    hints: Line,
-    status: &Option<String>,
-) {
-    frame.render_widget(Paragraph::new(hints), area);
-    if let Some(s) = status {
-        let p = Paragraph::new(Line::from(Span::styled(
-            format!("{s} "),
-            Style::default().fg(Color::Yellow),
-        )))
-        .alignment(Alignment::Right);
-        frame.render_widget(p, area);
-    }
-}
 
 /// A footer with context hints on the left and global navigation on the right. Status
 /// messages take the right side while present.

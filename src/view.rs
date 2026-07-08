@@ -3,7 +3,7 @@
 //! data. A web or desktop frontend could call `MonthView::build` and render it too.
 
 use crate::calc::{self, WhatsLeft};
-use crate::models::{Account, AccountType, Direction, Envelope, Month, Txn};
+use crate::models::{Account, AccountType, Direction, Envelope, Kind, Month, Series, Txn};
 use crate::money::Money;
 use crate::queries;
 use anyhow::Result;
@@ -163,6 +163,285 @@ fn dir_rank(d: Direction) -> u8 {
     }
 }
 
+/// The date window used by the Series screen. The selected range scopes both the chart and
+/// every stat unless a future stat explicitly says otherwise.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SeriesTimeRange {
+    Last12Stamped,
+    ThisYear,
+    LastYear,
+    AllHistory,
+}
+
+impl SeriesTimeRange {
+    pub fn label(self, today: NaiveDate) -> String {
+        match self {
+            SeriesTimeRange::Last12Stamped => "Last 12 stamped months".into(),
+            SeriesTimeRange::ThisYear => format!("This year ({})", today.year()),
+            SeriesTimeRange::LastYear => format!("Last year ({})", today.year() - 1),
+            SeriesTimeRange::AllHistory => "All history".into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum SeriesGroup {
+    Income,
+    Expenses,
+    Envelopes,
+}
+
+impl SeriesGroup {
+    pub fn for_series(series: &Series) -> SeriesGroup {
+        match series.kind {
+            Kind::Envelope => SeriesGroup::Envelopes,
+            Kind::Transaction => match series.direction {
+                Some(Direction::In) => SeriesGroup::Income,
+                _ => SeriesGroup::Expenses,
+            },
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SeriesGroup::Income => "Income",
+            SeriesGroup::Expenses => "Expenses",
+            SeriesGroup::Envelopes => "Envelopes",
+        }
+    }
+}
+
+/// One month on the selected series chart. `None` means the month is on the x-axis but the
+/// series had no row in that month, so charts render a gap instead of a fake zero.
+#[derive(Clone, Debug)]
+pub struct SeriesTrendPoint {
+    pub month_label: String,
+    pub effective: Option<Money>,
+    pub planned: Option<Money>,
+    pub occurrence_count: usize,
+    pub settled_count: usize,
+    pub unsettled_count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SeriesStats {
+    pub latest: Option<Money>,
+    pub min: Option<Money>,
+    pub max: Option<Money>,
+    pub avg: Option<Money>,
+    pub planned_avg: Option<Money>,
+    pub avg_delta: Option<Money>,
+    pub occurrence_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct SeriesCurrentSummary {
+    pub month_label: String,
+    pub amount: Money,
+    pub occurrence_count: usize,
+    pub settled_count: usize,
+    pub unsettled_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct SeriesDetailView {
+    pub series: Series,
+    pub group: SeriesGroup,
+    pub plan_names: Vec<String>,
+    pub points: Vec<SeriesTrendPoint>,
+    pub stats: SeriesStats,
+    pub current: Option<SeriesCurrentSummary>,
+}
+
+pub struct SeriesPageView {
+    pub range: SeriesTimeRange,
+    pub range_label: String,
+    pub details: Vec<SeriesDetailView>,
+}
+
+impl SeriesPageView {
+    pub fn build(
+        conn: &Connection,
+        today: NaiveDate,
+        range: SeriesTimeRange,
+    ) -> Result<SeriesPageView> {
+        let all_months = queries::months(conn)?;
+        let axis = months_for_range(&all_months, today, range);
+        let current_label = format!("{:04}-{:02}", today.year(), today.month());
+        let current_month = queries::month_by_label(conn, &current_label)?;
+
+        let mut details = Vec::new();
+        for series in queries::list_series(conn)? {
+            let points = trend_points(conn, &series, &axis)?;
+            let current = match &current_month {
+                Some(month) => current_summary(conn, &series, month)?,
+                None => None,
+            };
+            details.push(SeriesDetailView {
+                group: SeriesGroup::for_series(&series),
+                plan_names: queries::plan_names_for_series(conn, &series.id)?,
+                stats: stats_for_points(&points),
+                points,
+                current,
+                series,
+            });
+        }
+
+        details.sort_by(|a, b| {
+            a.group
+                .cmp(&b.group)
+                .then_with(|| a.series.label.cmp(&b.series.label))
+                .then_with(|| a.series.id.cmp(&b.series.id))
+        });
+
+        Ok(SeriesPageView {
+            range,
+            range_label: range.label(today),
+            details,
+        })
+    }
+}
+
+fn months_for_range(months: &[Month], today: NaiveDate, range: SeriesTimeRange) -> Vec<Month> {
+    match range {
+        SeriesTimeRange::Last12Stamped => {
+            let start = months.len().saturating_sub(12);
+            months[start..].to_vec()
+        }
+        SeriesTimeRange::ThisYear => months
+            .iter()
+            .filter(|m| m.start_date.year() == today.year())
+            .cloned()
+            .collect(),
+        SeriesTimeRange::LastYear => months
+            .iter()
+            .filter(|m| m.start_date.year() == today.year() - 1)
+            .cloned()
+            .collect(),
+        SeriesTimeRange::AllHistory => months.to_vec(),
+    }
+}
+
+fn trend_points(
+    conn: &Connection,
+    series: &Series,
+    months: &[Month],
+) -> Result<Vec<SeriesTrendPoint>> {
+    let mut points = Vec::new();
+    for month in months {
+        points.push(match series.kind {
+            Kind::Transaction => transaction_point(conn, series, month)?,
+            Kind::Envelope => envelope_point(conn, series, month)?,
+        });
+    }
+    Ok(points)
+}
+
+fn transaction_point(
+    conn: &Connection,
+    series: &Series,
+    month: &Month,
+) -> Result<SeriesTrendPoint> {
+    let txns = queries::load_txns(conn, &month.id)?;
+    let rows: Vec<_> = txns
+        .iter()
+        .filter(|txn| {
+            txn.envelope_id.is_none() && txn.series_id.as_deref() == Some(series.id.as_str())
+        })
+        .collect();
+    let occurrence_count = rows.len();
+    let effective = (occurrence_count > 0).then(|| rows.iter().map(|txn| txn.amount).sum());
+    let planned_values: Vec<Money> = rows.iter().filter_map(|txn| txn.stamped_amount).collect();
+    let planned = (!planned_values.is_empty()).then(|| planned_values.into_iter().sum());
+    let settled_count = rows.iter().filter(|txn| txn.settled).count();
+
+    Ok(SeriesTrendPoint {
+        month_label: month.label.clone(),
+        effective,
+        planned,
+        occurrence_count,
+        settled_count,
+        unsettled_count: occurrence_count.saturating_sub(settled_count),
+    })
+}
+
+fn envelope_point(conn: &Connection, series: &Series, month: &Month) -> Result<SeriesTrendPoint> {
+    let envelopes = queries::load_envelopes(conn, &month.id)?;
+    let rows: Vec<_> = envelopes
+        .iter()
+        .filter(|envelope| envelope.series_id.as_deref() == Some(series.id.as_str()))
+        .collect();
+    let occurrence_count = rows.len();
+    let effective = (occurrence_count > 0).then(|| rows.iter().map(|env| env.amount).sum());
+    let planned = (occurrence_count > 0).then(|| rows.iter().map(|env| env.stamped_amount).sum());
+
+    Ok(SeriesTrendPoint {
+        month_label: month.label.clone(),
+        effective,
+        planned,
+        occurrence_count,
+        settled_count: 0,
+        unsettled_count: 0,
+    })
+}
+
+fn current_summary(
+    conn: &Connection,
+    series: &Series,
+    month: &Month,
+) -> Result<Option<SeriesCurrentSummary>> {
+    let point = match series.kind {
+        Kind::Transaction => transaction_point(conn, series, month)?,
+        Kind::Envelope => envelope_point(conn, series, month)?,
+    };
+    Ok(point.effective.map(|amount| SeriesCurrentSummary {
+        month_label: point.month_label,
+        amount,
+        occurrence_count: point.occurrence_count,
+        settled_count: point.settled_count,
+        unsettled_count: point.unsettled_count,
+    }))
+}
+
+fn stats_for_points(points: &[SeriesTrendPoint]) -> SeriesStats {
+    let values: Vec<Money> = points.iter().filter_map(|p| p.effective).collect();
+    let planned_values: Vec<Money> = points.iter().filter_map(|p| p.planned).collect();
+    let paired_values: Vec<(Money, Money)> = points
+        .iter()
+        .filter_map(|p| Some((p.effective?, p.planned?)))
+        .collect();
+    let occurrence_count = points.iter().map(|p| p.occurrence_count).sum();
+
+    SeriesStats {
+        latest: values.last().copied(),
+        min: values.iter().copied().min(),
+        max: values.iter().copied().max(),
+        avg: average_money(&values),
+        planned_avg: average_money(&planned_values),
+        avg_delta: avg_delta(&paired_values),
+        occurrence_count,
+    }
+}
+
+fn average_money(values: &[Money]) -> Option<Money> {
+    if values.is_empty() {
+        None
+    } else {
+        let sum: i64 = values.iter().map(|m| m.cents()).sum();
+        Some(Money((sum as f64 / values.len() as f64).round() as i64))
+    }
+}
+
+fn avg_delta(values: &[(Money, Money)]) -> Option<Money> {
+    if values.is_empty() {
+        None
+    } else {
+        let effective: Vec<Money> = values.iter().map(|(effective, _)| *effective).collect();
+        let planned: Vec<Money> = values.iter().map(|(_, planned)| *planned).collect();
+        Some(average_money(&effective)? - average_money(&planned)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +542,113 @@ mod tests {
         // A period nobody stamped returns None — the dashboard renders its "not stamped"
         // prompt for this and still lets you navigate away.
         assert!(MonthView::build_for(&conn, today, 2099, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn series_stats_total_repeated_monthly_occurrences() {
+        use crate::models::{Direction, Kind};
+
+        let mut conn = db::open_in_memory().unwrap();
+        let plan_id = ops::create_plan(&conn, "Normal").unwrap();
+        let paycheck = ops::create_series(
+            &conn,
+            Kind::Transaction,
+            "Paycheck",
+            Some(Direction::In),
+            None,
+            None,
+        )
+        .unwrap();
+        let first =
+            ops::add_plan_item(&conn, &plan_id, &paycheck, Money::from_dollars(100.0)).unwrap();
+        let second =
+            ops::add_plan_item(&conn, &plan_id, &paycheck, Money::from_dollars(200.0)).unwrap();
+
+        stamp_month(&mut conn, &plan_id, 2026, 1);
+        ops::set_item_amount(&conn, &first, Money::from_dollars(150.0)).unwrap();
+        ops::set_item_amount(&conn, &second, Money::from_dollars(250.0)).unwrap();
+        stamp_month(&mut conn, &plan_id, 2026, 2);
+
+        let view = SeriesPageView::build(
+            &conn,
+            NaiveDate::from_ymd_opt(2026, 2, 15).unwrap(),
+            SeriesTimeRange::AllHistory,
+        )
+        .unwrap();
+        let detail = view
+            .details
+            .iter()
+            .find(|detail| detail.series.id == paycheck)
+            .unwrap();
+
+        assert_eq!(detail.points.len(), 2);
+        assert_eq!(detail.points[0].effective, Some(Money::from_dollars(300.0)));
+        assert_eq!(detail.points[0].occurrence_count, 2);
+        assert_eq!(detail.points[1].effective, Some(Money::from_dollars(400.0)));
+        assert_eq!(detail.points[1].occurrence_count, 2);
+        assert_eq!(detail.stats.latest, Some(Money::from_dollars(400.0)));
+        assert_eq!(detail.stats.min, Some(Money::from_dollars(300.0)));
+        assert_eq!(detail.stats.max, Some(Money::from_dollars(400.0)));
+        assert_eq!(detail.stats.avg, Some(Money::from_dollars(350.0)));
+        assert_eq!(detail.stats.occurrence_count, 4);
+    }
+
+    #[test]
+    fn series_stats_follow_the_selected_time_range() {
+        use crate::models::{Direction, Kind};
+
+        let mut conn = db::open_in_memory().unwrap();
+        let plan_id = ops::create_plan(&conn, "Normal").unwrap();
+        let rent = ops::create_series(
+            &conn,
+            Kind::Transaction,
+            "Rent",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        let item = ops::add_plan_item(&conn, &plan_id, &rent, Money::from_dollars(100.0)).unwrap();
+
+        stamp_month(&mut conn, &plan_id, 2025, 1);
+        ops::set_item_amount(&conn, &item, Money::from_dollars(300.0)).unwrap();
+        stamp_month(&mut conn, &plan_id, 2026, 1);
+
+        let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let all = SeriesPageView::build(&conn, today, SeriesTimeRange::AllHistory).unwrap();
+        let this_year = SeriesPageView::build(&conn, today, SeriesTimeRange::ThisYear).unwrap();
+
+        let all_rent = all
+            .details
+            .iter()
+            .find(|detail| detail.series.id == rent)
+            .unwrap();
+        let this_year_rent = this_year
+            .details
+            .iter()
+            .find(|detail| detail.series.id == rent)
+            .unwrap();
+
+        assert_eq!(all_rent.stats.avg, Some(Money::from_dollars(200.0)));
+        assert_eq!(this_year_rent.points.len(), 1);
+        assert_eq!(this_year_rent.points[0].month_label, "2026-01");
+        assert_eq!(this_year_rent.stats.avg, Some(Money::from_dollars(300.0)));
+        assert_eq!(
+            this_year_rent.stats.latest,
+            Some(Money::from_dollars(300.0))
+        );
+    }
+
+    fn stamp_month(conn: &mut rusqlite::Connection, plan_id: &str, year: i32, month: u32) {
+        let start = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+        let label = format!("{year:04}-{month:02}");
+        ops::stamp(
+            conn,
+            plan_id,
+            &label,
+            start,
+            ops::days_in_month(year, month),
+        )
+        .unwrap();
     }
 }

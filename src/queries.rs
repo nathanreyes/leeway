@@ -77,6 +77,21 @@ pub fn month_by_label(conn: &Connection, label: &str) -> Result<Option<Month>> {
     }
 }
 
+/// Every stamped month, oldest first. Series trends use this as the time axis before
+/// applying their selected range.
+pub fn months(conn: &Connection) -> Result<Vec<Month>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, plan_id, label, start_date, days_in_month
+         FROM month ORDER BY start_date, label",
+    )?;
+    let rows = stmt.query_map([], map_month_raw)?;
+    let mut months = Vec::new();
+    for raw in rows {
+        months.push(raw?.parse()?);
+    }
+    Ok(months)
+}
+
 pub fn load_envelopes(conn: &Connection, month_id: &str) -> Result<Vec<Envelope>> {
     let mut stmt = conn.prepare(
         "SELECT id, month_id, series_id, label, category, amount_cents,
@@ -198,6 +213,21 @@ pub fn get_series(conn: &Connection, series_id: &str) -> Result<Option<Series>> 
         )
         .optional()?;
     Ok(row)
+}
+
+/// Names of plans that currently include this series, in display order.
+pub fn plan_names_for_series(conn: &Connection, series_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT p.name
+         FROM plan p
+         JOIN plan_item pi ON pi.plan_id = p.id
+         WHERE pi.series_id = ?1
+         ORDER BY p.name",
+    )?;
+    let rows = stmt
+        .query_map([series_id], |r| r.get::<_, String>("name"))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 pub fn plan_has_series(conn: &Connection, plan_id: &str, series_id: &str) -> Result<bool> {
