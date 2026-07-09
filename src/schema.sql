@@ -45,7 +45,6 @@ CREATE TABLE series (
     id          TEXT PRIMARY KEY,             -- UUID — the durable series id
     kind        TEXT NOT NULL,                -- 'transaction' | 'envelope'
     label       TEXT NOT NULL,                -- canonical; editing it affects every plan
-    category    TEXT,
     direction   TEXT,                         -- transactions: 'in' | 'out'
     period_type TEXT,                         -- envelopes: 'daily' | 'weekly' | 'monthly'
     mode        TEXT,                         -- envelopes: 'automatic' | 'manual'
@@ -99,7 +98,6 @@ CREATE TABLE envelope (
     month_id             TEXT NOT NULL REFERENCES month(id),
     series_id            TEXT,              -- copied series.id (soft ref, see above); NULL = ad-hoc
     label                TEXT NOT NULL,
-    category             TEXT,
     amount_cents         INTEGER NOT NULL,  -- this month's budget (editable)
     stamped_amount_cents INTEGER NOT NULL,  -- immutable snapshot, used by "revert to planned"
     period_type          TEXT NOT NULL,     -- 'daily' | 'weekly' | 'monthly'
@@ -114,7 +112,6 @@ CREATE TABLE txn (
     envelope_id          TEXT REFERENCES envelope(id),        -- NULL = standalone (bill/income)
     account_id           TEXT REFERENCES account(id),
     label                TEXT NOT NULL,
-    category             TEXT,
     direction            TEXT NOT NULL,     -- 'in' | 'out'
     amount_cents         INTEGER NOT NULL,  -- forecast input while unsettled; historical actual once settled
     stamped_amount_cents INTEGER,           -- immutable snapshot for revert (NULL for one-offs)

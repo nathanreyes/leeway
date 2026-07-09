@@ -236,10 +236,6 @@ pub enum PromptKind {
     SeriesLabel {
         series_id: String,
     },
-    /// Edit a series' optional category — affects every plan that includes it.
-    SeriesCategory {
-        series_id: String,
-    },
     /// Create a brand-new series on the Series page. The block fixes kind + direction (and
     /// seeds monthly/default-mode for envelopes); the submitted text is the label.
     NewSeries {
@@ -1217,13 +1213,6 @@ fn submit_text(app: &mut App) -> Result<()> {
         PromptKind::SeriesLabel { series_id } => {
             if !text.is_empty() {
                 ops::set_series_label(&app.conn, &series_id, &text)?;
-            }
-        }
-        PromptKind::SeriesCategory { series_id } => {
-            if text.is_empty() {
-                app.status = Some("Category can't be empty".into());
-            } else {
-                ops::set_series_category(&app.conn, &series_id, Some(&text))?;
             }
         }
         PromptKind::NewSeries { block } => {

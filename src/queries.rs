@@ -94,7 +94,7 @@ pub fn months(conn: &Connection) -> Result<Vec<Month>> {
 
 pub fn load_envelopes(conn: &Connection, month_id: &str) -> Result<Vec<Envelope>> {
     let mut stmt = conn.prepare(
-        "SELECT id, month_id, series_id, label, category, amount_cents,
+        "SELECT id, month_id, series_id, label, amount_cents,
                 stamped_amount_cents, period_type, mode
          FROM envelope WHERE month_id = ?1 ORDER BY label, id",
     )?;
@@ -106,7 +106,7 @@ pub fn load_envelopes(conn: &Connection, month_id: &str) -> Result<Vec<Envelope>
 
 pub fn load_txns(conn: &Connection, month_id: &str) -> Result<Vec<Txn>> {
     let mut stmt = conn.prepare(
-        "SELECT id, month_id, series_id, envelope_id, account_id, label, category,
+        "SELECT id, month_id, series_id, envelope_id, account_id, label,
                 direction, amount_cents, stamped_amount_cents, settled, date_paid
          FROM txn WHERE month_id = ?1 ORDER BY direction DESC, label, id",
     )?;
@@ -179,7 +179,7 @@ pub fn get_plan(conn: &Connection, plan_id: &str) -> Result<Option<Plan>> {
 pub fn load_plan_entries(conn: &Connection, plan_id: &str) -> Result<Vec<PlanEntry>> {
     let mut stmt = conn.prepare(
         "SELECT pi.id AS item_id, pi.plan_id AS plan_id, pi.amount_cents AS amount_cents,
-                s.id AS series_id, s.kind AS kind, s.label AS label, s.category AS category,
+                s.id AS series_id, s.kind AS kind, s.label AS label,
                 s.direction AS direction, s.period_type AS period_type, s.mode AS mode
          FROM plan_item pi JOIN series s ON s.id = pi.series_id
          WHERE pi.plan_id = ?1
@@ -194,7 +194,7 @@ pub fn load_plan_entries(conn: &Connection, plan_id: &str) -> Result<Vec<PlanEnt
 /// Every series, for the reuse picker.
 pub fn list_series(conn: &Connection) -> Result<Vec<Series>> {
     let mut stmt = conn.prepare(
-        "SELECT id, kind, label, category, direction, period_type, mode
+        "SELECT id, kind, label, direction, period_type, mode
          FROM series ORDER BY kind, label",
     )?;
     let rows = stmt
@@ -206,7 +206,7 @@ pub fn list_series(conn: &Connection) -> Result<Vec<Series>> {
 pub fn get_series(conn: &Connection, series_id: &str) -> Result<Option<Series>> {
     let row = conn
         .query_row(
-            "SELECT id, kind, label, category, direction, period_type, mode
+            "SELECT id, kind, label, direction, period_type, mode
              FROM series WHERE id = ?1",
             [series_id],
             map_series,
@@ -293,7 +293,6 @@ fn map_series(r: &Row) -> rusqlite::Result<Series> {
         id: r.get("id")?,
         kind: r.get("kind")?,
         label: r.get("label")?,
-        category: r.get("category")?,
         direction: r.get("direction")?,
         period_type: r.get("period_type")?,
         mode: r.get("mode")?,
@@ -309,7 +308,6 @@ fn map_plan_entry(r: &Row) -> rusqlite::Result<PlanEntry> {
             id: r.get("series_id")?,
             kind: r.get("kind")?,
             label: r.get("label")?,
-            category: r.get("category")?,
             direction: r.get("direction")?,
             period_type: r.get("period_type")?,
             mode: r.get("mode")?,
@@ -359,7 +357,6 @@ fn map_envelope(r: &Row) -> rusqlite::Result<Envelope> {
         month_id: r.get("month_id")?,
         series_id: r.get("series_id")?,
         label: r.get("label")?,
-        category: r.get("category")?,
         amount: r.get("amount_cents")?,
         stamped_amount: r.get("stamped_amount_cents")?,
         period_type: r.get("period_type")?,
@@ -375,7 +372,6 @@ fn map_txn(r: &Row) -> rusqlite::Result<Txn> {
         envelope_id: r.get("envelope_id")?,
         account_id: r.get("account_id")?,
         label: r.get("label")?,
-        category: r.get("category")?,
         direction: r.get("direction")?,
         amount: r.get("amount_cents")?,
         stamped_amount: r.get("stamped_amount_cents")?,

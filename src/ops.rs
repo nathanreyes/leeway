@@ -63,15 +63,14 @@ fn insert_instance_from_entry(conn: &Connection, month_id: &str, entry: &PlanEnt
         Kind::Envelope => {
             conn.execute(
                 "INSERT INTO envelope
-                   (id, month_id, series_id, label, category, amount_cents,
+                   (id, month_id, series_id, label, amount_cents,
                     stamped_amount_cents, period_type, mode)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     new_id(),
                     month_id,
                     s.id, // series_id = the durable series identity
                     s.label,
-                    s.category,
                     entry.amount,
                     entry.amount,
                     s.period_type.unwrap_or(PeriodType::Monthly),
@@ -84,15 +83,14 @@ fn insert_instance_from_entry(conn: &Connection, month_id: &str, entry: &PlanEnt
         Kind::Transaction => {
             conn.execute(
                 "INSERT INTO txn
-                   (id, month_id, series_id, label, category, direction,
+                   (id, month_id, series_id, label, direction,
                     amount_cents, stamped_amount_cents, settled)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
                 rusqlite::params![
                     new_id(),
                     month_id,
                     s.id,
                     s.label,
-                    s.category,
                     s.direction.unwrap_or(Direction::Out),
                     entry.amount,
                     entry.amount,
@@ -319,14 +317,13 @@ fn refresh_envelope(conn: &Connection, id: &str, entry: &PlanEntry) -> Result<()
     let s = &entry.series;
     conn.execute(
         "UPDATE envelope
-         SET amount_cents = ?1, stamped_amount_cents = ?2, label = ?3, category = ?4,
-             period_type = ?5, mode = ?6
-         WHERE id = ?7",
+         SET amount_cents = ?1, stamped_amount_cents = ?2, label = ?3,
+             period_type = ?4, mode = ?5
+         WHERE id = ?6",
         rusqlite::params![
             entry.amount,
             entry.amount,
             s.label,
-            s.category,
             s.period_type.unwrap_or(PeriodType::Monthly),
             s.mode.expect("envelope series must have a mode"),
             id
@@ -340,14 +337,13 @@ fn refresh_txn(conn: &Connection, id: &str, entry: &PlanEntry) -> Result<()> {
     let s = &entry.series;
     conn.execute(
         "UPDATE txn
-         SET amount_cents = ?1, stamped_amount_cents = ?2, label = ?3, category = ?4,
-             direction = ?5, settled = 0, date_paid = NULL
-         WHERE id = ?6",
+         SET amount_cents = ?1, stamped_amount_cents = ?2, label = ?3,
+             direction = ?4, settled = 0, date_paid = NULL
+         WHERE id = ?5",
         rusqlite::params![
             entry.amount,
             entry.amount,
             s.label,
-            s.category,
             s.direction.unwrap_or(Direction::Out),
             id
         ],
@@ -545,7 +541,7 @@ pub fn delete_plan(conn: &mut Connection, plan_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create a new series (a durable recurring-item definition). Category starts NULL.
+/// Create a new series (a durable recurring-item definition).
 ///
 /// `mode` is where the global default is applied — ONCE, here, at creation. An envelope
 /// series that passes `None` is seeded with the current `default_envelope_mode` and frozen;
@@ -647,18 +643,6 @@ pub fn set_series_label(conn: &Connection, series_id: &str, label: &str) -> Resu
     Ok(())
 }
 
-pub fn set_series_category(
-    conn: &Connection,
-    series_id: &str,
-    category: Option<&str>,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE series SET category = ?1 WHERE id = ?2",
-        rusqlite::params![category, series_id],
-    )?;
-    Ok(())
-}
-
 pub fn set_series_direction(
     conn: &Connection,
     series_id: &str,
@@ -735,15 +719,14 @@ pub fn add_series_txn_instance(
     let id = new_id();
     conn.execute(
         "INSERT INTO txn
-           (id, month_id, series_id, label, category, direction,
+           (id, month_id, series_id, label, direction,
             amount_cents, stamped_amount_cents, settled)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
         rusqlite::params![
             id,
             month_id,
             series.id,
             series.label,
-            series.category,
             series.direction.unwrap_or(Direction::Out),
             amount,
             amount,
@@ -768,15 +751,14 @@ pub fn add_series_envelope_instance(
     let id = new_id();
     conn.execute(
         "INSERT INTO envelope
-           (id, month_id, series_id, label, category, amount_cents,
+           (id, month_id, series_id, label, amount_cents,
             stamped_amount_cents, period_type, mode)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             id,
             month_id,
             series.id,
             series.label,
-            series.category,
             amount,
             amount,
             series.period_type.unwrap_or(PeriodType::Monthly),
@@ -825,9 +807,9 @@ pub fn add_oneoff_envelope(
     let id = new_id();
     conn.execute(
         "INSERT INTO envelope
-           (id, month_id, series_id, label, category, amount_cents,
+           (id, month_id, series_id, label, amount_cents,
             stamped_amount_cents, period_type, mode)
-         VALUES (?1, ?2, NULL, ?3, NULL, ?4, ?5, ?6, ?7)",
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![id, month_id, label, amount, amount, period_type, mode],
     )?;
     Ok(id)

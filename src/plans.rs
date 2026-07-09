@@ -3,7 +3,7 @@
 //! Editing model: focus Income, Expenses, or Envelopes, press `n` to search/create a
 //! series in that block, then fill the plan amount. The editor only touches plan-scoped
 //! things — `a` sets this plan's amount, `x` removes the item from this plan. Editing the
-//! shared series itself (label, category, mode, period) lives on the Series page (`S`), so a
+//! shared series itself (label, mode, period) lives on the Series page (`S`), so a
 //! plan can never silently rewrite a definition used by other plans.
 
 use crate::{AddDestination, App, BudgetBlock, ConfirmAction, PlanFocus, PromptKind, Screen};

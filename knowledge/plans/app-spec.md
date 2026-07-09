@@ -8,7 +8,7 @@ A single-user, local-first budgeting app whose job is to answer one question all
 
 - The **current checking balance is ground truth**, entered manually. The app never reconciles individual transactions against it.
 - Known income and bills are **events** you toggle as settled — you usually don't care *when*, only *whether*.
-- Spending categories (groceries, dining) are **envelopes** that bleed down over the month on their own.
+- Spending pools (groceries, dining) are **envelopes** that bleed down over the month on their own.
 - The app keeps every month it has ever stamped, so it can show **trends** ("what was electric this time last year?").
 - Anything that would force routine data entry into the main loop is suspect. Entry is optional enrichment, never a requirement.
 - **Cash flow, not net worth.** Accounts are only checking (spendable) and credit cards (a liability = `credit_limit − available_credit`). Saving toward a goal is modeled as a monthly commitment (an envelope or a set-aside bill that lowers "what's left"); tracking accumulated goal *balances* is out of scope.
@@ -21,7 +21,7 @@ Three primitives, cleanly related:
 
 - **Transaction** — an atomic money event: amount, direction (in/out), a settled flag. Paychecks and known bills *are* transactions. A transaction may stand alone (a bill, a paycheck) or belong to a manual envelope (a grocery purchase).
 - **Envelope** — a budgeted pool with a consumption *mode*. An **automatic** envelope accrues over time; a **manual** envelope is consumed by the transactions inside it.
-- **Series** — a first-class, durable definition of a recurring item (Rent, Groceries): its kind, label, category, and coded fields (direction / period / mode). A series is the **permanent identity** that stamped instances carry as `series_id` and that trends group by. One series can appear in many plans, so trends connect even when you switch which plan you stamp.
+- **Series** — a first-class, durable definition of a recurring item (Rent, Groceries): its kind, label, and coded fields (direction / period / mode). A series is the **permanent identity** that stamped instances carry as `series_id` and that trends group by. One series can appear in many plans, so trends connect even when you switch which plan you stamp.
 
 And a separation across time:
 
@@ -58,7 +58,6 @@ CREATE TABLE series (
     id          TEXT PRIMARY KEY,          -- UUID — the durable series id
     kind        TEXT NOT NULL,             -- 'transaction' | 'envelope'
     label       TEXT NOT NULL,             -- cosmetic only; safe to edit
-    category    TEXT,
     direction   TEXT,                      -- 'in' | 'out'  (transactions)
     period_type TEXT,                      -- envelopes: 'daily' | 'weekly' | 'monthly'
     mode        TEXT                       -- envelopes: 'automatic' | 'manual' | NULL = inherit global default
@@ -89,7 +88,6 @@ CREATE TABLE envelope (
     month_id       TEXT NOT NULL REFERENCES month(id),
     series_id      TEXT NOT NULL,          -- copied plan_item.id (plain value, NOT a live FK)
     label          TEXT NOT NULL,
-    category       TEXT,
     amount         REAL NOT NULL,          -- this month's budget (editable)
     stamped_amount REAL NOT NULL,          -- immutable snapshot, used by "revert to planned"
     period_type    TEXT NOT NULL,          -- 'daily' | 'weekly' | 'monthly'
@@ -104,7 +102,6 @@ CREATE TABLE txn (
     envelope_id    TEXT REFERENCES envelope(id),         -- NULL = standalone (bill/income)
     account_id     TEXT REFERENCES account(id),
     label          TEXT NOT NULL,
-    category       TEXT,
     direction      TEXT NOT NULL,          -- 'in' | 'out'
     amount         REAL NOT NULL,          -- forecast input while unsettled; historical actual once settled
     stamped_amount REAL,                   -- immutable snapshot for revert (NULL for one-offs)
@@ -186,12 +183,12 @@ stamp(plan, start_date, days_in_month):
             INSERT envelope(month_id=m, series_id=item.id,
                             amount=item.amount, stamped_amount=item.amount,
                             period_type=item.period_type, mode=item.mode,
-                            label=item.label, category=item.category)
+                            label=item.label)
         else:  # transaction
             INSERT txn(month_id=m, series_id=item.id,
                        amount=item.amount, stamped_amount=item.amount,
                        direction=item.direction, settled=0,
-                       label=item.label, category=item.category)
+                       label=item.label)
     # link is now broken: the month is a self-contained snapshot
 ```
 

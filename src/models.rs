@@ -140,7 +140,6 @@ pub struct Series {
     pub id: String,
     pub kind: Kind,
     pub label: String,
-    pub category: Option<String>,
     pub direction: Option<Direction>,   // transactions
     pub period_type: Option<PeriodType>, // envelopes
     pub mode: Option<Mode>,              // Some for envelopes (frozen at creation); None for transactions
@@ -175,7 +174,6 @@ pub struct Envelope {
     /// as `Txn::series_id`: `Some` = plan-derived, `None` = hand-entered.
     pub series_id: Option<String>,
     pub label: String,
-    pub category: Option<String>,
     pub amount: Money,
     pub stamped_amount: Money,
     pub period_type: PeriodType,
@@ -190,7 +188,6 @@ pub struct Txn {
     pub envelope_id: Option<String>,
     pub account_id: Option<String>,
     pub label: String,
-    pub category: Option<String>,
     pub direction: Direction,
     pub amount: Money,
     pub stamped_amount: Option<Money>,

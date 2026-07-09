@@ -69,17 +69,6 @@ pub fn handle_key(
                 );
             }
         }
-        KeyCode::Char('c') => {
-            if let Some(detail) = selected_detail(app, view) {
-                let category = detail.series.category.clone().unwrap_or_default();
-                let id = detail.series.id.clone();
-                app.open_text_replace_on_type(
-                    "Series category",
-                    category,
-                    PromptKind::SeriesCategory { series_id: id },
-                );
-            }
-        }
         KeyCode::Char('m') => {
             if let Some(detail) = selected_detail(app, view) {
                 if detail.series.kind == Kind::Envelope {
@@ -487,8 +476,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
     .areas(area);
 
     // Summary and "Used in plans" sit side by side: the stats read as an aligned single
-    // column on the left, and plan membership gets its own list on the right rather than
-    // being crammed onto the category line.
+    // column on the left, and plan membership gets its own list on the right.
     let [summary_area, plans_area] =
         Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
             .areas(mid_area);
@@ -505,7 +493,6 @@ fn draw_summary(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
         SeriesGroup::Expenses => "expense",
         SeriesGroup::Envelopes => "envelope",
     };
-    let category = detail.series.category.as_deref().unwrap_or("--");
     let stats = &detail.stats;
     let delta = stats
         .avg_delta
@@ -522,7 +509,6 @@ fn draw_summary(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
             ),
             Span::styled(format!("  {kind}"), Style::default().fg(Color::DarkGray)),
         ]),
-        stat_row("category", crate::truncate(category, 22)),
         stat_row("latest", format_money_opt(stats.latest)),
         stat_row("avg", format_money_opt(stats.avg)),
         stat_row("min", format_money_opt(stats.min)),
@@ -546,8 +532,7 @@ fn stat_row(label: &str, value: String) -> Line<'static> {
     ])
 }
 
-/// The plans that currently include this series — its own panel beside the stats, so
-/// membership isn't squeezed onto the category line.
+/// The plans that currently include this series, in their own panel beside the stats.
 fn draw_plans_used(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
     let block = crate::titled_block(" Used in plans ");
     let width = area.width.saturating_sub(3) as usize;
@@ -656,8 +641,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
             Span::raw(" move  "),
             key(" n "),
             Span::raw(" new  "),
-            key(" r/c "),
-            Span::raw(" rename/category  "),
+            key(" r "),
+            Span::raw(" rename  "),
             key(" m/p "),
             Span::raw(" mode/period  "),
             key(" x "),
@@ -675,8 +660,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
             Span::raw(" move  "),
             key(" n "),
             Span::raw(" new  "),
-            key(" r/c "),
-            Span::raw(" rename/category  "),
+            key(" r "),
+            Span::raw(" rename  "),
             key(" x "),
             Span::raw(" delete  "),
             key(" / "),
@@ -752,15 +737,7 @@ fn visible_indices(app: &App, view: &SeriesPageView) -> Vec<usize> {
             SeriesFilter::AdHoc => detail.plan_names.is_empty(),
         })
         .filter(|(_, detail)| {
-            needle.is_empty()
-                || detail.series.label.to_lowercase().contains(&needle)
-                || detail
-                    .series
-                    .category
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_lowercase()
-                    .contains(&needle)
+            needle.is_empty() || detail.series.label.to_lowercase().contains(&needle)
         })
         .map(|(idx, _)| idx)
         .collect()
