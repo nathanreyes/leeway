@@ -173,10 +173,26 @@ pub struct SeriesSearch {
     pub all_series: Vec<Series>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EnvelopeDetailFocus {
+    Details,
+    Transactions,
+}
+
+impl EnvelopeDetailFocus {
+    fn other(self) -> Self {
+        match self {
+            Self::Details => Self::Transactions,
+            Self::Transactions => Self::Details,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EnvelopeDetail {
     pub month_id: String,
     pub envelope_id: String,
+    pub focus: EnvelopeDetailFocus,
     pub selected_spend: usize,
 }
 
@@ -311,8 +327,8 @@ pub enum PromptKind {
         period_type: PeriodType,
         days_in_month: i64,
     },
-    /// File a spend into a manual envelope: first collect the label, then the amount. Carries
-    /// the month so the new txn lands in the right period.
+    /// Record an envelope transaction: first collect the label, then the amount. Carries the
+    /// month so the new transaction lands in the right period, regardless of envelope mode.
     EnvelopeSpendLabel {
         envelope_id: String,
         month_id: String,
@@ -980,118 +996,127 @@ fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
     match key.code {
         KeyCode::Esc => app.modal = None,
-        KeyCode::Char('j') | KeyCode::Down => {
-            if let Some(Modal::EnvelopeDetail(detail)) = &mut app.modal
-                && detail.selected_spend + 1 < spending.len()
-            {
-                detail.selected_spend += 1;
-            }
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
+        KeyCode::Tab | KeyCode::BackTab => {
             if let Some(Modal::EnvelopeDetail(detail)) = &mut app.modal {
-                detail.selected_spend = detail.selected_spend.saturating_sub(1);
+                detail.focus = detail.focus.other();
             }
         }
-        KeyCode::Char('r') => app.open_text_from_envelope_detail(
-            "Envelope label",
-            envelope.label,
-            PromptKind::EnvelopeLabel { id: envelope.id },
-            detail.clone(),
-            true,
-        ),
-        KeyCode::Char('a') => {
-            let days_in_month = queries::month_days(&app.conn, &detail.month_id)?;
-            let amount =
-                calc::envelope_period_amount(envelope.amount, envelope.period_type, days_in_month);
-            let title = match calc::active_period(envelope.period_type) {
-                PeriodType::Daily => format!("Daily amount for {}", envelope.label),
-                PeriodType::Monthly | PeriodType::Weekly => {
-                    format!("Monthly amount for {}", envelope.label)
+        _ => match detail.focus {
+            EnvelopeDetailFocus::Details => match key.code {
+                KeyCode::Char('r') => app.open_text_from_envelope_detail(
+                    "Envelope label",
+                    envelope.label,
+                    PromptKind::EnvelopeLabel { id: envelope.id },
+                    detail.clone(),
+                    true,
+                ),
+                KeyCode::Char('a') => {
+                    let days_in_month = queries::month_days(&app.conn, &detail.month_id)?;
+                    let amount = calc::envelope_period_amount(
+                        envelope.amount,
+                        envelope.period_type,
+                        days_in_month,
+                    );
+                    let title = match calc::active_period(envelope.period_type) {
+                        PeriodType::Daily => format!("Daily amount for {}", envelope.label),
+                        PeriodType::Monthly | PeriodType::Weekly => {
+                            format!("Monthly amount for {}", envelope.label)
+                        }
+                    };
+                    app.open_text_from_envelope_detail(
+                        title,
+                        amount_edit_string(amount),
+                        PromptKind::EnvelopeAmount {
+                            id: envelope.id,
+                            period_type: envelope.period_type,
+                            days_in_month,
+                        },
+                        detail.clone(),
+                        true,
+                    );
                 }
-            };
-            app.open_text_from_envelope_detail(
-                title,
-                amount_edit_string(amount),
-                PromptKind::EnvelopeAmount {
-                    id: envelope.id,
-                    period_type: envelope.period_type,
-                    days_in_month,
-                },
-                detail.clone(),
-                true,
-            );
-        }
-        KeyCode::Char('m') => {
-            let next = match envelope.mode {
-                Mode::Manual => Mode::Automatic,
-                Mode::Automatic => Mode::Manual,
-            };
-            ops::set_envelope_mode(&app.conn, &envelope.id, next)?;
-        }
-        KeyCode::Char('p') => {
-            let next = match calc::active_period(envelope.period_type) {
-                PeriodType::Daily => PeriodType::Monthly,
-                PeriodType::Monthly | PeriodType::Weekly => PeriodType::Daily,
-            };
-            ops::set_envelope_period(&app.conn, &envelope.id, next)?;
-        }
-        KeyCode::Char('s') | KeyCode::Char('n') => {
-            if envelope.mode == Mode::Manual {
-                app.open_text_from_envelope_detail(
-                    format!("Spending label for {}", envelope.label),
-                    String::new(),
-                    PromptKind::EnvelopeSpendLabel {
-                        envelope_id: envelope.id,
-                        month_id: detail.month_id.clone(),
-                    },
-                    detail.clone(),
-                    false,
-                );
-            } else {
-                app.status = Some(
-                    "Automatic envelopes accrue by time; switch to manual to file spending".into(),
-                );
-            }
-        }
-        KeyCode::Enter => {
-            if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
-                app.open_text_from_envelope_detail(
-                    format!("Amount for {}", txn.label),
-                    amount_edit_string(txn.amount),
-                    PromptKind::TxnAmount { id: txn.id.clone() },
-                    detail.clone(),
-                    true,
-                );
-            }
-        }
-        KeyCode::Char('l') => {
-            if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
-                app.open_text_from_envelope_detail(
-                    "Spending label",
-                    txn.label.clone(),
-                    PromptKind::TxnLabel { id: txn.id.clone() },
-                    detail.clone(),
-                    true,
-                );
-            }
-        }
-        KeyCode::Char('d') => {
-            if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
-                app.open_confirm_from_envelope_detail(
-                    format!("Delete spending “{}”?", txn.label),
-                    ConfirmAction::DeleteTxn { id: txn.id.clone() },
-                    detail.clone(),
-                );
-            }
-        }
-        KeyCode::Char('x') => {
-            app.open_confirm_from_envelope_detail(
-                format!("Delete envelope “{}” and its spending?", envelope.label),
-                ConfirmAction::DeleteEnvelope { id: envelope.id },
-                detail.clone(),
-            );
-        }
-        _ => {}
+                KeyCode::Char('m') => {
+                    let next = match envelope.mode {
+                        Mode::Manual => Mode::Automatic,
+                        Mode::Automatic => Mode::Manual,
+                    };
+                    ops::set_envelope_mode(&app.conn, &envelope.id, next)?;
+                }
+                KeyCode::Char('p') => {
+                    let next = match calc::active_period(envelope.period_type) {
+                        PeriodType::Daily => PeriodType::Monthly,
+                        PeriodType::Monthly | PeriodType::Weekly => PeriodType::Daily,
+                    };
+                    ops::set_envelope_period(&app.conn, &envelope.id, next)?;
+                }
+                KeyCode::Char('x') => {
+                    app.open_confirm_from_envelope_detail(
+                        format!("Delete envelope “{}” and its transactions?", envelope.label),
+                        ConfirmAction::DeleteEnvelope { id: envelope.id },
+                        detail.clone(),
+                    );
+                }
+                _ => {}
+            },
+            EnvelopeDetailFocus::Transactions => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Some(Modal::EnvelopeDetail(detail)) = &mut app.modal
+                        && detail.selected_spend + 1 < spending.len()
+                    {
+                        detail.selected_spend += 1;
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some(Modal::EnvelopeDetail(detail)) = &mut app.modal {
+                        detail.selected_spend = detail.selected_spend.saturating_sub(1);
+                    }
+                }
+                KeyCode::Char('s') | KeyCode::Char('n') => {
+                    app.open_text_from_envelope_detail(
+                        format!("Transaction label for {}", envelope.label),
+                        String::new(),
+                        PromptKind::EnvelopeSpendLabel {
+                            envelope_id: envelope.id,
+                            month_id: detail.month_id.clone(),
+                        },
+                        detail.clone(),
+                        false,
+                    );
+                }
+                KeyCode::Enter => {
+                    if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
+                        app.open_text_from_envelope_detail(
+                            format!("Amount for {}", txn.label),
+                            amount_edit_string(txn.amount),
+                            PromptKind::TxnAmount { id: txn.id.clone() },
+                            detail.clone(),
+                            true,
+                        );
+                    }
+                }
+                KeyCode::Char('l') => {
+                    if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
+                        app.open_text_from_envelope_detail(
+                            "Transaction label",
+                            txn.label.clone(),
+                            PromptKind::TxnLabel { id: txn.id.clone() },
+                            detail.clone(),
+                            true,
+                        );
+                    }
+                }
+                KeyCode::Char('d') => {
+                    if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
+                        app.open_confirm_from_envelope_detail(
+                            format!("Delete transaction “{}”?", txn.label),
+                            ConfirmAction::DeleteTxn { id: txn.id.clone() },
+                            detail.clone(),
+                        );
+                    }
+                }
+                _ => {}
+            },
+        },
     }
     Ok(())
 }
@@ -1934,11 +1959,10 @@ fn draw_envelope_detail_modal(frame: &mut Frame, app: &App, detail: &EnvelopeDet
     let area = centered_rect(76, 72, frame.area());
     frame.render_widget(Clear, area);
 
-    let (title, lines) = match envelope_detail_lines(app, detail) {
-        Ok(result) => result,
-        Err(err) => (
-            " Envelope ".to_string(),
-            vec![
+    let (title, details, transactions) = match envelope_detail_content(app, detail) {
+        Ok(content) => content,
+        Err(err) => {
+            let body = vec![
                 Line::raw(""),
                 Line::from(Span::styled(
                     format!(" Could not load envelope: {err}"),
@@ -1947,50 +1971,102 @@ fn draw_envelope_detail_modal(frame: &mut Frame, app: &App, detail: &EnvelopeDet
                 Line::raw(""),
                 Line::from(Span::styled(
                     " Esc to close",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
                 )),
-            ],
-        ),
+            ];
+            frame.render_widget(Paragraph::new(body).block(titled_block(" Envelope ")), area);
+            return;
+        }
     };
     let block = titled_block(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [body_area, footer_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).areas(inner);
-    frame.render_widget(Paragraph::new(lines), body_area);
-    frame.render_widget(Paragraph::new(envelope_detail_footer_lines()), footer_area);
+    let [details_area, transactions_area, footer_area] = Layout::vertical([
+        Constraint::Length(8),
+        Constraint::Min(7),
+        Constraint::Length(1),
+    ])
+    .spacing(1)
+    .areas(inner);
+    draw_envelope_detail_section(
+        frame,
+        details_area,
+        " Details ",
+        details,
+        details_footer_line(),
+        detail.focus == EnvelopeDetailFocus::Details,
+    );
+    draw_envelope_detail_section(
+        frame,
+        transactions_area,
+        " Transactions ",
+        transactions,
+        transactions_footer_line(),
+        detail.focus == EnvelopeDetailFocus::Transactions,
+    );
+    frame.render_widget(
+        Paragraph::new(envelope_detail_navigation_line()),
+        footer_area,
+    );
 }
 
-fn envelope_detail_footer_lines() -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            modal_key(" r "),
-            Span::raw(" label  "),
-            modal_key(" a "),
-            Span::raw(" amount  "),
-            modal_key(" m "),
-            Span::raw(" mode  "),
-            modal_key(" p "),
-            Span::raw(" period  "),
-            modal_key(" s "),
-            Span::raw(" spend"),
-        ]),
-        Line::from(vec![
-            modal_key(" j/k "),
-            Span::raw(" move  "),
-            modal_key(" Enter "),
-            Span::raw(" amount  "),
-            modal_key(" l "),
-            Span::raw(" label  "),
-            modal_key(" d "),
-            Span::raw(" delete  "),
-            modal_key(" x "),
-            Span::raw(" del env  "),
-            modal_key(" Esc "),
-            Span::raw(" close"),
-        ]),
-    ]
+fn draw_envelope_detail_section(
+    frame: &mut Frame,
+    area: Rect,
+    title: &'static str,
+    lines: Vec<Line<'static>>,
+    controls: Line<'static>,
+    focused: bool,
+) {
+    let block = focusable_block(title, focused);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [content_area, controls_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(Paragraph::new(lines), content_area);
+    if focused {
+        frame.render_widget(Paragraph::new(controls), controls_area);
+    }
+}
+
+fn details_footer_line() -> Line<'static> {
+    Line::from(vec![
+        modal_key(" r "),
+        Span::raw(" label  "),
+        modal_key(" a "),
+        Span::raw(" amount  "),
+        modal_key(" m "),
+        Span::raw(" mode  "),
+        modal_key(" p "),
+        Span::raw(" cadence  "),
+        modal_key(" x "),
+        Span::raw(" delete envelope"),
+    ])
+}
+
+fn transactions_footer_line() -> Line<'static> {
+    Line::from(vec![
+        modal_key(" s/n "),
+        Span::raw(" add  "),
+        modal_key(" j/k "),
+        Span::raw(" move  "),
+        modal_key(" Enter "),
+        Span::raw(" amount  "),
+        modal_key(" l "),
+        Span::raw(" label  "),
+        modal_key(" d "),
+        Span::raw(" delete"),
+    ])
+}
+
+fn envelope_detail_navigation_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled(" Tab ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(" switch section  ", Style::default().fg(Color::Gray)),
+        modal_key(" Esc "),
+        Span::styled(" close", Style::default().fg(Color::Gray)),
+    ])
 }
 
 fn modal_key(label: &'static str) -> Span<'static> {
@@ -2000,21 +2076,22 @@ fn modal_key(label: &'static str) -> Span<'static> {
     )
 }
 
-fn envelope_detail_lines(
+fn envelope_detail_content(
     app: &App,
     detail: &EnvelopeDetail,
-) -> Result<(String, Vec<Line<'static>>)> {
+) -> Result<(String, Vec<Line<'static>>, Vec<Line<'static>>)> {
     let month = queries::month_by_id(&app.conn, &detail.month_id)?
         .with_context(|| format!("month not found: {}", detail.month_id))?;
     let envelope = load_detail_envelope(app, detail)?
         .with_context(|| format!("envelope not found: {}", detail.envelope_id))?;
-    let spending = queries::load_envelope_txns(&app.conn, &detail.month_id, &detail.envelope_id)?;
+    let transactions =
+        queries::load_envelope_txns(&app.conn, &detail.month_id, &detail.envelope_id)?;
     let fraction = calc::elapsed_fraction(
         month.start_date,
         month.days_in_month,
         Local::now().date_naive(),
     );
-    let consumed = calc::envelope_consumed(&envelope, envelope.mode, &spending, fraction);
+    let consumed = calc::envelope_consumed(&envelope, envelope.mode, &transactions, fraction);
     let remaining = calc::envelope_remaining(&envelope, consumed);
     let period = calc::active_period(envelope.period_type);
     let period_label = match period {
@@ -2031,54 +2108,83 @@ fn envelope_detail_lines(
         PeriodType::Monthly | PeriodType::Weekly => "/mo",
     };
 
-    let mut lines = vec![
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled(" mode ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{mode_label:<10}")),
-            Span::styled(" period ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{period_label:<8}")),
-            Span::styled(" entered ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{}{}", entered_amount, unit)),
-        ]),
-        Line::from(vec![
-            Span::styled(" monthly ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{:<12}", envelope.amount.to_string())),
-            Span::styled(" consumed ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{:<12}", consumed.to_string())),
-            Span::styled(" left ", Style::default().fg(Color::DarkGray)),
-            Span::raw(remaining.to_string()),
-        ]),
-        Line::raw(""),
-        Line::from(Span::styled(" Spending", Style::default().fg(Color::Gray))),
+    let details = vec![
+        envelope_detail_metric_line(
+            ("Mode", mode_label.to_string(), Color::White),
+            ("Cadence", period_label.to_string(), Color::White),
+            ("Entered", format!("{entered_amount}{unit}"), Color::White),
+        ),
+        envelope_detail_metric_line(
+            ("Monthly", envelope.amount.to_string(), Color::White),
+            ("Consumed", consumed.to_string(), Color::White),
+            ("Remaining", remaining.to_string(), Color::Cyan),
+        ),
     ];
 
-    if spending.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  No spending filed",
+    let mut transaction_lines = vec![Line::from(Span::styled(
+        match envelope.mode {
+            Mode::Automatic => {
+                " Recorded transactions do not affect this automatic envelope's balance."
+            }
+            Mode::Manual => " Transactions determine this manual envelope's consumed amount.",
+        },
+        Style::default().fg(Color::Gray),
+    ))];
+    if transactions.is_empty() {
+        transaction_lines.push(Line::raw(""));
+        transaction_lines.push(Line::from(Span::styled(
+            " No transactions recorded",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        for (idx, txn) in spending.iter().enumerate() {
-            let selected = idx == detail.selected_spend.min(spending.len().saturating_sub(1));
-            let marker = if selected { ">" } else { " " };
+        for (idx, txn) in transactions.iter().enumerate() {
+            let selected = detail.focus == EnvelopeDetailFocus::Transactions
+                && idx
+                    == detail
+                        .selected_spend
+                        .min(transactions.len().saturating_sub(1));
             let style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
-                Style::default()
+                Style::default().fg(Color::White)
             };
-            lines.push(Line::from(Span::styled(
-                format!(
-                    " {marker} {:<34} {:>12}",
-                    truncate(&txn.label, 34),
-                    txn.amount
+            transaction_lines.push(Line::from(vec![
+                Span::styled(
+                    if selected { "▌" } else { " " },
+                    Style::default().fg(Color::Cyan),
                 ),
-                style,
-            )));
+                Span::styled(
+                    format!(" {:<42} {:>14}", truncate(&txn.label, 42), txn.amount),
+                    style,
+                ),
+            ]));
         }
     }
 
-    Ok((format!(" Envelope - {} ", envelope.label), lines))
+    Ok((
+        format!(" Envelope · {} ", envelope.label),
+        details,
+        transaction_lines,
+    ))
+}
+
+fn envelope_detail_metric_line(
+    first: (&str, String, Color),
+    second: (&str, String, Color),
+    third: (&str, String, Color),
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (label, value, color) in [first, second, third] {
+        spans.push(Span::styled(
+            format!(" {label:<10}"),
+            Style::default().fg(Color::Gray),
+        ));
+        spans.push(Span::styled(
+            format!("{value:<15}"),
+            Style::default().fg(color),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn draw_series_search_modal(frame: &mut Frame, prompt: &SeriesSearch) {
@@ -2269,6 +2375,7 @@ mod tests {
         let detail = EnvelopeDetail {
             month_id,
             envelope_id: envelope.id.clone(),
+            focus: EnvelopeDetailFocus::Details,
             selected_spend: 0,
         };
 
@@ -2312,6 +2419,7 @@ mod tests {
             Some(Modal::EnvelopeDetail(actual)) => {
                 assert_eq!(actual.month_id, expected.month_id);
                 assert_eq!(actual.envelope_id, expected.envelope_id);
+                assert_eq!(actual.focus, expected.focus);
                 assert_eq!(actual.selected_spend, expected.selected_spend);
             }
             _ => panic!("expected envelope detail modal"),
@@ -2356,8 +2464,43 @@ mod tests {
     }
 
     #[test]
-    fn canceling_envelope_spend_amount_returns_to_detail_modal() {
+    fn envelope_detail_focus_scopes_controls_to_its_section() {
         let (mut app, detail, _) = app_with_envelope_detail();
+
+        // Details owns envelope-level edits at first; transaction creation is inert here.
+        handle_modal_key(&mut app, key(KeyCode::Char('s'))).unwrap();
+        assert_envelope_detail_modal(&app, &detail);
+
+        handle_modal_key(&mut app, key(KeyCode::Tab)).unwrap();
+        let mut transactions_detail = detail.clone();
+        transactions_detail.focus = EnvelopeDetailFocus::Transactions;
+        assert_envelope_detail_modal(&app, &transactions_detail);
+
+        // Transactions own transaction creation; envelope label edits are inert here.
+        handle_modal_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+        assert_envelope_detail_modal(&app, &transactions_detail);
+
+        handle_modal_key(&mut app, key(KeyCode::Char('s'))).unwrap();
+        match &app.modal {
+            Some(Modal::Text(prompt)) => {
+                assert_eq!(prompt.title, "Transaction label for Dining");
+                assert_eq!(
+                    prompt
+                        .return_to_envelope_detail
+                        .as_ref()
+                        .map(|detail| detail.focus),
+                    Some(EnvelopeDetailFocus::Transactions)
+                );
+            }
+            _ => panic!("expected transaction label prompt"),
+        }
+    }
+
+    #[test]
+    fn canceling_envelope_spend_amount_returns_to_detail_modal() {
+        let (mut app, mut detail, _) = app_with_envelope_detail();
+        handle_modal_key(&mut app, key(KeyCode::Tab)).unwrap();
+        detail.focus = EnvelopeDetailFocus::Transactions;
 
         handle_modal_key(&mut app, key(KeyCode::Char('s'))).unwrap();
         for c in "Coffee".chars() {
@@ -2375,5 +2518,30 @@ mod tests {
         handle_modal_key(&mut app, key(KeyCode::Esc)).unwrap();
 
         assert_envelope_detail_modal(&app, &detail);
+    }
+
+    #[test]
+    fn automatic_envelope_accepts_recorded_transactions() {
+        let (mut app, mut detail, envelope_id) = app_with_envelope_detail();
+        ops::set_envelope_mode(&app.conn, &envelope_id, Mode::Automatic).unwrap();
+        handle_modal_key(&mut app, key(KeyCode::Tab)).unwrap();
+        detail.focus = EnvelopeDetailFocus::Transactions;
+
+        handle_modal_key(&mut app, key(KeyCode::Char('s'))).unwrap();
+        for c in "Coffee".chars() {
+            handle_modal_key(&mut app, key(KeyCode::Char(c))).unwrap();
+        }
+        handle_modal_key(&mut app, key(KeyCode::Enter)).unwrap();
+        for c in "12.50".chars() {
+            handle_modal_key(&mut app, key(KeyCode::Char(c))).unwrap();
+        }
+        handle_modal_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert_envelope_detail_modal(&app, &detail);
+        let transactions =
+            queries::load_envelope_txns(&app.conn, &detail.month_id, &detail.envelope_id).unwrap();
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].label, "Coffee");
+        assert_eq!(transactions[0].amount, Money::from_dollars(12.5));
     }
 }

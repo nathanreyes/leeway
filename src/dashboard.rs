@@ -5,7 +5,7 @@
 
 use crate::{
     AddDestination, App, BudgetBlock, ChoiceOption, ConfirmAction, DashFocus, EnvelopeDetail,
-    Modal, ModalAction, PromptKind,
+    EnvelopeDetailFocus, Modal, ModalAction, PromptKind,
     anim::{SummaryAnimations, SummaryTerm, display_cents},
 };
 use anyhow::Result;
@@ -379,6 +379,7 @@ fn open_envelope_detail(app: &mut App, view: &MonthView) {
         app.modal = Some(Modal::EnvelopeDetail(EnvelopeDetail {
             month_id: view.month.id.clone(),
             envelope_id: e.envelope.id.clone(),
+            focus: EnvelopeDetailFocus::Details,
             selected_spend: 0,
         }));
     }
@@ -408,27 +409,18 @@ fn cycle_period(app: &mut App, view: &MonthView) -> Result<()> {
     Ok(())
 }
 
-/// `s` (and Enter on the Envelopes panel): file a spend into the selected manual envelope.
-/// Works for any manual envelope. Automatic envelopes accrue by time, so there's nothing
-/// to file.
+/// `s`: record a transaction in the selected envelope. Automatic envelopes keep it as a
+/// record; manual envelopes also use it to calculate their consumed amount.
 fn feed_spending(app: &mut App, view: &MonthView) {
     if let Some(e) = selected_env(app, view) {
-        match e.envelope.mode {
-            Mode::Manual => app.open_text(
-                format!("Spending label for {}", e.envelope.label),
-                String::new(),
-                PromptKind::EnvelopeSpendLabel {
-                    envelope_id: e.envelope.id.clone(),
-                    month_id: view.month.id.clone(),
-                },
-            ),
-            Mode::Automatic => {
-                app.status = Some(
-                    "Automatic envelopes accrue by time; switch to manual (m) to file spending"
-                        .into(),
-                );
-            }
-        }
+        app.open_text(
+            format!("Transaction label for {}", e.envelope.label),
+            String::new(),
+            PromptKind::EnvelopeSpendLabel {
+                envelope_id: e.envelope.id.clone(),
+                month_id: view.month.id.clone(),
+            },
+        );
     }
 }
 
@@ -1404,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn spend_key_prompts_for_envelope_spending_label() {
+    fn spend_key_prompts_for_envelope_transaction_label() {
         let mut app = app_with_stamped_month();
         app.dash_focus = DashFocus::Envelopes;
         let view = month_view(&app);
@@ -1420,7 +1412,7 @@ mod tests {
 
         match app.modal {
             Some(crate::Modal::Text(prompt)) => {
-                assert_eq!(prompt.title, "Spending label for Dining");
+                assert_eq!(prompt.title, "Transaction label for Dining");
                 match prompt.kind {
                     PromptKind::EnvelopeSpendLabel {
                         envelope_id,
@@ -1433,6 +1425,25 @@ mod tests {
                 }
             }
             _ => panic!("expected text prompt"),
+        }
+    }
+
+    #[test]
+    fn spend_key_allows_automatic_envelope_transactions() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Envelopes;
+        let view = month_view(&app);
+        let envelope_id = view.envelopes[0].envelope.id.clone();
+        ops::set_envelope_mode(&app.conn, &envelope_id, Mode::Automatic).unwrap();
+        let automatic_view = month_view(&app);
+
+        handle_key(&mut app, spend_key(), &Some(automatic_view)).unwrap();
+
+        match app.modal {
+            Some(crate::Modal::Text(prompt)) => {
+                assert_eq!(prompt.title, "Transaction label for Dining");
+            }
+            _ => panic!("expected transaction label prompt"),
         }
     }
 

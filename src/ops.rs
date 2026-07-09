@@ -877,10 +877,10 @@ pub fn add_oneoff_envelope(
     Ok(id)
 }
 
-/// File a spend inside a manual envelope (what "feeds" it — a manual envelope's consumed
-/// amount is the sum of the txns filed in it; see `calc::envelope_consumed`). It's a
-/// hand-entered txn (`series_id NULL`) linked by `envelope_id`, direction Out, and marked
-/// settled since it records money already spent. Returns the new txn id.
+/// Record a transaction inside an envelope. It's a hand-entered txn (`series_id NULL`), linked
+/// by `envelope_id`, direction Out, and marked settled since it records money already spent.
+/// Manual envelopes consume these transactions; automatic envelopes retain them as a record
+/// while continuing to consume only by elapsed time. Returns the new txn id.
 pub fn add_envelope_spending(
     conn: &Connection,
     month_id: &str,
@@ -893,11 +893,11 @@ pub fn add_envelope_spending(
         "INSERT INTO txn (id, month_id, envelope_id, label, direction, amount_cents, settled)
          SELECT ?1, ?2, id, ?4, 'out', ?5, 1
          FROM envelope
-         WHERE id = ?3 AND month_id = ?2 AND mode = 'manual'",
+         WHERE id = ?3 AND month_id = ?2",
         rusqlite::params![id, month_id, envelope_id, label, amount],
     )?;
     if inserted == 0 {
-        anyhow::bail!("manual envelope not found in the selected month");
+        anyhow::bail!("envelope not found in the selected month");
     }
     Ok(id)
 }
@@ -2033,7 +2033,7 @@ mod tests {
     }
 
     #[test]
-    fn envelope_spending_requires_a_manual_envelope_in_the_same_month() {
+    fn envelope_transactions_require_an_envelope_in_the_same_month() {
         let mut conn = db::open_in_memory().unwrap();
         seed_demo(&mut conn).unwrap();
         let current = queries::current_month(&conn).unwrap().unwrap();
@@ -2075,16 +2075,16 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            add_envelope_spending(
-                &conn,
-                &current.id,
-                &automatic,
-                "Lunch",
-                Money::from_dollars(10.0),
-            )
-            .is_err()
-        );
+        let txn_id = add_envelope_spending(
+            &conn,
+            &current.id,
+            &automatic,
+            "Lunch",
+            Money::from_dollars(10.0),
+        )
+        .unwrap();
+        let recorded = queries::load_envelope_txns(&conn, &current.id, &automatic).unwrap();
+        assert!(recorded.iter().any(|txn| txn.id == txn_id));
 
         let err = conn
             .execute(

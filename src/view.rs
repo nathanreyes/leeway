@@ -440,9 +440,10 @@ fn avg_delta(values: &[(Money, Money)]) -> Option<Money> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{Mode, PeriodType};
     use crate::money::Money;
     use crate::{db, ops};
-    use chrono::NaiveDate;
+    use chrono::{Local, NaiveDate};
 
     #[test]
     fn editing_a_balance_moves_whats_left() {
@@ -476,6 +477,48 @@ mod tests {
             after.whats_left.whats_left,
             before.whats_left.whats_left + Money::from_dollars(500.0)
         );
+    }
+
+    #[test]
+    fn automatic_envelope_transactions_do_not_change_whats_left() {
+        let mut conn = db::open_in_memory().unwrap();
+        ops::seed_demo(&mut conn).unwrap();
+        let today = Local::now().date_naive();
+        let month = queries::current_month(&conn).unwrap().unwrap();
+        let envelope_id = ops::add_oneoff_envelope(
+            &conn,
+            &month.id,
+            "Trip",
+            Money::from_dollars(200.0),
+            PeriodType::Monthly,
+            Mode::Automatic,
+        )
+        .unwrap();
+
+        let before = MonthView::build(&conn, today).unwrap().unwrap();
+        let before_trip = before
+            .envelopes
+            .iter()
+            .find(|row| row.envelope.id == envelope_id)
+            .unwrap();
+        ops::add_envelope_spending(
+            &conn,
+            &month.id,
+            &envelope_id,
+            "Flight",
+            Money::from_dollars(75.0),
+        )
+        .unwrap();
+
+        let after = MonthView::build(&conn, today).unwrap().unwrap();
+        let after_trip = after
+            .envelopes
+            .iter()
+            .find(|row| row.envelope.id == envelope_id)
+            .unwrap();
+        assert_eq!(after.whats_left.whats_left, before.whats_left.whats_left);
+        assert_eq!(after_trip.consumed, before_trip.consumed);
+        assert_eq!(after_trip.remaining, before_trip.remaining);
     }
 
     #[test]
