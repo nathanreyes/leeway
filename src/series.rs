@@ -47,7 +47,7 @@ pub fn handle_key(
         KeyCode::Char('j') | KeyCode::Down => move_selection(app, view, 1),
         KeyCode::Char('k') | KeyCode::Up => move_selection(app, view, -1),
         KeyCode::Char('t') => open_range_choice(app, today),
-        // `f` cycles the membership filter (Both → Plans → Ad-hoc). Reset the selection so it
+        // `f` cycles the membership filter (Plans → Ad-hoc → Both). Reset the selection so it
         // doesn't linger past the end of a now-shorter list.
         KeyCode::Char('f') => {
             app.series_filter = app.series_filter.next();
@@ -336,11 +336,11 @@ fn draw_filter(frame: &mut Frame, area: Rect, app: &App) {
     };
     let line = Line::from(vec![
         Span::raw(" "),
-        segment("Both", app.series_filter == SeriesFilter::Both),
-        Span::raw(" "),
         segment("Plans", app.series_filter == SeriesFilter::Plans),
         Span::raw(" "),
         segment("Ad-hoc", app.series_filter == SeriesFilter::AdHoc),
+        Span::raw(" "),
+        segment("Both", app.series_filter == SeriesFilter::Both),
     ]);
     frame.render_widget(
         Paragraph::new(line).block(crate::titled_block(" Filter ")),

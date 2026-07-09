@@ -69,18 +69,19 @@ pub enum PlanFocus {
 /// month). Classification is by `SeriesDetailView.plan_names`: empty ⟺ ad-hoc.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SeriesFilter {
-    Both,
     Plans,
     AdHoc,
+    Both,
 }
 
 impl SeriesFilter {
-    /// Cycle order for the `f` key: Both → Plans → Ad-hoc → Both.
+    /// Cycle order for the `f` key: Plans → Ad-hoc → Both → Plans. Plans leads because it's the
+    /// common case, and seeing the two exclusive halves first gives "Both" (their union) context.
     pub fn next(self) -> Self {
         match self {
-            SeriesFilter::Both => SeriesFilter::Plans,
             SeriesFilter::Plans => SeriesFilter::AdHoc,
             SeriesFilter::AdHoc => SeriesFilter::Both,
+            SeriesFilter::Both => SeriesFilter::Plans,
         }
     }
 }
@@ -493,7 +494,8 @@ fn main() -> Result<()> {
         series_search: String::new(),
         series_search_active: false,
         series_range: SeriesTimeRange::Last12Stamped,
-        series_filter: SeriesFilter::Both,
+        // Land on the common case: series that belong to a plan. `f` cycles to Ad-hoc, then Both.
+        series_filter: SeriesFilter::Plans,
         plan_focus: PlanFocus::Income,
         editor_income_sel: 0,
         editor_expense_sel: 0,
