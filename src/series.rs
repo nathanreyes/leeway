@@ -1,10 +1,10 @@
 //! The Series screen: recurring-item management plus range-scoped trend stats.
 
-use crate::{App, ChoiceOption, ModalAction, PromptKind, Screen};
+use crate::{App, BudgetBlock, ChoiceOption, ConfirmAction, ModalAction, PromptKind, Screen};
 use anyhow::Result;
 use ballpark::models::{Kind, Mode, PeriodType};
 use ballpark::money::Money;
-use ballpark::ops;
+use ballpark::{ops, queries};
 use ballpark::view::{
     SeriesDetailView, SeriesGroup, SeriesPageView, SeriesTimeRange, SeriesTrendPoint,
 };
@@ -45,6 +45,11 @@ pub fn handle_key(
         KeyCode::Char('j') | KeyCode::Down => move_selection(app, view, 1),
         KeyCode::Char('k') | KeyCode::Up => move_selection(app, view, -1),
         KeyCode::Char('t') => open_range_choice(app, today),
+        // `n` creates a series. The list is a flat, grouped sidebar (no block focus), so we
+        // pick the kind with a little menu first, then prompt for the label.
+        KeyCode::Char('n') => open_new_series_choice(app),
+        // `x` deletes the selected series, with the plan/month guard the user asked for.
+        KeyCode::Char('x') => delete_selected_series(app, view)?,
         KeyCode::Char('r') => {
             if let Some(detail) = selected_detail(app, view) {
                 let label = detail.series.label.clone();
@@ -170,6 +175,89 @@ fn open_range_choice(app: &mut App, today: NaiveDate) {
     );
 }
 
+/// The kind chooser for `n`. Each option carries the `BudgetBlock` that fixes the new
+/// series' kind + direction (and, for envelopes, seeds monthly/default-mode); picking one
+/// opens the label prompt via `ModalAction::BeginNewSeries`.
+fn open_new_series_choice(app: &mut App) {
+    app.open_choice(
+        "New series",
+        vec![
+            ChoiceOption {
+                key: 'i',
+                label: "Income (transaction in)".into(),
+                action: Some(ModalAction::BeginNewSeries {
+                    block: BudgetBlock::Income,
+                }),
+            },
+            ChoiceOption {
+                key: 'e',
+                label: "Expense (transaction out)".into(),
+                action: Some(ModalAction::BeginNewSeries {
+                    block: BudgetBlock::Expenses,
+                }),
+            },
+            ChoiceOption {
+                key: 'v',
+                label: "Envelope".into(),
+                action: Some(ModalAction::BeginNewSeries {
+                    block: BudgetBlock::Envelopes,
+                }),
+            },
+            ChoiceOption {
+                key: 'c',
+                label: "Cancel".into(),
+                action: None,
+            },
+        ],
+    );
+}
+
+/// Delete the selected series, guarding references the way the user chose:
+///   - used by any plan  -> refuse, and name the plans (a live FK; remove it there first);
+///   - only in past months -> confirm, noting history/trends are preserved (the copied
+///     `series_id` is intentionally orphaned — see `ops::delete_series`);
+///   - unused anywhere -> a plain confirm.
+fn delete_selected_series(app: &mut App, view: &SeriesPageView) -> Result<()> {
+    let Some(detail) = selected_detail(app, view) else {
+        return Ok(());
+    };
+    let series_id = detail.series.id.clone();
+    let label = detail.series.label.clone();
+
+    let plans = queries::plan_names_for_series(&app.conn, &series_id)?;
+    if !plans.is_empty() {
+        app.status = Some(format!(
+            "“{label}” is used in plans: {} — remove it there first",
+            plans.join(", ")
+        ));
+        return Ok(());
+    }
+
+    let months = queries::series_month_usage(&app.conn, &series_id)?;
+    let title = if months > 0 {
+        format!(
+            "Delete “{label}”? Used in {months} past month{}; history is kept.",
+            if months == 1 { "" } else { "s" }
+        )
+    } else {
+        format!("Delete “{label}”?")
+    };
+    app.open_confirm(title, ConfirmAction::DeleteSeries { series_id });
+    Ok(())
+}
+
+/// Move the selection onto the series with this id (used after creating one). No-op if it
+/// isn't currently visible — e.g. a search filter is hiding it.
+pub fn select_series_by_id(app: &mut App, view: &SeriesPageView, series_id: &str) {
+    let indices = visible_indices(app, view);
+    if let Some(pos) = indices
+        .iter()
+        .position(|&idx| view.details[idx].series.id == series_id)
+    {
+        app.series_sel = pos;
+    }
+}
+
 pub fn draw(frame: &mut Frame, app: &App, view: &SeriesPageView) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
@@ -281,7 +369,11 @@ fn draw_series_list(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageV
     let mut state = ListState::default();
     state.select(selected_row);
 
-    let list = crate::selectable_list(items).block(crate::selectable_block(" Series ", true));
+    // The right column is the range average (stats.avg), not a stored default — a series has
+    // no default amount. Naming it in the title stops the bare money value from reading like
+    // an editable default; the detail pane labels the same figure "avg".
+    let list =
+        crate::selectable_list(items).block(crate::selectable_block(" Series · avg / mo ", true));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -512,25 +604,33 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
         Line::from(vec![
             key(" j/k "),
             Span::raw(" move  "),
-            key(" / "),
-            Span::raw(" search  "),
-            key(" t "),
-            Span::raw(" range  "),
+            key(" n "),
+            Span::raw(" new  "),
             key(" r/c "),
             Span::raw(" label/category  "),
             key(" m/p "),
-            Span::raw(" mode/period"),
+            Span::raw(" mode/period  "),
+            key(" x "),
+            Span::raw(" delete  "),
+            key(" / "),
+            Span::raw(" search  "),
+            key(" t "),
+            Span::raw(" range"),
         ])
     } else {
         Line::from(vec![
             key(" j/k "),
             Span::raw(" move  "),
+            key(" n "),
+            Span::raw(" new  "),
+            key(" r/c "),
+            Span::raw(" label/category  "),
+            key(" x "),
+            Span::raw(" delete  "),
             key(" / "),
             Span::raw(" search  "),
             key(" t "),
-            Span::raw(" range  "),
-            key(" r/c "),
-            Span::raw(" label/category"),
+            Span::raw(" range"),
         ])
     };
     let right = Line::from(vec![

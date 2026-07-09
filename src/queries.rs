@@ -230,6 +230,21 @@ pub fn plan_names_for_series(conn: &Connection, series_id: &str) -> Result<Vec<S
     Ok(rows)
 }
 
+/// How many stamped month instances (txn + envelope rows) still carry this series id.
+/// Used only to phrase the delete confirm: these are copied *soft* references that are
+/// intentionally orphaned when a series is deleted (each instance is a self-contained
+/// snapshot — see the `envelope` table comment in schema.sql), so they never block the
+/// delete the way a live `plan_item` reference does.
+pub fn series_month_usage(conn: &Connection, series_id: &str) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM txn      WHERE series_id = ?1)
+              + (SELECT COUNT(*) FROM envelope WHERE series_id = ?1)",
+        [series_id],
+        |r| r.get(0),
+    )?;
+    Ok(count)
+}
+
 pub fn plan_has_series(conn: &Connection, plan_id: &str, series_id: &str) -> Result<bool> {
     let has: bool = conn.query_row(
         "SELECT EXISTS(

@@ -186,6 +186,11 @@ pub enum ModalAction {
     SetSeriesRange {
         range: SeriesTimeRange,
     },
+    /// Chosen the kind of a new series on the Series page; now prompt for its label. The
+    /// block carries kind + direction (and "is envelope") via its existing helpers.
+    BeginNewSeries {
+        block: BudgetBlock,
+    },
 }
 
 /// A single-line text input. `kind` records what to do with the text on submit.
@@ -210,6 +215,11 @@ pub enum PromptKind {
     /// Edit a series' optional category — affects every plan that includes it.
     SeriesCategory {
         series_id: String,
+    },
+    /// Create a brand-new series on the Series page. The block fixes kind + direction (and
+    /// seeds monthly/default-mode for envelopes); the submitted text is the label.
+    NewSeries {
+        block: BudgetBlock,
     },
     /// Edit a plan_item's per-plan budgeted amount.
     ItemAmount {
@@ -296,6 +306,11 @@ pub enum ConfirmAction {
     DeleteItem {
         id: String,
     },
+    /// Delete a shared series definition. Guarded in `ops::delete_series` (blocked while any
+    /// plan still uses it); orphaning its id on past months is the intended, safe outcome.
+    DeleteSeries {
+        series_id: String,
+    },
     /// Delete a transaction instance from a month.
     DeleteTxn {
         id: String,
@@ -345,6 +360,10 @@ pub struct App {
     pub pending_dash_txn: Option<String>,
     pub pending_dash_env: Option<String>,
     pub pending_dash_account: Option<String>,
+    /// The Series page's counterpart to `pending_select`: after creating a series we stash
+    /// its id here, and the event loop resolves it to the (search-filtered) list position on
+    /// the next reload so the new series lands selected.
+    pub pending_series_select: Option<String>,
     pub modal: Option<Modal>,
     /// A transient one-liner (errors, confirmations) shown in the footer.
     pub status: Option<String>,
@@ -460,6 +479,7 @@ fn main() -> Result<()> {
         pending_dash_txn: None,
         pending_dash_env: None,
         pending_dash_account: None,
+        pending_series_select: None,
         modal: None,
         status: None,
     };
@@ -565,6 +585,10 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
             Screen::Series => {
                 let view =
                     ballpark::view::SeriesPageView::build(&app.conn, today, app.series_range)?;
+                // Resolve "select the series I just created" now that the list is loaded.
+                if let Some(target) = app.pending_series_select.take() {
+                    series::select_series_by_id(app, &view, &target);
+                }
                 let visible_count = series::visible_count(app, &view);
                 clamp(&mut app.series_sel, visible_count);
                 terminal.draw(|f| {
@@ -920,6 +944,13 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
             app.series_range = range;
             app.status = Some(format!("Range: {}", range.label(Local::now().date_naive())));
         }
+        ModalAction::BeginNewSeries { block } => {
+            app.open_text(
+                format!("New {} name", block.noun()),
+                String::new(),
+                PromptKind::NewSeries { block },
+            );
+        }
     }
     Ok(())
 }
@@ -1129,6 +1160,24 @@ fn submit_text(app: &mut App) -> Result<()> {
                 ops::set_series_category(&app.conn, &series_id, Some(&text))?;
             }
         }
+        PromptKind::NewSeries { block } => {
+            if text.is_empty() {
+                app.status = Some(format!("{} name can't be empty", block.noun()));
+            } else {
+                // Same construction the plan/dashboard add path uses (see add_selected_series):
+                // block fixes kind + direction, envelopes seed monthly + default mode.
+                let id = ops::create_series(
+                    &app.conn,
+                    block.kind(),
+                    &text,
+                    block.direction(),
+                    (block == BudgetBlock::Envelopes).then_some(PeriodType::Monthly),
+                    None,
+                )?;
+                app.pending_series_select = Some(id);
+                app.status = Some(format!("Created “{text}”"));
+            }
+        }
         PromptKind::SeriesAddAmount {
             destination,
             block,
@@ -1292,6 +1341,15 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                     ConfirmAction::DeleteItem { id } => {
                         ops::delete_plan_item(&app.conn, &id)?;
                         app.status = Some("Item deleted".into());
+                    }
+                    ConfirmAction::DeleteSeries { series_id } => {
+                        // The UI pre-checks plan usage, but `delete_series` re-checks and
+                        // errors if a plan snuck in; surface that as a status instead of
+                        // crashing the loop.
+                        match ops::delete_series(&app.conn, &series_id) {
+                            Ok(()) => app.status = Some("Series deleted".into()),
+                            Err(e) => app.status = Some(e.to_string()),
+                        }
                     }
                     ConfirmAction::DeleteTxn { id } => {
                         ops::delete_txn(&app.conn, &id)?;

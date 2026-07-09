@@ -1,13 +1,14 @@
 //! The plans screens: a list of templates, and an editor for one plan's items.
 //!
 //! Editing model: focus Income, Expenses, or Envelopes, press `n` to search/create a
-//! series in that block, then fill the plan amount. Later edits still use single-key
-//! actions (`r` label, `a` amount, `m`/`p` cycle envelope coded fields).
+//! series in that block, then fill the plan amount. The editor only touches plan-scoped
+//! things — `a` sets this plan's amount, `x` removes the item from this plan. Editing the
+//! shared series itself (label, category, mode, period) lives on the Series page (`S`), so a
+//! plan can never silently rewrite a definition used by other plans.
 
 use crate::{AddDestination, App, BudgetBlock, ConfirmAction, PlanFocus, PromptKind, Screen};
 use anyhow::Result;
 use ballpark::models::{Direction, Kind, Mode, PeriodType, Plan, PlanEntry};
-use ballpark::ops;
 use ballpark::queries::PlanSummary;
 use chrono::Local;
 use ratatui::Frame;
@@ -184,17 +185,12 @@ pub fn handle_editor_key(
             budget_block_for_focus(app.plan_focus),
         )?,
 
-        // `r` edits the shared series label (affects every plan); `a` edits this plan's amount.
-        KeyCode::Char('r') => {
-            if let Some(en) = selected_entry(app, entries) {
-                app.open_text_replace_on_type(
-                    "Series label (shared across plans)",
-                    en.series.label.clone(),
-                    PromptKind::SeriesLabel {
-                        series_id: en.series.id.clone(),
-                    },
-                );
-            }
+        // The plan editor only changes plan-scoped things: which series are in the plan and
+        // this plan's amount for each. Label, mode, and period belong to the *shared* series
+        // (they'd change every plan), so those edits live on the Series page. Redirect the
+        // old keys there rather than leaving them as silent dead ends.
+        KeyCode::Char('r') | KeyCode::Char('m') | KeyCode::Char('p') => {
+            app.status = Some("Edit the series itself on the Series page (S)".into());
         }
         KeyCode::Char('a') => {
             if let Some(en) = selected_entry(app, entries) {
@@ -205,34 +201,6 @@ pub fn handle_editor_key(
                         id: en.item_id.clone(),
                     },
                 );
-            }
-        }
-
-        // Cycle the envelope coded fields on the SERIES (affects every plan that uses it).
-        KeyCode::Char('m') => {
-            if app.plan_focus != PlanFocus::Envelopes {
-                app.status = Some("Mode applies to envelopes".into());
-            } else if let Some(en) = selected_entry(app, entries) {
-                // Envelope series always carry a concrete mode; toggle automatic <-> manual.
-                let next = match en.series.mode {
-                    Some(Mode::Manual) => Mode::Automatic,
-                    _ => Mode::Manual,
-                };
-                ops::set_series_mode(&app.conn, &en.series.id, next)?;
-                app.status = Some("Mode changed (affects all plans using this series)".into());
-            }
-        }
-        KeyCode::Char('p') => {
-            if app.plan_focus != PlanFocus::Envelopes {
-                app.status = Some("Period applies to envelopes".into());
-            } else if let Some(en) = selected_entry(app, entries) {
-                let next = match en.series.period_type {
-                    Some(PeriodType::Daily) => PeriodType::Weekly,
-                    Some(PeriodType::Weekly) => PeriodType::Monthly,
-                    Some(PeriodType::Monthly) | None => PeriodType::Daily,
-                };
-                ops::set_series_period(&app.conn, &en.series.id, next)?;
-                app.status = Some("Period changed (affects all plans using this series)".into());
             }
         }
 
@@ -355,38 +323,20 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
     draw_plan_block(frame, expense_area, app, entries, PlanFocus::Expenses);
     draw_plan_block(frame, env_area, app, entries, PlanFocus::Envelopes);
 
-    let hints = match app.plan_focus {
-        PlanFocus::Income | PlanFocus::Expenses => Line::from(vec![
-            key(" Tab "),
-            Span::raw(" block  "),
-            key(" j/k "),
-            Span::raw(" move  "),
-            key(" n "),
-            Span::raw(" new  "),
-            key(" r "),
-            Span::raw(" rename  "),
-            key(" a "),
-            Span::raw(" amount  "),
-            key(" x "),
-            Span::raw(" remove"),
-        ]),
-        PlanFocus::Envelopes => Line::from(vec![
-            key(" Tab "),
-            Span::raw(" block  "),
-            key(" j/k "),
-            Span::raw(" move  "),
-            key(" n "),
-            Span::raw(" new  "),
-            key(" r "),
-            Span::raw(" rename  "),
-            key(" a "),
-            Span::raw(" amount  "),
-            key(" m/p "),
-            Span::raw(" mode/period  "),
-            key(" x "),
-            Span::raw(" remove"),
-        ]),
-    };
+    // The editor's verbs are the same in every block now that series-definition edits moved
+    // to the Series page: add, set this plan's amount, remove from this plan.
+    let hints = Line::from(vec![
+        key(" Tab "),
+        Span::raw(" block  "),
+        key(" j/k "),
+        Span::raw(" move  "),
+        key(" n "),
+        Span::raw(" new  "),
+        key(" a "),
+        Span::raw(" amount  "),
+        key(" x "),
+        Span::raw(" remove"),
+    ]);
     let nav_hints = Line::from(vec![
         key(" S "),
         Span::raw(" series  "),
@@ -480,6 +430,7 @@ fn key(label: &str) -> Span<'static> {
 mod tests {
     use super::*;
     use ballpark::money::Money;
+    use ballpark::ops;
     use ballpark::queries;
     use ratatui::crossterm::event::KeyModifiers;
     use rusqlite::Connection;
@@ -539,6 +490,7 @@ mod tests {
             pending_dash_txn: None,
             pending_dash_env: None,
             pending_dash_account: None,
+            pending_series_select: None,
             modal: None,
             status: None,
         };
@@ -548,6 +500,10 @@ mod tests {
 
     fn direction_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+    }
+
+    fn rename_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)
     }
 
     fn backtab_key() -> KeyEvent {
@@ -563,6 +519,22 @@ mod tests {
 
         handle_editor_key(&mut app, backtab_key(), &plan, &entries).unwrap();
         assert!(app.plan_focus == PlanFocus::Envelopes);
+    }
+
+    #[test]
+    fn rename_key_no_longer_edits_shared_series_label() {
+        // Series-definition edits moved to the Series page; `r` in the plan editor must not
+        // open a rename prompt or touch the shared label — it just points the user there.
+        let (mut app, plan, entries, rent_series_id) = app_with_transaction_plan();
+
+        handle_editor_key(&mut app, rename_key(), &plan, &entries).unwrap();
+
+        assert!(app.modal.is_none(), "no rename prompt opened");
+        assert!(app.status.is_some(), "shows a redirect hint instead");
+        let series = queries::get_series(&app.conn, &rent_series_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(series.label, "Rent", "shared label untouched");
     }
 
     #[test]

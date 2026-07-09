@@ -1069,6 +1069,7 @@ mod tests {
             pending_dash_txn: None,
             pending_dash_env: None,
             pending_dash_account: None,
+            pending_series_select: None,
             modal: None,
             status: None,
         }

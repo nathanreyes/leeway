@@ -1134,6 +1134,43 @@ mod tests {
     }
 
     #[test]
+    fn series_month_usage_counts_instances_and_delete_guards_plans() {
+        let mut conn = db::open_in_memory().unwrap();
+        let plan = create_plan(&conn, "P").unwrap();
+        let rent = create_series(
+            &conn,
+            Kind::Transaction,
+            "Rent",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        add_plan_item(&conn, &plan, &rent, Money::from_dollars(1000.0)).unwrap();
+
+        // Not stamped yet: no month instance carries the series id.
+        assert_eq!(queries::series_month_usage(&conn, &rent).unwrap(), 0);
+        // ...but a plan uses it, so delete is blocked.
+        assert!(delete_series(&conn, &rent).is_err());
+
+        let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        stamp(&mut conn, &plan, "2026-09", start, 30).unwrap();
+
+        // After stamping, exactly one instance references the series (the warn-in-months case).
+        assert_eq!(queries::series_month_usage(&conn, &rent).unwrap(), 1);
+
+        // Removing it from the plan clears the live reference; the stamped month still counts,
+        // and delete now succeeds (orphaning that historical id, by design).
+        let item = queries::load_plan_entries(&conn, &plan).unwrap()[0]
+            .item_id
+            .clone();
+        delete_plan_item(&conn, &item).unwrap();
+        assert_eq!(queries::series_month_usage(&conn, &rent).unwrap(), 1);
+        delete_series(&conn, &rent).unwrap();
+        assert_eq!(queries::series_month_usage(&conn, &rent).unwrap(), 1);
+    }
+
+    #[test]
     fn mark_and_unmark_paid_roundtrip() {
         let mut conn = db::open_in_memory().unwrap();
         seed_demo(&mut conn).unwrap();
