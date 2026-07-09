@@ -5,7 +5,7 @@
 
 use crate::{
     AddDestination, App, BudgetBlock, ChoiceOption, ConfirmAction, DashFocus, EnvelopeDetail,
-    EnvelopeDetailFocus, Modal, ModalAction, PromptKind,
+    EnvelopeDetailFocus, ModalAction, PromptKind,
     anim::{SummaryAnimations, SummaryTerm, display_cents},
 };
 use anyhow::Result;
@@ -110,7 +110,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
             DashFocus::Header => {}
         },
 
-        // Enter / Space = the focused panel's primary action.
+        // Enter opens an envelope's dedicated detail screen; otherwise it performs the focused
+        // row's primary action. Space always keeps the lightweight primary action.
+        KeyCode::Enter if app.dash_focus == DashFocus::Envelopes => {
+            open_envelope_detail(app, view);
+        }
         KeyCode::Enter | KeyCode::Char(' ') => act_on_focus(app, view)?,
 
         // `n` = create something in the focused panel.
@@ -128,13 +132,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         KeyCode::Char('r') | KeyCode::Char('a') | KeyCode::Char('m') | KeyCode::Char('p')
             if app.dash_focus == DashFocus::Envelopes =>
         {
-            app.status = Some("Press e to edit envelope details".into());
+            app.status = Some("Press Enter to edit envelope details".into());
         }
         KeyCode::Char('r') => edit_label(app, view), // rename / label
         KeyCode::Char('a') => edit_amount(app, view), // amount
         KeyCode::Char('m') => cycle_mode(app, view)?, // envelope mode
         KeyCode::Char('p') => cycle_period(app, view)?, // envelope period type
-        KeyCode::Char('s') => feed_spending(app, view), // file spending into a manual envelope
+        KeyCode::Char('s') => feed_spending(app, view), // record an envelope transaction
         KeyCode::Char('x') => delete_selected(app, view), // delete this month's row
 
         // Carry balance is account-only: checking reserves cash, cards forgive deferred debt.
@@ -144,14 +148,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
             }
         }
 
-        // `e` is the Accounts panel's edit alias (Enter also works there).
-        KeyCode::Char('e') => {
-            if app.dash_focus == DashFocus::Accounts {
-                act_on_focus(app, view)?;
-            } else if app.dash_focus == DashFocus::Envelopes {
-                open_envelope_detail(app, view);
-            }
-        }
         // Edit a credit card's limit (rarely changed, so it gets its own key).
         KeyCode::Char('l') if app.dash_focus == DashFocus::Accounts => {
             if let Some(acct) = view.accounts.get(app.dash_acct_sel)
@@ -376,12 +372,14 @@ fn edit_amount(app: &mut App, view: &MonthView) {
 
 fn open_envelope_detail(app: &mut App, view: &MonthView) {
     if let Some(e) = selected_env(app, view) {
-        app.modal = Some(Modal::EnvelopeDetail(EnvelopeDetail {
-            month_id: view.month.id.clone(),
-            envelope_id: e.envelope.id.clone(),
-            focus: EnvelopeDetailFocus::Details,
-            selected_spend: 0,
-        }));
+        app.screen = crate::Screen::EnvelopeDetail {
+            detail: EnvelopeDetail {
+                month_id: view.month.id.clone(),
+                envelope_id: e.envelope.id.clone(),
+                focus: EnvelopeDetailFocus::Details,
+                selected_spend: 0,
+            },
+        };
     }
 }
 
@@ -434,7 +432,10 @@ fn delete_selected(app: &mut App, view: &MonthView) {
         );
     } else if let Some(e) = selected_env(app, view) {
         app.open_confirm(
-            format!("Delete envelope “{}” and its spending?", e.envelope.label),
+            format!(
+                "Delete envelope “{}” and its transactions?",
+                e.envelope.label
+            ),
             ConfirmAction::DeleteEnvelope {
                 id: e.envelope.id.clone(),
             },
@@ -465,7 +466,8 @@ fn step_month(app: &mut App, delta: i32) {
     app.dash_acct_sel = 0;
 }
 
-/// Do the focused panel's action: settle a bill, or open the balance-edit prompt.
+/// Do the focused panel's lightweight action: settle a bill, record an envelope transaction,
+/// or open the balance-edit prompt. Enter opens an envelope's full detail screen instead.
 fn act_on_focus(app: &mut App, view: &MonthView) -> Result<()> {
     match app.dash_focus {
         DashFocus::Income | DashFocus::Expenses => {
@@ -473,8 +475,7 @@ fn act_on_focus(app: &mut App, view: &MonthView) -> Result<()> {
                 ops::toggle_settled(&app.conn, &txn.id, txn.settled)?;
             }
         }
-        // On the envelopes panel the primary action is to file a spend (manual envelopes);
-        // for automatic ones `feed_spending` shows the "accrues by time" hint instead.
+        // Space records a transaction without leaving the dashboard. Enter opens details.
         DashFocus::Envelopes => feed_spending(app, view),
         DashFocus::Accounts => {
             if let Some(acct) = view.accounts.get(app.dash_acct_sel) {
@@ -618,10 +619,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             Span::raw(" panel  "),
             key(" j/k "),
             Span::raw(" move  "),
-            key(" s "),
-            Span::raw(" spend  "),
-            key(" e "),
+            key(" Enter "),
             Span::raw(" detail  "),
+            key(" s "),
+            Span::raw(" record  "),
             key(" n "),
             Span::raw(" new  "),
             key(" x "),
@@ -1181,8 +1182,8 @@ mod tests {
         KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)
     }
 
-    fn edit_key() -> KeyEvent {
-        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)
+    fn enter_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
     }
 
     fn spend_key() -> KeyEvent {
@@ -1343,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn period_key_points_envelope_edits_to_detail_modal() {
+    fn period_key_points_envelope_edits_to_detail_screen() {
         let mut app = app_with_stamped_month();
         app.dash_focus = DashFocus::Envelopes;
         let view = month_view(&app);
@@ -1359,7 +1360,7 @@ mod tests {
 
         assert_eq!(
             app.status.as_deref(),
-            Some("Press e to edit envelope details")
+            Some("Press Enter to edit envelope details")
         );
         let refreshed = month_view(&app);
         let dining = refreshed
@@ -1371,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_key_opens_envelope_detail_modal() {
+    fn enter_key_opens_envelope_detail_screen() {
         let mut app = app_with_stamped_month();
         app.dash_focus = DashFocus::Envelopes;
         let view = month_view(&app);
@@ -1383,16 +1384,34 @@ mod tests {
         let expected_id = dining.envelope.id.clone();
         let expected_month_id = view.month.id.clone();
 
-        handle_key(&mut app, edit_key(), &Some(view)).unwrap();
+        handle_key(&mut app, enter_key(), &Some(view)).unwrap();
 
-        match app.modal {
-            Some(crate::Modal::EnvelopeDetail(detail)) => {
+        match app.screen {
+            Screen::EnvelopeDetail { detail } => {
                 assert_eq!(detail.envelope_id, expected_id);
                 assert_eq!(detail.month_id, expected_month_id);
+                assert_eq!(detail.focus, EnvelopeDetailFocus::Details);
                 assert_eq!(detail.selected_spend, 0);
             }
-            _ => panic!("expected envelope detail modal"),
+            _ => panic!("expected envelope detail screen"),
         }
+    }
+
+    #[test]
+    fn e_key_does_not_open_envelope_detail() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Envelopes;
+        let view = month_view(&app);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            &Some(view),
+        )
+        .unwrap();
+
+        assert!(matches!(app.screen, Screen::Dashboard));
+        assert!(app.modal.is_none());
     }
 
     #[test]

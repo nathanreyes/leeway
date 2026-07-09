@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 /// that's how the loop knows which plan's items to load.
 pub enum Screen {
     Dashboard,
+    EnvelopeDetail { detail: EnvelopeDetail },
     Series,
     Plans,
     PlanEditor { plan_id: String },
@@ -93,7 +94,6 @@ impl SeriesFilter {
 pub enum Modal {
     Text(TextPrompt),
     SeriesSearch(SeriesSearch),
-    EnvelopeDetail(EnvelopeDetail),
     Confirm(Confirm),
     Choice(Choice),
 }
@@ -692,6 +692,30 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                 }
             }
 
+            Screen::EnvelopeDetail { detail } => {
+                let detail = detail.clone();
+                // The envelope may have been deleted from a confirmation dialog. Return to the
+                // dashboard rather than rendering a stale drill-in screen.
+                if load_detail_envelope(app, &detail)?.is_none() {
+                    app.screen = Screen::Dashboard;
+                    app.status = Some("Envelope no longer exists".into());
+                    continue;
+                }
+
+                terminal.draw(|f| {
+                    draw_envelope_detail_screen(f, app, &detail);
+                    draw_modal(f, app);
+                })?;
+                if let Some(key) = read_key(IDLE_TICK)? {
+                    if app.modal.is_some() {
+                        handle_modal_key(app, key)?;
+                    } else if handle_global_key(app, key) {
+                    } else {
+                        handle_envelope_detail_key(app, key)?;
+                    }
+                }
+            }
+
             Screen::Series => {
                 let view =
                     ballpark::view::SeriesPageView::build(&app.conn, today, app.series_range)?;
@@ -975,7 +999,6 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match app.modal.as_ref() {
         Some(Modal::Text(_)) => handle_text_key(app, key),
         Some(Modal::SeriesSearch(_)) => handle_series_search_key(app, key),
-        Some(Modal::EnvelopeDetail(_)) => handle_envelope_detail_key(app, key),
         Some(Modal::Confirm(_)) => handle_confirm_key(app, key),
         Some(Modal::Choice(_)) => handle_choice_key(app, key),
         None => Ok(()),
@@ -983,21 +1006,21 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
 }
 
 fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let Some(Modal::EnvelopeDetail(detail)) = app.modal.as_ref() else {
+    let Screen::EnvelopeDetail { detail } = &app.screen else {
         return Ok(());
     };
     let detail = detail.clone();
     let Some(envelope) = load_detail_envelope(app, &detail)? else {
-        app.modal = None;
+        app.screen = Screen::Dashboard;
         app.status = Some("Envelope no longer exists".into());
         return Ok(());
     };
     let spending = queries::load_envelope_txns(&app.conn, &detail.month_id, &detail.envelope_id)?;
 
     match key.code {
-        KeyCode::Esc => app.modal = None,
+        KeyCode::Esc => app.screen = Screen::Dashboard,
         KeyCode::Tab | KeyCode::BackTab => {
-            if let Some(Modal::EnvelopeDetail(detail)) = &mut app.modal {
+            if let Screen::EnvelopeDetail { detail } = &mut app.screen {
                 detail.focus = detail.focus.other();
             }
         }
@@ -1060,14 +1083,14 @@ fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
             },
             EnvelopeDetailFocus::Transactions => match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
-                    if let Some(Modal::EnvelopeDetail(detail)) = &mut app.modal
+                    if let Screen::EnvelopeDetail { detail } = &mut app.screen
                         && detail.selected_spend + 1 < spending.len()
                     {
                         detail.selected_spend += 1;
                     }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    if let Some(Modal::EnvelopeDetail(detail)) = &mut app.modal {
+                    if let Screen::EnvelopeDetail { detail } = &mut app.screen {
                         detail.selected_spend = detail.selected_spend.saturating_sub(1);
                     }
                 }
@@ -1246,9 +1269,9 @@ fn finish_restamp(app: &mut App, message: &str) {
     app.status = Some(message.to_string());
 }
 
-fn restore_envelope_detail_modal(app: &mut App, detail: Option<EnvelopeDetail>) {
+fn restore_envelope_detail_screen(app: &mut App, detail: Option<EnvelopeDetail>) {
     if let Some(detail) = detail {
-        app.modal = Some(Modal::EnvelopeDetail(detail));
+        app.screen = Screen::EnvelopeDetail { detail };
     }
 }
 
@@ -1262,7 +1285,7 @@ fn handle_text_key(app: &mut App, key: KeyEvent) -> Result<()> {
                     None
                 }
             };
-            restore_envelope_detail_modal(app, return_to);
+            restore_envelope_detail_screen(app, return_to);
         }
         KeyCode::Enter => submit_text(app)?,
         KeyCode::Backspace => {
@@ -1728,7 +1751,7 @@ fn submit_text(app: &mut App) -> Result<()> {
         },
     }
     if app.modal.is_none() {
-        restore_envelope_detail_modal(app, return_to_envelope_detail);
+        restore_envelope_detail_screen(app, return_to_envelope_detail);
     }
     Ok(())
 }
@@ -1774,8 +1797,10 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         }
                     }
                 }
-                if !deletes_parent_envelope && app.modal.is_none() {
-                    restore_envelope_detail_modal(app, return_to);
+                if deletes_parent_envelope && return_to.is_some() {
+                    app.screen = Screen::Dashboard;
+                } else if app.modal.is_none() {
+                    restore_envelope_detail_screen(app, return_to);
                 }
             }
         }
@@ -1787,7 +1812,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                     None
                 }
             };
-            restore_envelope_detail_modal(app, return_to);
+            restore_envelope_detail_screen(app, return_to);
         }
         _ => {}
     }
@@ -1878,8 +1903,8 @@ pub(crate) fn suggested_stamp_label(conn: &Connection, today: NaiveDate) -> Resu
 // --- Modal rendering -----------------------------------------------------------
 
 /// Draw the open modal (if any) as a centered popup over the current screen.
-fn draw_modal(frame: &mut Frame, app: &App) {
-    let Some(modal) = &app.modal else { return };
+fn draw_modal(frame: &mut Frame, _app: &App) {
+    let Some(modal) = &_app.modal else { return };
 
     match modal {
         Modal::Text(prompt) => {
@@ -1914,7 +1939,6 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(Paragraph::new(body).block(block), area);
         }
         Modal::SeriesSearch(prompt) => draw_series_search_modal(frame, prompt),
-        Modal::EnvelopeDetail(detail) => draw_envelope_detail_modal(frame, app, detail),
         Modal::Confirm(confirm) => {
             let area = centered_rect(60, 20, frame.area());
             frame.render_widget(Clear, area);
@@ -1955,9 +1979,8 @@ fn draw_modal(frame: &mut Frame, app: &App) {
     }
 }
 
-fn draw_envelope_detail_modal(frame: &mut Frame, app: &App, detail: &EnvelopeDetail) {
-    let area = centered_rect(76, 72, frame.area());
-    frame.render_widget(Clear, area);
+fn draw_envelope_detail_screen(frame: &mut Frame, app: &App, detail: &EnvelopeDetail) {
+    let area = frame.area();
 
     let (title, details, transactions) = match envelope_detail_content(app, detail) {
         Ok(content) => content,
@@ -1987,14 +2010,12 @@ fn draw_envelope_detail_modal(frame: &mut Frame, app: &App, detail: &EnvelopeDet
         Constraint::Min(7),
         Constraint::Length(1),
     ])
-    .spacing(1)
     .areas(inner);
     draw_envelope_detail_section(
         frame,
         details_area,
         " Details ",
         details,
-        details_footer_line(),
         detail.focus == EnvelopeDetailFocus::Details,
     );
     draw_envelope_detail_section(
@@ -2002,12 +2023,18 @@ fn draw_envelope_detail_modal(frame: &mut Frame, app: &App, detail: &EnvelopeDet
         transactions_area,
         " Transactions ",
         transactions,
-        transactions_footer_line(),
         detail.focus == EnvelopeDetailFocus::Transactions,
     );
-    frame.render_widget(
-        Paragraph::new(envelope_detail_navigation_line()),
+    let focused_commands = match detail.focus {
+        EnvelopeDetailFocus::Details => details_footer_line(),
+        EnvelopeDetailFocus::Transactions => transactions_footer_line(),
+    };
+    crate::draw_split_status_footer(
+        frame,
         footer_area,
+        focused_commands,
+        envelope_detail_navigation_line(),
+        &app.status,
     );
 }
 
@@ -2016,18 +2043,12 @@ fn draw_envelope_detail_section(
     area: Rect,
     title: &'static str,
     lines: Vec<Line<'static>>,
-    controls: Line<'static>,
     focused: bool,
 ) {
     let block = focusable_block(title, focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [content_area, controls_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
-    frame.render_widget(Paragraph::new(lines), content_area);
-    if focused {
-        frame.render_widget(Paragraph::new(controls), controls_area);
-    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn details_footer_line() -> Line<'static> {
@@ -2062,10 +2083,16 @@ fn transactions_footer_line() -> Line<'static> {
 
 fn envelope_detail_navigation_line() -> Line<'static> {
     Line::from(vec![
-        Span::styled(" Tab ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::styled(" switch section  ", Style::default().fg(Color::Gray)),
+        modal_key(" Tab "),
+        Span::styled(" section  ", Style::default().fg(Color::Gray)),
         modal_key(" Esc "),
-        Span::styled(" close", Style::default().fg(Color::Gray)),
+        Span::styled(" back  ", Style::default().fg(Color::Gray)),
+        modal_key(" P "),
+        Span::styled(" plans  ", Style::default().fg(Color::Gray)),
+        modal_key(" S "),
+        Span::styled(" series  ", Style::default().fg(Color::Gray)),
+        modal_key(" q "),
+        Span::styled(" quit", Style::default().fg(Color::Gray)),
     ])
 }
 
@@ -2381,7 +2408,9 @@ mod tests {
 
         let app = App {
             conn,
-            screen: Screen::Dashboard,
+            screen: Screen::EnvelopeDetail {
+                detail: detail.clone(),
+            },
             should_quit: false,
             dash_focus: DashFocus::Envelopes,
             viewed_year: 2026,
@@ -2407,30 +2436,30 @@ mod tests {
             pending_series_select: None,
             summary_anims: SummaryAnimations::new(),
             frame_now: Instant::now(),
-            modal: Some(Modal::EnvelopeDetail(detail.clone())),
+            modal: None,
             status: None,
         };
 
         (app, detail, envelope.id)
     }
 
-    fn assert_envelope_detail_modal(app: &App, expected: &EnvelopeDetail) {
-        match &app.modal {
-            Some(Modal::EnvelopeDetail(actual)) => {
+    fn assert_envelope_detail_screen(app: &App, expected: &EnvelopeDetail) {
+        match &app.screen {
+            Screen::EnvelopeDetail { detail: actual } => {
                 assert_eq!(actual.month_id, expected.month_id);
                 assert_eq!(actual.envelope_id, expected.envelope_id);
                 assert_eq!(actual.focus, expected.focus);
                 assert_eq!(actual.selected_spend, expected.selected_spend);
             }
-            _ => panic!("expected envelope detail modal"),
+            _ => panic!("expected envelope detail screen"),
         }
     }
 
     #[test]
-    fn canceling_envelope_label_prompt_returns_to_detail_modal() {
+    fn canceling_envelope_label_prompt_returns_to_detail_screen() {
         let (mut app, detail, _) = app_with_envelope_detail();
 
-        handle_modal_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('r'))).unwrap();
         match &app.modal {
             Some(Modal::Text(prompt)) => {
                 assert_eq!(prompt.title, "Envelope label");
@@ -2441,20 +2470,20 @@ mod tests {
 
         handle_modal_key(&mut app, key(KeyCode::Esc)).unwrap();
 
-        assert_envelope_detail_modal(&app, &detail);
+        assert_envelope_detail_screen(&app, &detail);
     }
 
     #[test]
-    fn submitting_envelope_label_returns_to_detail_modal() {
+    fn submitting_envelope_label_returns_to_detail_screen() {
         let (mut app, detail, envelope_id) = app_with_envelope_detail();
 
-        handle_modal_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('r'))).unwrap();
         for c in "Travel".chars() {
             handle_modal_key(&mut app, key(KeyCode::Char(c))).unwrap();
         }
         handle_modal_key(&mut app, key(KeyCode::Enter)).unwrap();
 
-        assert_envelope_detail_modal(&app, &detail);
+        assert_envelope_detail_screen(&app, &detail);
         let envelope = queries::load_envelopes(&app.conn, &detail.month_id)
             .unwrap()
             .into_iter()
@@ -2468,19 +2497,19 @@ mod tests {
         let (mut app, detail, _) = app_with_envelope_detail();
 
         // Details owns envelope-level edits at first; transaction creation is inert here.
-        handle_modal_key(&mut app, key(KeyCode::Char('s'))).unwrap();
-        assert_envelope_detail_modal(&app, &detail);
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('s'))).unwrap();
+        assert_envelope_detail_screen(&app, &detail);
 
-        handle_modal_key(&mut app, key(KeyCode::Tab)).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Tab)).unwrap();
         let mut transactions_detail = detail.clone();
         transactions_detail.focus = EnvelopeDetailFocus::Transactions;
-        assert_envelope_detail_modal(&app, &transactions_detail);
+        assert_envelope_detail_screen(&app, &transactions_detail);
 
         // Transactions own transaction creation; envelope label edits are inert here.
-        handle_modal_key(&mut app, key(KeyCode::Char('r'))).unwrap();
-        assert_envelope_detail_modal(&app, &transactions_detail);
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+        assert_envelope_detail_screen(&app, &transactions_detail);
 
-        handle_modal_key(&mut app, key(KeyCode::Char('s'))).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('s'))).unwrap();
         match &app.modal {
             Some(Modal::Text(prompt)) => {
                 assert_eq!(prompt.title, "Transaction label for Dining");
@@ -2497,12 +2526,21 @@ mod tests {
     }
 
     #[test]
-    fn canceling_envelope_spend_amount_returns_to_detail_modal() {
+    fn escape_returns_from_envelope_detail_to_dashboard() {
+        let (mut app, _, _) = app_with_envelope_detail();
+
+        handle_envelope_detail_key(&mut app, key(KeyCode::Esc)).unwrap();
+
+        assert!(matches!(app.screen, Screen::Dashboard));
+    }
+
+    #[test]
+    fn canceling_envelope_spend_amount_returns_to_detail_screen() {
         let (mut app, mut detail, _) = app_with_envelope_detail();
-        handle_modal_key(&mut app, key(KeyCode::Tab)).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Tab)).unwrap();
         detail.focus = EnvelopeDetailFocus::Transactions;
 
-        handle_modal_key(&mut app, key(KeyCode::Char('s'))).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('s'))).unwrap();
         for c in "Coffee".chars() {
             handle_modal_key(&mut app, key(KeyCode::Char(c))).unwrap();
         }
@@ -2517,17 +2555,17 @@ mod tests {
 
         handle_modal_key(&mut app, key(KeyCode::Esc)).unwrap();
 
-        assert_envelope_detail_modal(&app, &detail);
+        assert_envelope_detail_screen(&app, &detail);
     }
 
     #[test]
     fn automatic_envelope_accepts_recorded_transactions() {
         let (mut app, mut detail, envelope_id) = app_with_envelope_detail();
         ops::set_envelope_mode(&app.conn, &envelope_id, Mode::Automatic).unwrap();
-        handle_modal_key(&mut app, key(KeyCode::Tab)).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Tab)).unwrap();
         detail.focus = EnvelopeDetailFocus::Transactions;
 
-        handle_modal_key(&mut app, key(KeyCode::Char('s'))).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('s'))).unwrap();
         for c in "Coffee".chars() {
             handle_modal_key(&mut app, key(KeyCode::Char(c))).unwrap();
         }
@@ -2537,7 +2575,7 @@ mod tests {
         }
         handle_modal_key(&mut app, key(KeyCode::Enter)).unwrap();
 
-        assert_envelope_detail_modal(&app, &detail);
+        assert_envelope_detail_screen(&app, &detail);
         let transactions =
             queries::load_envelope_txns(&app.conn, &detail.month_id, &detail.envelope_id).unwrap();
         assert_eq!(transactions.len(), 1);

@@ -79,12 +79,12 @@ Common dashboard keys:
 
 - `Tab` / `Shift+Tab`: move between panels.
 - `j` / `k` or arrow keys: move within the focused panel.
-- `Enter` / `Space`: perform the focused row's primary action.
+- `Enter`: perform the focused row's primary action; opens the selected envelope.
+- `Space`: perform the focused row's lightweight action without leaving the dashboard.
 - `n`: add an item to the focused panel.
 - `r`: rename the focused item.
 - `a`: edit an amount.
-- `s`: add spending to a manual envelope.
-- `e`: open envelope details and spending management.
+- `s`: record a transaction in the selected envelope.
 - `P`: open Plans.
 - `S`: open Series and trends.
 - `q` / `Esc`: quit.
