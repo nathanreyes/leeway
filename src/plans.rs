@@ -402,9 +402,8 @@ fn entry_row(entry: &PlanEntry, focus: PlanFocus) -> ListItem<'static> {
         ]),
         PlanFocus::Envelopes => {
             let period = match s.period_type {
-                Some(PeriodType::Daily) => "daily",
-                Some(PeriodType::Weekly) => "weekly",
-                _ => "monthly",
+                Some(PeriodType::Daily) => "/day",
+                Some(PeriodType::Weekly) | Some(PeriodType::Monthly) | None => "/mo",
             };
             // Envelope series always carry a concrete mode; None is unreachable here.
             let mode = match s.mode {
@@ -414,10 +413,10 @@ fn entry_row(entry: &PlanEntry, focus: PlanFocus) -> ListItem<'static> {
             Line::from(vec![
                 Span::raw(format!("{:<18}", crate::truncate(&s.label, 18))),
                 Span::styled(
-                    format!("{:<8}{:<8}", period, mode),
+                    format!("{:<6}{:<8}", period, mode),
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::raw(format!("{:>12}", entry.amount.to_string())),
+                Span::raw(format!("{:>14}", entry.amount.to_string())),
             ])
         }
     };

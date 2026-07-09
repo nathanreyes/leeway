@@ -18,11 +18,11 @@ mod plans;
 mod series;
 
 use anim::SummaryAnimations;
-use anyhow::Result;
-use ballpark::models::{AccountType, Direction, Kind, PeriodType, Series};
+use anyhow::{Context, Result};
+use ballpark::models::{AccountType, Direction, Kind, Mode, PeriodType, Series, Txn};
 use ballpark::money::Money;
 use ballpark::view::SeriesTimeRange;
-use ballpark::{db, ops, queries};
+use ballpark::{calc, db, ops, queries};
 use chrono::{Datelike, Local, NaiveDate};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
@@ -93,6 +93,7 @@ impl SeriesFilter {
 pub enum Modal {
     Text(TextPrompt),
     SeriesSearch(SeriesSearch),
+    EnvelopeDetail(EnvelopeDetail),
     Confirm(Confirm),
     Choice(Choice),
 }
@@ -172,6 +173,13 @@ pub struct SeriesSearch {
     pub all_series: Vec<Series>,
 }
 
+#[derive(Clone)]
+pub struct EnvelopeDetail {
+    pub month_id: String,
+    pub envelope_id: String,
+    pub selected_spend: usize,
+}
+
 /// A little menu: each option has a hotkey, a label, and an action (`None` = just cancel).
 pub struct Choice {
     pub title: String,
@@ -224,6 +232,7 @@ pub struct TextPrompt {
     pub help: Vec<String>,
     pub replace_on_next_char: bool,
     pub kind: PromptKind,
+    pub return_to_envelope_detail: Option<EnvelopeDetail>,
 }
 
 /// What a text prompt's submitted value means.
@@ -299,23 +308,37 @@ pub enum PromptKind {
     /// Edit a month envelope's monthly amount.
     EnvelopeAmount {
         id: String,
+        period_type: PeriodType,
+        days_in_month: i64,
     },
-    /// File a spend into a (manual) envelope: the value is the dollar amount spent. Carries
+    /// File a spend into a manual envelope: first collect the label, then the amount. Carries
     /// the month so the new txn lands in the right period.
-    EnvelopeSpend {
+    EnvelopeSpendLabel {
         envelope_id: String,
         month_id: String,
+    },
+    EnvelopeSpendAmount {
+        envelope_id: String,
+        month_id: String,
+        label: String,
     },
 }
 
 pub enum SeriesSelection {
-    Existing { series_id: String, label: String },
-    New { label: String },
+    Existing {
+        series_id: String,
+        label: String,
+        period_type: Option<PeriodType>,
+    },
+    New {
+        label: String,
+    },
 }
 
 pub struct Confirm {
     pub title: String,
     pub action: ConfirmAction,
+    pub return_to_envelope_detail: Option<EnvelopeDetail>,
 }
 
 /// Destructive actions that require a yes/no before running.
@@ -393,14 +416,27 @@ pub struct App {
 }
 
 impl App {
-    fn open_text(&mut self, title: impl Into<String>, buffer: impl Into<String>, kind: PromptKind) {
+    fn open_text_prompt(
+        &mut self,
+        title: impl Into<String>,
+        buffer: impl Into<String>,
+        help: Vec<String>,
+        replace_on_next_char: bool,
+        kind: PromptKind,
+        return_to_envelope_detail: Option<EnvelopeDetail>,
+    ) {
         self.modal = Some(Modal::Text(TextPrompt {
             title: title.into(),
             buffer: buffer.into(),
-            help: Vec::new(),
-            replace_on_next_char: false,
+            help,
+            replace_on_next_char,
             kind,
+            return_to_envelope_detail,
         }));
+    }
+
+    fn open_text(&mut self, title: impl Into<String>, buffer: impl Into<String>, kind: PromptKind) {
+        self.open_text_prompt(title, buffer, Vec::new(), false, kind, None);
     }
 
     /// Like `open_text_replace_on_type` (the seeded text is preselected, so the first
@@ -413,13 +449,7 @@ impl App {
         help: Vec<String>,
         kind: PromptKind,
     ) {
-        self.modal = Some(Modal::Text(TextPrompt {
-            title: title.into(),
-            buffer: buffer.into(),
-            help,
-            replace_on_next_char: true,
-            kind,
-        }));
+        self.open_text_prompt(title, buffer, help, true, kind, None);
     }
 
     fn open_text_replace_on_type(
@@ -428,13 +458,25 @@ impl App {
         buffer: impl Into<String>,
         kind: PromptKind,
     ) {
-        self.modal = Some(Modal::Text(TextPrompt {
-            title: title.into(),
-            buffer: buffer.into(),
-            help: Vec::new(),
-            replace_on_next_char: true,
+        self.open_text_prompt(title, buffer, Vec::new(), true, kind, None);
+    }
+
+    fn open_text_from_envelope_detail(
+        &mut self,
+        title: impl Into<String>,
+        buffer: impl Into<String>,
+        kind: PromptKind,
+        detail: EnvelopeDetail,
+        replace_on_next_char: bool,
+    ) {
+        self.open_text_prompt(
+            title,
+            buffer,
+            Vec::new(),
+            replace_on_next_char,
             kind,
-        }));
+            Some(detail),
+        );
     }
 
     fn open_series_search(
@@ -457,6 +499,20 @@ impl App {
         self.modal = Some(Modal::Confirm(Confirm {
             title: title.into(),
             action,
+            return_to_envelope_detail: None,
+        }));
+    }
+
+    fn open_confirm_from_envelope_detail(
+        &mut self,
+        title: impl Into<String>,
+        action: ConfirmAction,
+        detail: EnvelopeDetail,
+    ) {
+        self.modal = Some(Modal::Confirm(Confirm {
+            title: title.into(),
+            action,
+            return_to_envelope_detail: Some(detail),
         }));
     }
 
@@ -541,36 +597,34 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     Some(v) => {
                         // Resolve "select the item I just created" now that the sorted lists
                         // are loaded (mirrors the plan editor's pending_select handling).
-                        if let Some(target) = app.pending_dash_txn.take() {
-                            if let Some(txn) = v.standalone.iter().find(|t| t.id == target) {
-                                app.dash_focus = match txn.direction {
-                                    ballpark::models::Direction::In => DashFocus::Income,
-                                    ballpark::models::Direction::Out => DashFocus::Expenses,
-                                };
-                                if let Some(idx) = dashboard_txn_index(v, &target, app.dash_focus) {
-                                    match app.dash_focus {
-                                        DashFocus::Income => app.dash_income_sel = idx,
-                                        DashFocus::Expenses => app.dash_expense_sel = idx,
-                                        _ => {}
-                                    }
+                        if let Some(target) = app.pending_dash_txn.take()
+                            && let Some(txn) = v.standalone.iter().find(|t| t.id == target)
+                        {
+                            app.dash_focus = match txn.direction {
+                                ballpark::models::Direction::In => DashFocus::Income,
+                                ballpark::models::Direction::Out => DashFocus::Expenses,
+                            };
+                            if let Some(idx) = dashboard_txn_index(v, &target, app.dash_focus) {
+                                match app.dash_focus {
+                                    DashFocus::Income => app.dash_income_sel = idx,
+                                    DashFocus::Expenses => app.dash_expense_sel = idx,
+                                    _ => {}
                                 }
                             }
                         }
-                        if let Some(target) = app.pending_dash_env.take() {
-                            if let Some(idx) =
+                        if let Some(target) = app.pending_dash_env.take()
+                            && let Some(idx) =
                                 v.envelopes.iter().position(|e| e.envelope.id == target)
-                            {
-                                app.dash_env_sel = idx;
-                                app.dash_focus = DashFocus::Envelopes;
-                            }
+                        {
+                            app.dash_env_sel = idx;
+                            app.dash_focus = DashFocus::Envelopes;
                         }
-                        if let Some(target) = app.pending_dash_account.take() {
-                            if v.is_current {
-                                if let Some(idx) = v.accounts.iter().position(|a| a.id == target) {
-                                    app.dash_acct_sel = idx;
-                                    app.dash_focus = DashFocus::Accounts;
-                                }
-                            }
+                        if let Some(target) = app.pending_dash_account.take()
+                            && v.is_current
+                            && let Some(idx) = v.accounts.iter().position(|a| a.id == target)
+                        {
+                            app.dash_acct_sel = idx;
+                            app.dash_focus = DashFocus::Accounts;
                         }
                         if v.is_current {
                             clamp(&mut app.dash_acct_sel, v.accounts.len());
@@ -676,15 +730,15 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                 let entries = queries::load_plan_entries(&app.conn, &plan_id)?;
 
                 // Resolve a pending "select this new item" request now that rows are loaded.
-                if let Some(target) = app.pending_select.take() {
-                    if let Some(entry) = entries.iter().find(|e| e.item_id == target) {
-                        app.plan_focus = plan_focus_for_entry(entry);
-                        if let Some(idx) = plan_entry_index(&entries, &target, app.plan_focus) {
-                            match app.plan_focus {
-                                PlanFocus::Income => app.editor_income_sel = idx,
-                                PlanFocus::Expenses => app.editor_expense_sel = idx,
-                                PlanFocus::Envelopes => app.editor_env_sel = idx,
-                            }
+                if let Some(target) = app.pending_select.take()
+                    && let Some(entry) = entries.iter().find(|e| e.item_id == target)
+                {
+                    app.plan_focus = plan_focus_for_entry(entry);
+                    if let Some(idx) = plan_entry_index(&entries, &target, app.plan_focus) {
+                        match app.plan_focus {
+                            PlanFocus::Income => app.editor_income_sel = idx,
+                            PlanFocus::Expenses => app.editor_expense_sel = idx,
+                            PlanFocus::Envelopes => app.editor_env_sel = idx,
                         }
                     }
                 }
@@ -905,10 +959,154 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match app.modal.as_ref() {
         Some(Modal::Text(_)) => handle_text_key(app, key),
         Some(Modal::SeriesSearch(_)) => handle_series_search_key(app, key),
+        Some(Modal::EnvelopeDetail(_)) => handle_envelope_detail_key(app, key),
         Some(Modal::Confirm(_)) => handle_confirm_key(app, key),
         Some(Modal::Choice(_)) => handle_choice_key(app, key),
         None => Ok(()),
     }
+}
+
+fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let Some(Modal::EnvelopeDetail(detail)) = app.modal.as_ref() else {
+        return Ok(());
+    };
+    let detail = detail.clone();
+    let Some(envelope) = load_detail_envelope(app, &detail)? else {
+        app.modal = None;
+        app.status = Some("Envelope no longer exists".into());
+        return Ok(());
+    };
+    let spending = queries::load_envelope_txns(&app.conn, &detail.month_id, &detail.envelope_id)?;
+
+    match key.code {
+        KeyCode::Esc => app.modal = None,
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let Some(Modal::EnvelopeDetail(detail)) = &mut app.modal
+                && detail.selected_spend + 1 < spending.len()
+            {
+                detail.selected_spend += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let Some(Modal::EnvelopeDetail(detail)) = &mut app.modal {
+                detail.selected_spend = detail.selected_spend.saturating_sub(1);
+            }
+        }
+        KeyCode::Char('r') => app.open_text_from_envelope_detail(
+            "Envelope label",
+            envelope.label,
+            PromptKind::EnvelopeLabel { id: envelope.id },
+            detail.clone(),
+            true,
+        ),
+        KeyCode::Char('a') => {
+            let days_in_month = queries::month_days(&app.conn, &detail.month_id)?;
+            let amount =
+                calc::envelope_period_amount(envelope.amount, envelope.period_type, days_in_month);
+            let title = match calc::active_period(envelope.period_type) {
+                PeriodType::Daily => format!("Daily amount for {}", envelope.label),
+                PeriodType::Monthly | PeriodType::Weekly => {
+                    format!("Monthly amount for {}", envelope.label)
+                }
+            };
+            app.open_text_from_envelope_detail(
+                title,
+                amount_edit_string(amount),
+                PromptKind::EnvelopeAmount {
+                    id: envelope.id,
+                    period_type: envelope.period_type,
+                    days_in_month,
+                },
+                detail.clone(),
+                true,
+            );
+        }
+        KeyCode::Char('m') => {
+            let next = match envelope.mode {
+                Mode::Manual => Mode::Automatic,
+                Mode::Automatic => Mode::Manual,
+            };
+            ops::set_envelope_mode(&app.conn, &envelope.id, next)?;
+        }
+        KeyCode::Char('p') => {
+            let next = match calc::active_period(envelope.period_type) {
+                PeriodType::Daily => PeriodType::Monthly,
+                PeriodType::Monthly | PeriodType::Weekly => PeriodType::Daily,
+            };
+            ops::set_envelope_period(&app.conn, &envelope.id, next)?;
+        }
+        KeyCode::Char('s') | KeyCode::Char('n') => {
+            if envelope.mode == Mode::Manual {
+                app.open_text_from_envelope_detail(
+                    format!("Spending label for {}", envelope.label),
+                    String::new(),
+                    PromptKind::EnvelopeSpendLabel {
+                        envelope_id: envelope.id,
+                        month_id: detail.month_id.clone(),
+                    },
+                    detail.clone(),
+                    false,
+                );
+            } else {
+                app.status = Some(
+                    "Automatic envelopes accrue by time; switch to manual to file spending".into(),
+                );
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
+                app.open_text_from_envelope_detail(
+                    format!("Amount for {}", txn.label),
+                    amount_edit_string(txn.amount),
+                    PromptKind::TxnAmount { id: txn.id.clone() },
+                    detail.clone(),
+                    true,
+                );
+            }
+        }
+        KeyCode::Char('l') => {
+            if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
+                app.open_text_from_envelope_detail(
+                    "Spending label",
+                    txn.label.clone(),
+                    PromptKind::TxnLabel { id: txn.id.clone() },
+                    detail.clone(),
+                    true,
+                );
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
+                app.open_confirm_from_envelope_detail(
+                    format!("Delete spending “{}”?", txn.label),
+                    ConfirmAction::DeleteTxn { id: txn.id.clone() },
+                    detail.clone(),
+                );
+            }
+        }
+        KeyCode::Char('x') => {
+            app.open_confirm_from_envelope_detail(
+                format!("Delete envelope “{}” and its spending?", envelope.label),
+                ConfirmAction::DeleteEnvelope { id: envelope.id },
+                detail.clone(),
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn load_detail_envelope(
+    app: &App,
+    detail: &EnvelopeDetail,
+) -> Result<Option<ballpark::models::Envelope>> {
+    Ok(queries::load_envelopes(&app.conn, &detail.month_id)?
+        .into_iter()
+        .find(|envelope| envelope.id == detail.envelope_id))
+}
+
+fn selected_spending(spending: &[Txn], selected: usize) -> Option<&Txn> {
+    spending.get(selected.min(spending.len().saturating_sub(1)))
 }
 
 fn handle_choice_key(app: &mut App, key: KeyEvent) -> Result<()> {
@@ -1023,9 +1221,24 @@ fn finish_restamp(app: &mut App, message: &str) {
     app.status = Some(message.to_string());
 }
 
+fn restore_envelope_detail_modal(app: &mut App, detail: Option<EnvelopeDetail>) {
+    if let Some(detail) = detail {
+        app.modal = Some(Modal::EnvelopeDetail(detail));
+    }
+}
+
 fn handle_text_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
-        KeyCode::Esc => app.modal = None,
+        KeyCode::Esc => {
+            let return_to = match app.modal.take() {
+                Some(Modal::Text(prompt)) => prompt.return_to_envelope_detail,
+                other => {
+                    app.modal = other;
+                    None
+                }
+            };
+            restore_envelope_detail_modal(app, return_to);
+        }
         KeyCode::Enter => submit_text(app)?,
         KeyCode::Backspace => {
             if let Some(Modal::Text(p)) = &mut app.modal {
@@ -1098,17 +1311,21 @@ fn submit_series_search(app: &mut App) -> Result<()> {
     let matches = series_search_matches(&prompt);
     let selected = matches
         .get(prompt.selected.min(matches.len().saturating_sub(1)))
-        .map(|series| (series.id.clone(), series.label.clone()));
+        .map(|series| (series.id.clone(), series.label.clone(), series.period_type));
 
     match selected {
-        Some((series_id, label)) => {
+        Some((series_id, label, period_type)) => {
             app.open_text_replace_on_type(
-                format!("Amount for {}", label),
+                series_amount_prompt_title(prompt.block, &label, period_type),
                 amount_edit_string(Money::ZERO),
                 PromptKind::SeriesAddAmount {
                     destination: prompt.destination,
                     block: prompt.block,
-                    selection: SeriesSelection::Existing { series_id, label },
+                    selection: SeriesSelection::Existing {
+                        series_id,
+                        label,
+                        period_type,
+                    },
                 },
             );
         }
@@ -1118,7 +1335,7 @@ fn submit_series_search(app: &mut App) -> Result<()> {
                 app.status = Some(format!("Type a {} name", prompt.block.noun()));
             } else {
                 app.open_text_replace_on_type(
-                    format!("Amount for new {}", prompt.block.noun()),
+                    series_amount_prompt_title(prompt.block, &label, None),
                     amount_edit_string(Money::ZERO),
                     PromptKind::SeriesAddAmount {
                         destination: prompt.destination,
@@ -1137,6 +1354,28 @@ impl SeriesSelection {
         match self {
             SeriesSelection::Existing { label, .. } | SeriesSelection::New { label } => label,
         }
+    }
+
+    fn period_type(&self) -> Option<PeriodType> {
+        match self {
+            SeriesSelection::Existing { period_type, .. } => *period_type,
+            SeriesSelection::New { .. } => None,
+        }
+    }
+}
+
+fn series_amount_prompt_title(
+    block: BudgetBlock,
+    label: &str,
+    period_type: Option<PeriodType>,
+) -> String {
+    if block == BudgetBlock::Envelopes {
+        match period_type.map(calc::active_period) {
+            Some(PeriodType::Daily) => format!("Daily amount for {label}"),
+            _ => format!("Monthly amount for {label}"),
+        }
+    } else {
+        format!("Amount for {label}")
     }
 }
 
@@ -1193,6 +1432,7 @@ fn submit_text(app: &mut App) -> Result<()> {
         return Ok(());
     };
     let text = prompt.buffer.trim().to_string();
+    let return_to_envelope_detail = prompt.return_to_envelope_detail;
 
     match prompt.kind {
         PromptKind::NewPlan => {
@@ -1241,14 +1481,17 @@ fn submit_text(app: &mut App) -> Result<()> {
             Some(amount) => add_selected_series(app, destination, block, selection, amount)?,
             None => {
                 app.status = Some(format!("Couldn't read “{text}” as an amount"));
-                app.open_text(
-                    format!("Amount for {}", selection.label()),
+                app.open_text_prompt(
+                    series_amount_prompt_title(block, selection.label(), selection.period_type()),
                     text,
+                    Vec::new(),
+                    false,
                     PromptKind::SeriesAddAmount {
                         destination,
                         block,
                         selection,
                     },
+                    return_to_envelope_detail.clone(),
                 );
             }
         },
@@ -1304,10 +1547,13 @@ fn submit_text(app: &mut App) -> Result<()> {
             }
             None => {
                 app.status = Some(format!("Couldn't read “{text}” as an amount"));
-                app.open_text(
+                app.open_text_prompt(
                     format!("Starting balance for {name}"),
                     text,
+                    Vec::new(),
+                    false,
                     PromptKind::NewCheckingBalance { name },
+                    return_to_envelope_detail.clone(),
                 );
             }
         },
@@ -1319,10 +1565,13 @@ fn submit_text(app: &mut App) -> Result<()> {
             ),
             None => {
                 app.status = Some(format!("Couldn't read “{text}” as an amount"));
-                app.open_text(
+                app.open_text_prompt(
                     format!("Credit limit for {name}"),
                     text,
+                    Vec::new(),
+                    false,
                     PromptKind::NewCardLimit { name },
+                    return_to_envelope_detail.clone(),
                 );
             }
         },
@@ -1334,10 +1583,13 @@ fn submit_text(app: &mut App) -> Result<()> {
             }
             None => {
                 app.status = Some(format!("Couldn't read “{text}” as an amount"));
-                app.open_text(
+                app.open_text_prompt(
                     format!("Available credit for {name}"),
                     text,
+                    Vec::new(),
+                    false,
                     PromptKind::NewCardAvailable { name, limit },
+                    return_to_envelope_detail.clone(),
                 );
             }
         },
@@ -1366,20 +1618,92 @@ fn submit_text(app: &mut App) -> Result<()> {
                 ops::set_envelope_label(&app.conn, &id, &text)?;
             }
         }
-        PromptKind::EnvelopeAmount { id } => match Money::parse_dollars(&text) {
-            Some(amount) => ops::set_envelope_amount(&app.conn, &id, amount)?,
-            None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
-        },
-        PromptKind::EnvelopeSpend {
-            envelope_id,
-            month_id,
+        PromptKind::EnvelopeAmount {
+            id,
+            period_type,
+            days_in_month,
         } => match Money::parse_dollars(&text) {
             Some(amount) => {
-                ops::add_envelope_spending(&app.conn, &month_id, &envelope_id, "Spending", amount)?;
-                app.status = Some(format!("Filed {amount} of spending"));
+                let monthly_amount =
+                    calc::monthlyized_envelope_amount(amount, period_type, days_in_month);
+                ops::set_envelope_amount(&app.conn, &id, monthly_amount)?;
             }
-            None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
+            None => {
+                app.status = Some(format!("Couldn't read “{text}” as an amount"));
+                app.open_text_prompt(
+                    "Envelope amount",
+                    text,
+                    Vec::new(),
+                    false,
+                    PromptKind::EnvelopeAmount {
+                        id,
+                        period_type,
+                        days_in_month,
+                    },
+                    return_to_envelope_detail.clone(),
+                );
+            }
         },
+        PromptKind::EnvelopeSpendLabel {
+            envelope_id,
+            month_id,
+        } => {
+            if text.is_empty() {
+                app.status = Some("Spending label can't be empty".into());
+                app.open_text_prompt(
+                    "Spending label",
+                    text,
+                    Vec::new(),
+                    false,
+                    PromptKind::EnvelopeSpendLabel {
+                        envelope_id,
+                        month_id,
+                    },
+                    return_to_envelope_detail.clone(),
+                );
+            } else {
+                app.open_text_prompt(
+                    format!("Amount for {text}"),
+                    String::new(),
+                    Vec::new(),
+                    false,
+                    PromptKind::EnvelopeSpendAmount {
+                        envelope_id,
+                        month_id,
+                        label: text,
+                    },
+                    return_to_envelope_detail.clone(),
+                );
+            }
+        }
+        PromptKind::EnvelopeSpendAmount {
+            envelope_id,
+            month_id,
+            label,
+        } => match Money::parse_dollars(&text) {
+            Some(amount) => {
+                ops::add_envelope_spending(&app.conn, &month_id, &envelope_id, &label, amount)?;
+                app.status = Some(format!("Filed {amount} for {label}"));
+            }
+            None => {
+                app.status = Some(format!("Couldn't read “{text}” as an amount"));
+                app.open_text_prompt(
+                    format!("Amount for {label}"),
+                    text,
+                    Vec::new(),
+                    false,
+                    PromptKind::EnvelopeSpendAmount {
+                        envelope_id,
+                        month_id,
+                        label,
+                    },
+                    return_to_envelope_detail.clone(),
+                );
+            }
+        },
+    }
+    if app.modal.is_none() {
+        restore_envelope_detail_modal(app, return_to_envelope_detail);
     }
     Ok(())
 }
@@ -1388,6 +1712,9 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
             if let Some(Modal::Confirm(confirm)) = app.modal.take() {
+                let return_to = confirm.return_to_envelope_detail;
+                let deletes_parent_envelope =
+                    matches!(&confirm.action, ConfirmAction::DeleteEnvelope { .. });
                 match confirm.action {
                     ConfirmAction::DeletePlan { id } => {
                         ops::delete_plan(&mut app.conn, &id)?;
@@ -1422,9 +1749,21 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         }
                     }
                 }
+                if !deletes_parent_envelope && app.modal.is_none() {
+                    restore_envelope_detail_modal(app, return_to);
+                }
             }
         }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.modal = None,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            let return_to = match app.modal.take() {
+                Some(Modal::Confirm(confirm)) => confirm.return_to_envelope_detail,
+                other => {
+                    app.modal = other;
+                    None
+                }
+            };
+            restore_envelope_detail_modal(app, return_to);
+        }
         _ => {}
     }
     Ok(())
@@ -1550,6 +1889,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(Paragraph::new(body).block(block), area);
         }
         Modal::SeriesSearch(prompt) => draw_series_search_modal(frame, prompt),
+        Modal::EnvelopeDetail(detail) => draw_envelope_detail_modal(frame, app, detail),
         Modal::Confirm(confirm) => {
             let area = centered_rect(60, 20, frame.area());
             frame.render_widget(Clear, area);
@@ -1588,6 +1928,157 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             frame.render_widget(Paragraph::new(body).block(block), area);
         }
     }
+}
+
+fn draw_envelope_detail_modal(frame: &mut Frame, app: &App, detail: &EnvelopeDetail) {
+    let area = centered_rect(76, 72, frame.area());
+    frame.render_widget(Clear, area);
+
+    let (title, lines) = match envelope_detail_lines(app, detail) {
+        Ok(result) => result,
+        Err(err) => (
+            " Envelope ".to_string(),
+            vec![
+                Line::raw(""),
+                Line::from(Span::styled(
+                    format!(" Could not load envelope: {err}"),
+                    Style::default().fg(Color::Red),
+                )),
+                Line::raw(""),
+                Line::from(Span::styled(
+                    " Esc to close",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ],
+        ),
+    };
+    let block = titled_block(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [body_area, footer_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).areas(inner);
+    frame.render_widget(Paragraph::new(lines), body_area);
+    frame.render_widget(Paragraph::new(envelope_detail_footer_lines()), footer_area);
+}
+
+fn envelope_detail_footer_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            modal_key(" r "),
+            Span::raw(" label  "),
+            modal_key(" a "),
+            Span::raw(" amount  "),
+            modal_key(" m "),
+            Span::raw(" mode  "),
+            modal_key(" p "),
+            Span::raw(" period  "),
+            modal_key(" s "),
+            Span::raw(" spend"),
+        ]),
+        Line::from(vec![
+            modal_key(" j/k "),
+            Span::raw(" move  "),
+            modal_key(" Enter "),
+            Span::raw(" amount  "),
+            modal_key(" l "),
+            Span::raw(" label  "),
+            modal_key(" d "),
+            Span::raw(" delete  "),
+            modal_key(" x "),
+            Span::raw(" del env  "),
+            modal_key(" Esc "),
+            Span::raw(" close"),
+        ]),
+    ]
+}
+
+fn modal_key(label: &'static str) -> Span<'static> {
+    Span::styled(
+        label.to_string(),
+        Style::default().fg(Color::Black).bg(Color::Gray),
+    )
+}
+
+fn envelope_detail_lines(
+    app: &App,
+    detail: &EnvelopeDetail,
+) -> Result<(String, Vec<Line<'static>>)> {
+    let month = queries::month_by_id(&app.conn, &detail.month_id)?
+        .with_context(|| format!("month not found: {}", detail.month_id))?;
+    let envelope = load_detail_envelope(app, detail)?
+        .with_context(|| format!("envelope not found: {}", detail.envelope_id))?;
+    let spending = queries::load_envelope_txns(&app.conn, &detail.month_id, &detail.envelope_id)?;
+    let fraction = calc::elapsed_fraction(
+        month.start_date,
+        month.days_in_month,
+        Local::now().date_naive(),
+    );
+    let consumed = calc::envelope_consumed(&envelope, envelope.mode, &spending, fraction);
+    let remaining = calc::envelope_remaining(&envelope, consumed);
+    let period = calc::active_period(envelope.period_type);
+    let period_label = match period {
+        PeriodType::Daily => "daily",
+        PeriodType::Monthly | PeriodType::Weekly => "monthly",
+    };
+    let mode_label = match envelope.mode {
+        Mode::Automatic => "automatic",
+        Mode::Manual => "manual",
+    };
+    let entered_amount = calc::envelope_period_amount(envelope.amount, period, month.days_in_month);
+    let unit = match period {
+        PeriodType::Daily => "/day",
+        PeriodType::Monthly | PeriodType::Weekly => "/mo",
+    };
+
+    let mut lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(" mode ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{mode_label:<10}")),
+            Span::styled(" period ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{period_label:<8}")),
+            Span::styled(" entered ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}{}", entered_amount, unit)),
+        ]),
+        Line::from(vec![
+            Span::styled(" monthly ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:<12}", envelope.amount.to_string())),
+            Span::styled(" consumed ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:<12}", consumed.to_string())),
+            Span::styled(" left ", Style::default().fg(Color::DarkGray)),
+            Span::raw(remaining.to_string()),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(" Spending", Style::default().fg(Color::Gray))),
+    ];
+
+    if spending.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No spending filed",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (idx, txn) in spending.iter().enumerate() {
+            let selected = idx == detail.selected_spend.min(spending.len().saturating_sub(1));
+            let marker = if selected { ">" } else { " " };
+            let style = if selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {marker} {:<34} {:>12}",
+                    truncate(&txn.label, 34),
+                    txn.amount
+                ),
+                style,
+            )));
+        }
+    }
+
+    Ok((format!(" Envelope - {} ", envelope.label), lines))
 }
 
 fn draw_series_search_modal(frame: &mut Frame, prompt: &SeriesSearch) {
@@ -1734,4 +2225,155 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 /// Format a `Money` as an editable plain number ("1500.00") to prefill the amount prompt.
 pub(crate) fn amount_edit_string(m: Money) -> String {
     format!("{:.2}", m.cents() as f64 / 100.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::KeyModifiers;
+    use uuid::Uuid;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn app_with_envelope_detail() -> (App, EnvelopeDetail, String) {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ballpark-envelope-detail-{}.db", Uuid::new_v4()));
+        let mut conn = db::open(&path).unwrap();
+        let plan_id = ops::create_plan(&conn, "Normal").unwrap();
+        let dining_series = ops::create_series(
+            &conn,
+            Kind::Envelope,
+            "Dining",
+            None,
+            Some(PeriodType::Monthly),
+            Some(Mode::Manual),
+        )
+        .unwrap();
+        ops::add_plan_item(&conn, &plan_id, &dining_series, Money::from_dollars(300.0)).unwrap();
+
+        let month_id = ops::stamp(
+            &mut conn,
+            &plan_id,
+            "2026-09",
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            30,
+        )
+        .unwrap();
+        let envelope = queries::load_envelopes(&conn, &month_id)
+            .unwrap()
+            .into_iter()
+            .find(|envelope| envelope.label == "Dining")
+            .unwrap();
+        let detail = EnvelopeDetail {
+            month_id,
+            envelope_id: envelope.id.clone(),
+            selected_spend: 0,
+        };
+
+        let app = App {
+            conn,
+            screen: Screen::Dashboard,
+            should_quit: false,
+            dash_focus: DashFocus::Envelopes,
+            viewed_year: 2026,
+            viewed_month: 9,
+            dash_income_sel: 0,
+            dash_expense_sel: 0,
+            dash_env_sel: 0,
+            dash_acct_sel: 0,
+            plans_sel: 0,
+            series_sel: 0,
+            series_search: String::new(),
+            series_search_active: false,
+            series_range: SeriesTimeRange::Last12Stamped,
+            series_filter: SeriesFilter::Both,
+            plan_focus: PlanFocus::Income,
+            editor_income_sel: 0,
+            editor_expense_sel: 0,
+            editor_env_sel: 0,
+            pending_select: None,
+            pending_dash_txn: None,
+            pending_dash_env: None,
+            pending_dash_account: None,
+            pending_series_select: None,
+            summary_anims: SummaryAnimations::new(),
+            frame_now: Instant::now(),
+            modal: Some(Modal::EnvelopeDetail(detail.clone())),
+            status: None,
+        };
+
+        (app, detail, envelope.id)
+    }
+
+    fn assert_envelope_detail_modal(app: &App, expected: &EnvelopeDetail) {
+        match &app.modal {
+            Some(Modal::EnvelopeDetail(actual)) => {
+                assert_eq!(actual.month_id, expected.month_id);
+                assert_eq!(actual.envelope_id, expected.envelope_id);
+                assert_eq!(actual.selected_spend, expected.selected_spend);
+            }
+            _ => panic!("expected envelope detail modal"),
+        }
+    }
+
+    #[test]
+    fn canceling_envelope_label_prompt_returns_to_detail_modal() {
+        let (mut app, detail, _) = app_with_envelope_detail();
+
+        handle_modal_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+        match &app.modal {
+            Some(Modal::Text(prompt)) => {
+                assert_eq!(prompt.title, "Envelope label");
+                assert!(prompt.return_to_envelope_detail.is_some());
+            }
+            _ => panic!("expected envelope label prompt"),
+        }
+
+        handle_modal_key(&mut app, key(KeyCode::Esc)).unwrap();
+
+        assert_envelope_detail_modal(&app, &detail);
+    }
+
+    #[test]
+    fn submitting_envelope_label_returns_to_detail_modal() {
+        let (mut app, detail, envelope_id) = app_with_envelope_detail();
+
+        handle_modal_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+        for c in "Travel".chars() {
+            handle_modal_key(&mut app, key(KeyCode::Char(c))).unwrap();
+        }
+        handle_modal_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert_envelope_detail_modal(&app, &detail);
+        let envelope = queries::load_envelopes(&app.conn, &detail.month_id)
+            .unwrap()
+            .into_iter()
+            .find(|envelope| envelope.id == envelope_id)
+            .unwrap();
+        assert_eq!(envelope.label, "Travel");
+    }
+
+    #[test]
+    fn canceling_envelope_spend_amount_returns_to_detail_modal() {
+        let (mut app, detail, _) = app_with_envelope_detail();
+
+        handle_modal_key(&mut app, key(KeyCode::Char('s'))).unwrap();
+        for c in "Coffee".chars() {
+            handle_modal_key(&mut app, key(KeyCode::Char(c))).unwrap();
+        }
+        handle_modal_key(&mut app, key(KeyCode::Enter)).unwrap();
+        match &app.modal {
+            Some(Modal::Text(prompt)) => {
+                assert_eq!(prompt.title, "Amount for Coffee");
+                assert!(prompt.return_to_envelope_detail.is_some());
+            }
+            _ => panic!("expected envelope spend amount prompt"),
+        }
+
+        handle_modal_key(&mut app, key(KeyCode::Esc)).unwrap();
+
+        assert_envelope_detail_modal(&app, &detail);
+    }
 }

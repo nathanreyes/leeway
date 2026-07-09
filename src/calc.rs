@@ -4,7 +4,7 @@
 //! clock, no I/O. That's what makes them trivial to unit-test (see the bottom of the
 //! file) and what lets a future web/desktop frontend reuse them unchanged.
 
-use crate::models::{Envelope, Mode, Txn};
+use crate::models::{Envelope, Mode, PeriodType, Txn};
 use crate::money::Money;
 use chrono::NaiveDate;
 
@@ -22,6 +22,39 @@ pub fn elapsed_fraction(start_date: NaiveDate, days_in_month: i64, today: NaiveD
         return 0.0; // guard against a malformed month; avoids divide-by-zero
     }
     days_elapsed(start_date, days_in_month, today) as f64 / days_in_month as f64
+}
+
+/// The active period set. `Weekly` is retained only so old databases can still be read; the
+/// app no longer creates it and treats legacy weekly rows as monthly.
+pub fn active_period(period: PeriodType) -> PeriodType {
+    match period {
+        PeriodType::Daily => PeriodType::Daily,
+        PeriodType::Weekly | PeriodType::Monthly => PeriodType::Monthly,
+    }
+}
+
+/// Convert an entered envelope amount into the concrete budget for one stamped month.
+/// Monthly values are already monthly totals; daily values are rates multiplied by that
+/// month's actual day count.
+pub fn monthlyized_envelope_amount(amount: Money, period: PeriodType, days_in_month: i64) -> Money {
+    match active_period(period) {
+        PeriodType::Daily => Money(amount.cents().saturating_mul(days_in_month.max(0))),
+        PeriodType::Monthly | PeriodType::Weekly => amount,
+    }
+}
+
+/// Convert a concrete monthly envelope budget back into the amount the user edits for the
+/// selected period. Daily rates round to the nearest cent for display and editing.
+pub fn envelope_period_amount(
+    monthly_amount: Money,
+    period: PeriodType,
+    days_in_month: i64,
+) -> Money {
+    match active_period(period) {
+        PeriodType::Daily if days_in_month > 0 => monthly_amount.scale(1.0 / days_in_month as f64),
+        PeriodType::Daily => Money::ZERO,
+        PeriodType::Monthly | PeriodType::Weekly => monthly_amount,
+    }
 }
 
 /// How much of an envelope is consumed so far.
@@ -60,15 +93,15 @@ pub fn txn_remaining(txn: &Txn) -> Money {
 /// number the whole app exists to show.
 #[derive(Clone, Copy, Debug)]
 pub struct WhatsLeft {
-    pub funds_available: Money,     // spendable checking balances (raw, before buffers)
-    pub card_debt: Money,           // total credit-card owed (= limit − available), raw
-    pub income_remaining: Money,    // unsettled standalone income
-    pub bills_remaining: Money,     // unsettled standalone bills
+    pub funds_available: Money, // spendable checking balances (raw, before buffers)
+    pub card_debt: Money,       // total credit-card owed (= limit − available), raw
+    pub income_remaining: Money, // unsettled standalone income
+    pub bills_remaining: Money, // unsettled standalone bills
     pub envelopes_remaining: Money, // sum of every envelope's remaining
-    pub checking_buffer: Money,     // checking carry balances held back from spendable funds
-    pub card_carry: Money,          // credit-card carry balances not paid this month
-    pub carry_adjustment: Money,    // net of checking buffers (−) and card carryovers (+)
-    pub whats_left: Money,          // the headline
+    pub checking_buffer: Money, // checking carry balances held back from spendable funds
+    pub card_carry: Money,      // credit-card carry balances not paid this month
+    pub carry_adjustment: Money, // net of checking buffers (−) and card carryovers (+)
+    pub whats_left: Money,      // the headline
 }
 
 impl WhatsLeft {
@@ -104,10 +137,9 @@ impl WhatsLeft {
         // `funds_available` and `card_debt` stay raw so the dashboard can show the real
         // cash and real debt; the carry balances land here as one already-signed term
         // (see Account::carry_adjustment for the per-type sign).
-        let whats_left = funds_available - card_debt + income_remaining
-            - bills_remaining
-            - envelopes_remaining
-            + carry_adjustment;
+        let whats_left =
+            funds_available - card_debt + income_remaining - bills_remaining - envelopes_remaining
+                + carry_adjustment;
         WhatsLeft {
             funds_available,
             card_debt,
@@ -159,7 +191,10 @@ mod tests {
         let fraction = 17.0 / 30.0;
         let consumed = envelope_consumed(&env, Mode::Automatic, &[], fraction);
         assert_eq!(consumed, Money::from_dollars(1133.33));
-        assert_eq!(envelope_remaining(&env, consumed), Money::from_dollars(866.67));
+        assert_eq!(
+            envelope_remaining(&env, consumed),
+            Money::from_dollars(866.67)
+        );
     }
 
     #[test]
@@ -180,7 +215,10 @@ mod tests {
         ];
         let consumed = envelope_consumed(&env, Mode::Manual, &txns, 0.5);
         assert_eq!(consumed, Money::from_dollars(59.50));
-        assert_eq!(envelope_remaining(&env, consumed), Money::from_dollars(240.50));
+        assert_eq!(
+            envelope_remaining(&env, consumed),
+            Money::from_dollars(240.50)
+        );
     }
 
     #[test]
@@ -242,7 +280,10 @@ mod tests {
         assert_eq!(checking.carry_adjustment(), Money::from_dollars(-500.0));
         assert_eq!(card.carry_adjustment(), Money::from_dollars(300.0));
 
-        let carry: Money = [&checking, &card].iter().map(|a| a.carry_adjustment()).sum();
+        let carry: Money = [&checking, &card]
+            .iter()
+            .map(|a| a.carry_adjustment())
+            .sum();
         assert_eq!(carry, Money::from_dollars(-200.0)); // −500 + 300
 
         let base = WhatsLeft::compute(
@@ -264,6 +305,27 @@ mod tests {
         assert_eq!(
             with_carry.whats_left,
             base.whats_left - Money::from_dollars(200.0)
+        );
+    }
+
+    #[test]
+    fn daily_envelope_amount_monthlyizes_by_days_in_month() {
+        assert_eq!(
+            monthlyized_envelope_amount(Money::from_dollars(15.0), PeriodType::Daily, 30),
+            Money::from_dollars(450.0)
+        );
+        assert_eq!(
+            monthlyized_envelope_amount(Money::from_dollars(15.0), PeriodType::Daily, 31),
+            Money::from_dollars(465.0)
+        );
+    }
+
+    #[test]
+    fn weekly_period_is_legacy_and_behaves_as_monthly() {
+        assert_eq!(active_period(PeriodType::Weekly), PeriodType::Monthly);
+        assert_eq!(
+            monthlyized_envelope_amount(Money::from_dollars(80.0), PeriodType::Weekly, 31),
+            Money::from_dollars(80.0)
         );
     }
 

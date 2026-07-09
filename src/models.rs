@@ -53,6 +53,8 @@ macro_rules! sql_enum {
 
 sql_enum!(Direction { In => "in", Out => "out" });
 sql_enum!(Kind { Transaction => "transaction", Envelope => "envelope" });
+// `Weekly` is retained only so older local databases can still be read. Active UI cycles
+// between Daily and Monthly, and calculation treats Weekly as Monthly.
 sql_enum!(PeriodType { Daily => "daily", Weekly => "weekly", Monthly => "monthly" });
 sql_enum!(Mode { Automatic => "automatic", Manual => "manual" });
 sql_enum!(AccountType {
@@ -93,6 +95,7 @@ pub struct Account {
     /// One amount, meaning set by `account_type` (`None` = not set, treated as 0):
     ///   - checking:    a buffer the user wants to keep parked in the account.
     ///   - credit card: a balance the user is willing to carry into next month.
+    ///
     /// The math effect lives in `carry_adjustment()`, which knows the sign per type.
     pub carry_balance: Option<Money>,
 }
@@ -103,7 +106,8 @@ impl Account {
     pub fn owed(&self) -> Money {
         match self.account_type {
             AccountType::CreditCard => {
-                self.credit_limit.unwrap_or(Money::ZERO) - self.available_credit.unwrap_or(Money::ZERO)
+                self.credit_limit.unwrap_or(Money::ZERO)
+                    - self.available_credit.unwrap_or(Money::ZERO)
             }
             AccountType::Checking => Money::ZERO,
         }
@@ -115,6 +119,7 @@ impl Account {
     ///   - Checking: the buffer is cash you won't spend, so hold it back → NEGATIVE.
     ///   - Credit card: the tolerated balance is debt you won't pay this month, so it
     ///     cancels that much of `owed()`'s drag → POSITIVE.
+    ///
     /// `None` carry (the default) means no adjustment.
     pub fn carry_adjustment(&self) -> Money {
         let carry = self.carry_balance.unwrap_or(Money::ZERO);
@@ -140,9 +145,9 @@ pub struct Series {
     pub id: String,
     pub kind: Kind,
     pub label: String,
-    pub direction: Option<Direction>,   // transactions
+    pub direction: Option<Direction>,    // transactions
     pub period_type: Option<PeriodType>, // envelopes
-    pub mode: Option<Mode>,              // Some for envelopes (frozen at creation); None for transactions
+    pub mode: Option<Mode>, // Some for envelopes (frozen at creation); None for transactions
 }
 
 /// A series' membership in one plan: the join of `plan_item` and `series`. `item_id` is

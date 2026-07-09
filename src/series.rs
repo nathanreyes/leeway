@@ -6,17 +6,17 @@ use crate::{
 use anyhow::Result;
 use ballpark::models::{Kind, Mode, PeriodType};
 use ballpark::money::Money;
-use ballpark::{ops, queries};
 use ballpark::view::{
     SeriesDetailView, SeriesGroup, SeriesPageView, SeriesTimeRange, SeriesTrendPoint,
 };
+use ballpark::{ops, queries};
 use chrono::{Datelike, NaiveDate};
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Bar, BarChart, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
 enum SidebarRow {
     Header(SeriesGroup),
@@ -87,13 +87,14 @@ pub fn handle_key(
             if let Some(detail) = selected_detail(app, view) {
                 if detail.series.kind == Kind::Envelope {
                     let next = match detail.series.period_type {
-                        Some(PeriodType::Daily) => PeriodType::Weekly,
-                        Some(PeriodType::Weekly) => PeriodType::Monthly,
-                        Some(PeriodType::Monthly) | None => PeriodType::Daily,
+                        Some(PeriodType::Daily) => PeriodType::Monthly,
+                        Some(PeriodType::Weekly) | Some(PeriodType::Monthly) | None => {
+                            PeriodType::Daily
+                        }
                     };
                     ops::set_series_period(&app.conn, &detail.series.id, next)?;
                     app.status =
-                        Some("Period changed (affects all plans using this series)".into());
+                        Some("Period changed; plan amounts converted on a 30-day basis".into());
                 } else {
                     app.status = Some("Period applies to envelopes".into());
                 }

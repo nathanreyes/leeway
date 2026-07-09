@@ -46,7 +46,7 @@ CREATE TABLE series (
     kind        TEXT NOT NULL,                -- 'transaction' | 'envelope'
     label       TEXT NOT NULL,                -- canonical; editing it affects every plan
     direction   TEXT,                         -- transactions: 'in' | 'out'
-    period_type TEXT,                         -- envelopes: 'daily' | 'weekly' | 'monthly'
+    period_type TEXT,                         -- envelopes: 'daily' | 'monthly'
     mode        TEXT,                         -- envelopes: 'automatic' | 'manual'
     -- An envelope's `mode` is chosen once, at creation (the app seeds it from the global
     -- default_envelope_mode setting), and frozen thereafter: changing the global default
@@ -100,7 +100,7 @@ CREATE TABLE envelope (
     label                TEXT NOT NULL,
     amount_cents         INTEGER NOT NULL,  -- this month's budget (editable)
     stamped_amount_cents INTEGER NOT NULL,  -- immutable snapshot, used by "revert to planned"
-    period_type          TEXT NOT NULL,     -- 'daily' | 'weekly' | 'monthly'
+    period_type          TEXT NOT NULL,     -- 'daily' | 'monthly'
     mode                 TEXT NOT NULL      -- 'automatic' | 'manual' — frozen at stamp time
 );
 

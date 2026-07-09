@@ -59,7 +59,7 @@ CREATE TABLE series (
     kind        TEXT NOT NULL,             -- 'transaction' | 'envelope'
     label       TEXT NOT NULL,             -- cosmetic only; safe to edit
     direction   TEXT,                      -- 'in' | 'out'  (transactions)
-    period_type TEXT,                      -- envelopes: 'daily' | 'weekly' | 'monthly'
+    period_type TEXT,                      -- envelopes: 'daily' | 'monthly'
     mode        TEXT                       -- envelopes: 'automatic' | 'manual' | NULL = inherit global default
 );
 
@@ -70,7 +70,7 @@ CREATE TABLE plan_item (
     id        TEXT PRIMARY KEY,            -- UUID (per-plan row; NOT the series identity)
     plan_id   TEXT NOT NULL REFERENCES plan(id),
     series_id TEXT NOT NULL REFERENCES series(id),
-    amount    REAL NOT NULL                -- this plan's budgeted amount for the series
+    amount    REAL NOT NULL                -- envelopes: daily rate or monthly total, by period_type
 );
 
 -- A stamped period.
@@ -88,9 +88,9 @@ CREATE TABLE envelope (
     month_id       TEXT NOT NULL REFERENCES month(id),
     series_id      TEXT NOT NULL,          -- copied plan_item.id (plain value, NOT a live FK)
     label          TEXT NOT NULL,
-    amount         REAL NOT NULL,          -- this month's budget (editable)
+    amount         REAL NOT NULL,          -- this month's monthlyized budget (editable)
     stamped_amount REAL NOT NULL,          -- immutable snapshot, used by "revert to planned"
-    period_type    TEXT NOT NULL,          -- 'daily' | 'weekly' | 'monthly'
+    period_type    TEXT NOT NULL,          -- 'daily' | 'monthly'
     mode           TEXT                    -- 'automatic' | 'manual' | NULL = inherit global default
 );
 
@@ -134,7 +134,13 @@ days_elapsed    = clamp(today - month.start_date, 0, days_in_month)
 elapsed_fraction = days_elapsed / days_in_month        -- linear over the month
 ```
 
-`period_type` (daily/weekly/monthly) is how the user *enters and reads* the target; accrual itself is linear by day. (A $2,000 monthly grocery envelope at ~17/30 of the month shows ~$1,133 consumed — matching the source spreadsheet.)
+`period_type` is either daily or monthly. A plan item amount is entered in that unit:
+daily means "amount per day", monthly means "amount for the month." When a plan is
+stamped, daily envelope rates are monthlyized with the stamped month's day count
+(`daily_rate * days_in_month`) and stored on the envelope instance as the concrete
+monthly budget. Accrual itself is still linear by day. (A $2,000 monthly grocery
+envelope at ~17/30 of the month shows ~$1,133 consumed — matching the source
+spreadsheet.)
 
 ### Consumption & remaining
 
@@ -180,8 +186,10 @@ stamp(plan, start_date, days_in_month):
     # accounts persist; balances carry forward and are updated by hand as needed
     for item in plan.items:
         if item.kind == 'envelope':
+            monthly_amount = item.amount if item.period_type == 'monthly'
+                             else item.amount * days_in_month
             INSERT envelope(month_id=m, series_id=item.id,
-                            amount=item.amount, stamped_amount=item.amount,
+                            amount=monthly_amount, stamped_amount=monthly_amount,
                             period_type=item.period_type, mode=item.mode,
                             label=item.label)
         else:  # transaction

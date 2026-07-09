@@ -20,6 +20,7 @@ use std::sync::LazyLock;
 static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
     Migrations::new(vec![
         M::up(include_str!("schema.sql")),
+        M::up(include_str!("migration_002_integrity_and_indexes.sql")),
     ])
 });
 
@@ -82,6 +83,9 @@ mod tests {
             .unwrap();
         assert!(cols.iter().any(|c| c == "credit_limit_cents"));
         assert!(cols.iter().any(|c| c == "available_credit_cents"));
-        assert!(!cols.iter().any(|c| c == "protected"), "protected flag dropped");
+        assert!(
+            !cols.iter().any(|c| c == "protected"),
+            "protected flag dropped"
+        );
     }
 }

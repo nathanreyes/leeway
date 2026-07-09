@@ -9,6 +9,7 @@ use crate::queries;
 use anyhow::Result;
 use chrono::{Datelike, NaiveDate};
 use rusqlite::Connection;
+use std::collections::HashMap;
 
 /// One envelope with its computed state for this point in the month.
 pub struct EnvelopeRow {
@@ -64,6 +65,18 @@ impl MonthView {
         let all_txns = queries::load_txns(conn, &month_row.id)?;
         let envelopes_raw = queries::load_envelopes(conn, &month_row.id)?;
 
+        // Manual envelope spending is needed only as one total per envelope. Group it once
+        // rather than cloning and filtering the entire transaction list for every envelope.
+        let mut spending_by_envelope = HashMap::<&str, Money>::new();
+        for txn in &all_txns {
+            if let Some(envelope_id) = txn.envelope_id.as_deref() {
+                let total = spending_by_envelope
+                    .entry(envelope_id)
+                    .or_insert(Money::ZERO);
+                *total = *total + txn.amount;
+            }
+        }
+
         let fraction = calc::elapsed_fraction(month_row.start_date, month_row.days_in_month, today);
         let days_elapsed = calc::days_elapsed(month_row.start_date, month_row.days_in_month, today);
 
@@ -115,14 +128,21 @@ impl MonthView {
         let mut envelopes = Vec::new();
         for env in envelopes_raw {
             // `env.mode` is the frozen snapshot from stamp time — no global re-resolution.
-            let env_txns: Vec<Txn> = all_txns
-                .iter()
-                .filter(|t| t.envelope_id.as_deref() == Some(env.id.as_str()))
-                .cloned()
-                .collect();
-            let consumed = calc::envelope_consumed(&env, env.mode, &env_txns, fraction);
+            let consumed = match env.mode {
+                crate::models::Mode::Automatic => {
+                    calc::envelope_consumed(&env, env.mode, &[], fraction)
+                }
+                crate::models::Mode::Manual => spending_by_envelope
+                    .get(env.id.as_str())
+                    .copied()
+                    .unwrap_or(Money::ZERO),
+            };
             let remaining = calc::envelope_remaining(&env, consumed);
-            envelopes.push(EnvelopeRow { envelope: env, consumed, remaining });
+            envelopes.push(EnvelopeRow {
+                envelope: env,
+                consumed,
+                remaining,
+            });
         }
         let envelopes_remaining: Money = envelopes.iter().map(|e| e.remaining).sum();
 
@@ -268,18 +288,18 @@ impl SeriesPageView {
         let all_months = queries::months(conn)?;
         let axis = months_for_range(&all_months, today, range);
         let current_label = format!("{:04}-{:02}", today.year(), today.month());
-        let current_month = queries::month_by_label(conn, &current_label)?;
+        let current_month = all_months.iter().find(|month| month.label == current_label);
+        let aggregates = queries::series_trend_aggregates(conn)?;
+        let mut plan_names = queries::plan_names_by_series(conn)?;
 
         let mut details = Vec::new();
         for series in queries::list_series(conn)? {
-            let points = trend_points(conn, &series, &axis)?;
-            let current = match &current_month {
-                Some(month) => current_summary(conn, &series, month)?,
-                None => None,
-            };
+            let points = trend_points(&series, &axis, &aggregates);
+            let current =
+                current_month.and_then(|month| current_summary(&series, month, &aggregates));
             details.push(SeriesDetailView {
                 group: SeriesGroup::for_series(&series),
-                plan_names: queries::plan_names_for_series(conn, &series.id)?,
+                plan_names: plan_names.remove(&series.id).unwrap_or_default(),
                 stats: stats_for_points(&points),
                 points,
                 current,
@@ -323,84 +343,59 @@ fn months_for_range(months: &[Month], today: NaiveDate, range: SeriesTimeRange) 
 }
 
 fn trend_points(
-    conn: &Connection,
     series: &Series,
     months: &[Month],
-) -> Result<Vec<SeriesTrendPoint>> {
-    let mut points = Vec::new();
-    for month in months {
-        points.push(match series.kind {
-            Kind::Transaction => transaction_point(conn, series, month)?,
-            Kind::Envelope => envelope_point(conn, series, month)?,
-        });
-    }
-    Ok(points)
+    aggregates: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, queries::SeriesTrendAggregate>,
+    >,
+) -> Vec<SeriesTrendPoint> {
+    months
+        .iter()
+        .map(|month| trend_point(series, month, aggregates))
+        .collect()
 }
 
-fn transaction_point(
-    conn: &Connection,
+fn trend_point(
     series: &Series,
     month: &Month,
-) -> Result<SeriesTrendPoint> {
-    let txns = queries::load_txns(conn, &month.id)?;
-    let rows: Vec<_> = txns
-        .iter()
-        .filter(|txn| {
-            txn.envelope_id.is_none() && txn.series_id.as_deref() == Some(series.id.as_str())
-        })
-        .collect();
-    let occurrence_count = rows.len();
-    let effective = (occurrence_count > 0).then(|| rows.iter().map(|txn| txn.amount).sum());
-    let planned_values: Vec<Money> = rows.iter().filter_map(|txn| txn.stamped_amount).collect();
-    let planned = (!planned_values.is_empty()).then(|| planned_values.into_iter().sum());
-    let settled_count = rows.iter().filter(|txn| txn.settled).count();
+    aggregates: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, queries::SeriesTrendAggregate>,
+    >,
+) -> SeriesTrendPoint {
+    let aggregate = aggregates
+        .get(&series.id)
+        .and_then(|by_month| by_month.get(&month.id));
+    let occurrence_count = aggregate.map(|value| value.occurrence_count).unwrap_or(0);
+    let settled_count = aggregate.map(|value| value.settled_count).unwrap_or(0);
 
-    Ok(SeriesTrendPoint {
+    SeriesTrendPoint {
         month_label: month.label.clone(),
-        effective,
-        planned,
+        effective: aggregate.map(|value| value.effective),
+        planned: aggregate.and_then(|value| value.planned),
         occurrence_count,
         settled_count,
         unsettled_count: occurrence_count.saturating_sub(settled_count),
-    })
-}
-
-fn envelope_point(conn: &Connection, series: &Series, month: &Month) -> Result<SeriesTrendPoint> {
-    let envelopes = queries::load_envelopes(conn, &month.id)?;
-    let rows: Vec<_> = envelopes
-        .iter()
-        .filter(|envelope| envelope.series_id.as_deref() == Some(series.id.as_str()))
-        .collect();
-    let occurrence_count = rows.len();
-    let effective = (occurrence_count > 0).then(|| rows.iter().map(|env| env.amount).sum());
-    let planned = (occurrence_count > 0).then(|| rows.iter().map(|env| env.stamped_amount).sum());
-
-    Ok(SeriesTrendPoint {
-        month_label: month.label.clone(),
-        effective,
-        planned,
-        occurrence_count,
-        settled_count: 0,
-        unsettled_count: 0,
-    })
+    }
 }
 
 fn current_summary(
-    conn: &Connection,
     series: &Series,
     month: &Month,
-) -> Result<Option<SeriesCurrentSummary>> {
-    let point = match series.kind {
-        Kind::Transaction => transaction_point(conn, series, month)?,
-        Kind::Envelope => envelope_point(conn, series, month)?,
-    };
-    Ok(point.effective.map(|amount| SeriesCurrentSummary {
+    aggregates: &std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, queries::SeriesTrendAggregate>,
+    >,
+) -> Option<SeriesCurrentSummary> {
+    let point = trend_point(series, month, aggregates);
+    point.effective.map(|amount| SeriesCurrentSummary {
         month_label: point.month_label,
         amount,
         occurrence_count: point.occurrence_count,
         settled_count: point.settled_count,
         unsettled_count: point.unsettled_count,
-    }))
+    })
 }
 
 fn stats_for_points(points: &[SeriesTrendPoint]) -> SeriesStats {
@@ -456,7 +451,11 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
 
         let before = MonthView::build(&conn, today).unwrap().unwrap();
-        assert_eq!(before.accounts.len(), 2, "seed makes checking + credit card");
+        assert_eq!(
+            before.accounts.len(),
+            2,
+            "seed makes checking + credit card"
+        );
 
         // Bump the (unprotected) checking account by exactly $500.
         let checking = before
@@ -487,19 +486,35 @@ mod tests {
 
         let before = MonthView::build(&conn, today).unwrap().unwrap();
         // Funds are checking only; the demo card owes 5000 − 4150 = 850.
-        assert_eq!(before.whats_left.funds_available, Money::from_dollars(4200.0));
+        assert_eq!(
+            before.whats_left.funds_available,
+            Money::from_dollars(4200.0)
+        );
         assert_eq!(before.whats_left.card_debt, Money::from_dollars(850.0));
         // Regression guard: the card must SUBTRACT, not add (the old bug added it).
-        assert!(before.whats_left.whats_left < before.whats_left.funds_available + before.whats_left.income_remaining);
+        assert!(
+            before.whats_left.whats_left
+                < before.whats_left.funds_available + before.whats_left.income_remaining
+        );
 
         // Spend $100 on the card → available drops $100 → owed +$100 → what's left −$100.
-        let card = before.accounts.iter().find(|a| a.name == "Credit Card").unwrap();
+        let card = before
+            .accounts
+            .iter()
+            .find(|a| a.name == "Credit Card")
+            .unwrap();
         let new_avail = card.available_credit.unwrap() - Money::from_dollars(100.0);
         ops::set_available_credit(&conn, &card.id, new_avail).unwrap();
 
         let after = MonthView::build(&conn, today).unwrap().unwrap();
-        assert_eq!(after.whats_left.card_debt, before.whats_left.card_debt + Money::from_dollars(100.0));
-        assert_eq!(after.whats_left.whats_left, before.whats_left.whats_left - Money::from_dollars(100.0));
+        assert_eq!(
+            after.whats_left.card_debt,
+            before.whats_left.card_debt + Money::from_dollars(100.0)
+        );
+        assert_eq!(
+            after.whats_left.whats_left,
+            before.whats_left.whats_left - Money::from_dollars(100.0)
+        );
     }
 
     #[test]
@@ -514,7 +529,9 @@ mod tests {
         let start = NaiveDate::from_ymd_opt(2027, 3, 1).unwrap();
         ops::stamp(&mut conn, &plan_id, "2027-03", start, 31).unwrap();
 
-        let future = MonthView::build_for(&conn, today, 2027, 3).unwrap().unwrap();
+        let future = MonthView::build_for(&conn, today, 2027, 3)
+            .unwrap()
+            .unwrap();
 
         // Off-month: the three account-derived terms drop out entirely...
         assert!(!future.is_current);
@@ -529,9 +546,14 @@ mod tests {
         );
 
         // The current month, by contrast, still folds the checking balance in.
-        let current = MonthView::build_for(&conn, today, 2026, 7).unwrap().unwrap();
+        let current = MonthView::build_for(&conn, today, 2026, 7)
+            .unwrap()
+            .unwrap();
         assert!(current.is_current);
-        assert_eq!(current.whats_left.funds_available, Money::from_dollars(4200.0));
+        assert_eq!(
+            current.whats_left.funds_available,
+            Money::from_dollars(4200.0)
+        );
     }
 
     #[test]
@@ -541,7 +563,11 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
         // A period nobody stamped returns None — the dashboard renders its "not stamped"
         // prompt for this and still lets you navigate away.
-        assert!(MonthView::build_for(&conn, today, 2099, 1).unwrap().is_none());
+        assert!(
+            MonthView::build_for(&conn, today, 2099, 1)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

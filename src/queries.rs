@@ -5,10 +5,11 @@
 //! `Money` and `row.get("direction")` yields a `Direction` directly — no manual parsing.
 
 use crate::models::*;
+use crate::money::Money;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use rusqlite::{Connection, OptionalExtension, Row};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The global default envelope mode (from the `setting` table). Falls back to
 /// Automatic if the row is somehow missing.
@@ -77,6 +78,27 @@ pub fn month_by_label(conn: &Connection, label: &str) -> Result<Option<Month>> {
     }
 }
 
+pub fn month_by_id(conn: &Connection, id: &str) -> Result<Option<Month>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, plan_id, label, start_date, days_in_month
+         FROM month WHERE id = ?1 LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map([id], map_month_raw)?;
+    match rows.next() {
+        None => Ok(None),
+        Some(raw) => Ok(Some(raw?.parse()?)),
+    }
+}
+
+pub fn month_days(conn: &Connection, month_id: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT days_in_month FROM month WHERE id = ?1",
+        [month_id],
+        |r| r.get("days_in_month"),
+    )
+    .with_context(|| format!("month not found: {month_id}"))
+}
+
 /// Every stamped month, oldest first. Series trends use this as the time axis before
 /// applying their selected range.
 pub fn months(conn: &Connection) -> Result<Vec<Month>> {
@@ -112,6 +134,24 @@ pub fn load_txns(conn: &Connection, month_id: &str) -> Result<Vec<Txn>> {
     )?;
     let rows = stmt
         .query_map([month_id], map_txn)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn load_envelope_txns(
+    conn: &Connection,
+    month_id: &str,
+    envelope_id: &str,
+) -> Result<Vec<Txn>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, month_id, series_id, envelope_id, account_id, label,
+                direction, amount_cents, stamped_amount_cents, settled, date_paid
+         FROM txn
+         WHERE month_id = ?1 AND envelope_id = ?2
+         ORDER BY label, id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![month_id, envelope_id], map_txn)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -228,6 +268,105 @@ pub fn plan_names_for_series(conn: &Connection, series_id: &str) -> Result<Vec<S
         .query_map([series_id], |r| r.get::<_, String>("name"))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// All current plan memberships, grouped by durable series id. The Series page loads this
+/// once instead of issuing one query for each visible series.
+pub fn plan_names_by_series(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT pi.series_id, p.name
+         FROM plan_item pi
+         JOIN plan p ON p.id = pi.plan_id
+         ORDER BY pi.series_id, p.name",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut names = HashMap::<String, Vec<String>>::new();
+    for row in rows {
+        let (series_id, name) = row?;
+        names.entry(series_id).or_default().push(name);
+    }
+    Ok(names)
+}
+
+/// One series' aggregate for one stamped month. These are the compact inputs to the Series
+/// chart and stats: unlike `load_txns` and `load_envelopes`, they do not pull every raw row
+/// once per series.
+#[derive(Clone, Debug)]
+pub struct SeriesTrendAggregate {
+    pub effective: Money,
+    pub planned: Option<Money>,
+    pub occurrence_count: usize,
+    pub settled_count: usize,
+}
+
+/// Every persisted trend aggregate, nested by series then month. Transaction and envelope
+/// rows have different fields, so SQLite calculates them in two grouped queries and the
+/// caller receives one common shape.
+pub fn series_trend_aggregates(
+    conn: &Connection,
+) -> Result<HashMap<String, HashMap<String, SeriesTrendAggregate>>> {
+    let mut aggregates = HashMap::<String, HashMap<String, SeriesTrendAggregate>>::new();
+    let mut insert = |series_id: String, month_id: String, aggregate: SeriesTrendAggregate| {
+        aggregates
+            .entry(series_id)
+            .or_default()
+            .insert(month_id, aggregate);
+    };
+
+    let mut txns = conn.prepare(
+        "SELECT series_id, month_id,
+                SUM(amount_cents) AS effective_cents,
+                SUM(stamped_amount_cents) AS planned_cents,
+                COUNT(*) AS occurrence_count,
+                SUM(CASE WHEN settled THEN 1 ELSE 0 END) AS settled_count
+         FROM txn
+         WHERE envelope_id IS NULL AND series_id IS NOT NULL
+         GROUP BY series_id, month_id",
+    )?;
+    let rows = txns.query_map([], |r| {
+        Ok((
+            r.get::<_, String>("series_id")?,
+            r.get::<_, String>("month_id")?,
+            SeriesTrendAggregate {
+                effective: r.get("effective_cents")?,
+                planned: r.get("planned_cents")?,
+                occurrence_count: r.get::<_, i64>("occurrence_count")? as usize,
+                settled_count: r.get::<_, i64>("settled_count")? as usize,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (series_id, month_id, aggregate) = row?;
+        insert(series_id, month_id, aggregate);
+    }
+
+    let mut envelopes = conn.prepare(
+        "SELECT series_id, month_id,
+                SUM(amount_cents) AS effective_cents,
+                SUM(stamped_amount_cents) AS planned_cents,
+                COUNT(*) AS occurrence_count
+         FROM envelope
+         WHERE series_id IS NOT NULL
+         GROUP BY series_id, month_id",
+    )?;
+    let rows = envelopes.query_map([], |r| {
+        Ok((
+            r.get::<_, String>("series_id")?,
+            r.get::<_, String>("month_id")?,
+            SeriesTrendAggregate {
+                effective: r.get("effective_cents")?,
+                planned: r.get("planned_cents")?,
+                occurrence_count: r.get::<_, i64>("occurrence_count")? as usize,
+                settled_count: 0,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (series_id, month_id, aggregate) = row?;
+        insert(series_id, month_id, aggregate);
+    }
+
+    Ok(aggregates)
 }
 
 /// How many stamped month instances (txn + envelope rows) still carry this series id.

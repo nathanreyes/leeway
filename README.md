@@ -84,7 +84,8 @@ Common dashboard keys:
 - `r`: rename the focused item.
 - `a`: edit an amount.
 - `s`: add spending to a manual envelope.
-- `p`: open Plans.
+- `e`: open envelope details and spending management.
+- `P`: open Plans.
 - `S`: open Series and trends.
 - `q` / `Esc`: quit.
 

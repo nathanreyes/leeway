@@ -24,6 +24,10 @@ impl Money {
     /// Zero dollars — handy as a starting accumulator.
     pub const ZERO: Money = Money(0);
 
+    /// The largest user-entered amount we accept. Keeping a full month's daily rate within
+    /// the signed-cent range prevents a valid input from overflowing when it is monthlyized.
+    const MAX_INPUT_CENTS: u64 = i64::MAX as u64 / 31;
+
     /// Build from a whole-and-fractional dollar figure, e.g. `Money::from_dollars(12.34)`.
     /// Rounds to the nearest cent. Used when seeding demo data or accepting typed input.
     pub fn from_dollars(dollars: f64) -> Money {
@@ -40,7 +44,9 @@ impl Money {
     /// "70", "$1,234.56", "-12.5" all work. Returns `None` on anything unparseable, so
     /// the UI can reject bad input instead of silently storing garbage.
     pub fn parse_dollars(input: &str) -> Option<Money> {
-        // Strip the characters humans add for readability, then lean on f64 parsing.
+        // Strip the characters humans add for readability, then parse the decimal text
+        // directly. Going through f64 would accept NaN/scientific overflow and can lose a
+        // cent before we ever store the value as an integer.
         let cleaned: String = input
             .chars()
             .filter(|c| *c != '$' && *c != ',' && !c.is_whitespace())
@@ -48,7 +54,48 @@ impl Money {
         if cleaned.is_empty() {
             return None;
         }
-        cleaned.parse::<f64>().ok().map(Money::from_dollars)
+
+        let (negative, unsigned) = match cleaned.as_bytes().first() {
+            Some(b'-') => (true, &cleaned[1..]),
+            Some(b'+') => (false, &cleaned[1..]),
+            _ => (false, cleaned.as_str()),
+        };
+        let mut parts = unsigned.split('.');
+        let whole = parts.next()?;
+        let fraction = parts.next();
+        if parts.next().is_some()
+            || (whole.is_empty() && fraction.is_none())
+            || !whole.chars().all(|c| c.is_ascii_digit())
+        {
+            return None;
+        }
+
+        let whole_cents = if whole.is_empty() {
+            0
+        } else {
+            whole.parse::<u64>().ok()?.checked_mul(100)?
+        };
+        let fractional_cents = match fraction {
+            None | Some("") => 0,
+            Some(digits) if digits.len() == 1 && digits.chars().all(|c| c.is_ascii_digit()) => {
+                digits.parse::<u64>().ok()? * 10
+            }
+            Some(digits) if digits.len() == 2 && digits.chars().all(|c| c.is_ascii_digit()) => {
+                digits.parse::<u64>().ok()?
+            }
+            Some(_) => return None,
+        };
+        let cents = whole_cents.checked_add(fractional_cents)?;
+        if cents > Self::MAX_INPUT_CENTS {
+            return None;
+        }
+
+        let cents = i64::try_from(cents).ok()?;
+        Some(if negative {
+            Money(-cents)
+        } else {
+            Money(cents)
+        })
     }
 
     /// Scale by a fraction in [0.0, 1.0] and round to the nearest cent.
@@ -56,6 +103,11 @@ impl Money {
     /// We do the multiply in floating point (a fraction of a value is inherently
     /// fractional) but immediately round back to exact integer cents.
     pub fn scale(self, fraction: f64) -> Money {
+        let fraction = if fraction.is_finite() {
+            fraction.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         Money((self.0 as f64 * fraction).round() as i64)
     }
 }
@@ -67,14 +119,14 @@ impl Money {
 impl Add for Money {
     type Output = Money;
     fn add(self, rhs: Money) -> Money {
-        Money(self.0 + rhs.0)
+        Money(self.0.saturating_add(rhs.0))
     }
 }
 
 impl Sub for Money {
     type Output = Money;
     fn sub(self, rhs: Money) -> Money {
-        Money(self.0 - rhs.0)
+        Money(self.0.saturating_sub(rhs.0))
     }
 }
 
@@ -92,7 +144,7 @@ impl std::iter::Sum for Money {
 impl fmt::Display for Money {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let negative = self.0 < 0;
-        let abs = self.0.abs();
+        let abs = self.0.unsigned_abs();
         let dollars = abs / 100;
         let cents = abs % 100;
 
@@ -111,14 +163,14 @@ impl fmt::Display for Money {
 }
 
 /// Insert commas every three digits from the right. Kept private to this module.
-fn group_thousands(n: i64) -> String {
+fn group_thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     // Count from the left, inserting a comma before every group of three that
     // remains on the right.
     let len = digits.len();
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -156,6 +208,25 @@ mod tests {
         assert_eq!(Money::parse_dollars(" -12.5 "), Some(Money(-1250)));
         assert_eq!(Money::parse_dollars(""), None);
         assert_eq!(Money::parse_dollars("abc"), None);
+    }
+
+    #[test]
+    fn rejects_non_decimal_and_out_of_range_input() {
+        for input in [
+            "NaN",
+            "inf",
+            "1e100",
+            "12.345",
+            "--12",
+            "$92,000,000,000,000,000",
+        ] {
+            assert_eq!(Money::parse_dollars(input), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn formats_the_minimum_i64_amount() {
+        assert_eq!(Money(i64::MIN).to_string(), "-$92,233,720,368,547,758.08");
     }
 
     #[test]

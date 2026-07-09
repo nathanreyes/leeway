@@ -3,12 +3,13 @@
 //! Each function takes `&Connection` and returns `Result<()>` (or an id). Multi-row
 //! operations run inside a transaction so a failure can't leave a half-stamped month.
 
+use crate::calc;
 use crate::models::*;
 use crate::money::Money;
 use crate::queries;
 use anyhow::{Context, Result};
 use chrono::{Datelike, Local, NaiveDate};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -47,7 +48,7 @@ pub fn stamp(
 
     // `&tx` coerces to `&Connection`, so query/insert helpers run inside this transaction.
     for entry in queries::load_plan_entries(&tx, plan_id)? {
-        insert_instance_from_entry(&tx, &month_id, &entry)?;
+        insert_instance_from_entry(&tx, &month_id, &entry, days_in_month)?;
     }
 
     tx.commit()?;
@@ -57,10 +58,20 @@ pub fn stamp(
 /// Insert one fresh instance (envelope or standalone txn) for a plan entry into a month.
 /// The intrinsic fields come from the shared `series`; the amount from this plan's item.
 /// `stamped_amount == amount` at stamp time. Shared by fresh stamp, merge, and replace.
-fn insert_instance_from_entry(conn: &Connection, month_id: &str, entry: &PlanEntry) -> Result<()> {
+fn insert_instance_from_entry(
+    conn: &Connection,
+    month_id: &str,
+    entry: &PlanEntry,
+    days_in_month: i64,
+) -> Result<()> {
     let s = &entry.series;
     match s.kind {
         Kind::Envelope => {
+            let amount = calc::monthlyized_envelope_amount(
+                entry.amount,
+                s.period_type.unwrap_or(PeriodType::Monthly),
+                days_in_month,
+            );
             conn.execute(
                 "INSERT INTO envelope
                    (id, month_id, series_id, label, amount_cents,
@@ -71,9 +82,9 @@ fn insert_instance_from_entry(conn: &Connection, month_id: &str, entry: &PlanEnt
                     month_id,
                     s.id, // series_id = the durable series identity
                     s.label,
-                    entry.amount,
-                    entry.amount,
-                    s.period_type.unwrap_or(PeriodType::Monthly),
+                    amount,
+                    amount,
+                    calc::active_period(s.period_type.unwrap_or(PeriodType::Monthly)),
                     // Envelope series always carry a concrete mode (enforced at creation and
                     // by the series CHECK), so this copies a real value into the frozen snapshot.
                     s.mode.expect("envelope series must have a mode"),
@@ -157,6 +168,7 @@ pub fn month_has_items_outside_plan(
 /// - A matching **unsettled** instance is refreshed to the plan's values.
 /// - A matching **settled** transaction is left untouched (it holds a real actual).
 /// - A plan entry with no instance is inserted.
+///
 /// Nothing is ever deleted. Repeated occurrences of a series are matched in stable row
 /// order.
 pub fn restamp_merge(conn: &mut Connection, month_id: &str, plan_id: &str) -> Result<()> {
@@ -164,6 +176,7 @@ pub fn restamp_merge(conn: &mut Connection, month_id: &str, plan_id: &str) -> Re
     let entries = queries::load_plan_entries(&tx, plan_id)?;
     let txns = queries::load_txns(&tx, month_id)?;
     let envelopes = queries::load_envelopes(&tx, month_id)?;
+    let days_in_month = queries::month_days(&tx, month_id)?;
     let mut matched_txns: HashSet<String> = HashSet::new();
     let mut matched_envelopes: HashSet<String> = HashSet::new();
 
@@ -174,9 +187,9 @@ pub fn restamp_merge(conn: &mut Connection, month_id: &str, plan_id: &str) -> Re
                     next_matching_envelope(&envelopes, &matched_envelopes, &entry.series.id)
                 {
                     matched_envelopes.insert(envelope.id.clone());
-                    refresh_envelope(&tx, &envelope.id, entry)?;
+                    refresh_envelope(&tx, &envelope.id, entry, days_in_month)?;
                 } else {
-                    insert_instance_from_entry(&tx, month_id, entry)?;
+                    insert_instance_from_entry(&tx, month_id, entry, days_in_month)?;
                 }
             }
             Kind::Transaction => {
@@ -186,7 +199,7 @@ pub fn restamp_merge(conn: &mut Connection, month_id: &str, plan_id: &str) -> Re
                         refresh_txn(&tx, &txn.id, entry)?;
                     }
                 } else {
-                    insert_instance_from_entry(&tx, month_id, entry)?;
+                    insert_instance_from_entry(&tx, month_id, entry, days_in_month)?;
                 }
             }
         }
@@ -214,6 +227,7 @@ pub fn restamp_replace(
     let entries = queries::load_plan_entries(&tx, plan_id)?;
     let txns = queries::load_txns(&tx, month_id)?;
     let envelopes = queries::load_envelopes(&tx, month_id)?;
+    let days_in_month = queries::month_days(&tx, month_id)?;
     let mut matched_txns: HashSet<String> = HashSet::new();
     let mut matched_envelopes: HashSet<String> = HashSet::new();
 
@@ -224,9 +238,9 @@ pub fn restamp_replace(
                     next_matching_envelope(&envelopes, &matched_envelopes, &entry.series.id)
                 {
                     matched_envelopes.insert(envelope.id.clone());
-                    refresh_envelope(&tx, &envelope.id, entry)?;
+                    refresh_envelope(&tx, &envelope.id, entry, days_in_month)?;
                 } else {
-                    insert_instance_from_entry(&tx, month_id, entry)?;
+                    insert_instance_from_entry(&tx, month_id, entry, days_in_month)?;
                 }
             }
             Kind::Transaction => {
@@ -234,7 +248,7 @@ pub fn restamp_replace(
                     matched_txns.insert(txn.id.clone());
                     refresh_txn(&tx, &txn.id, entry)?;
                 } else {
-                    insert_instance_from_entry(&tx, month_id, entry)?;
+                    insert_instance_from_entry(&tx, month_id, entry, days_in_month)?;
                 }
             }
         }
@@ -313,18 +327,28 @@ fn occurrence_key(kind: Kind, series_id: &str) -> String {
 }
 
 /// Reset an envelope instance to a plan entry's planned values.
-fn refresh_envelope(conn: &Connection, id: &str, entry: &PlanEntry) -> Result<()> {
+fn refresh_envelope(
+    conn: &Connection,
+    id: &str,
+    entry: &PlanEntry,
+    days_in_month: i64,
+) -> Result<()> {
     let s = &entry.series;
+    let amount = calc::monthlyized_envelope_amount(
+        entry.amount,
+        s.period_type.unwrap_or(PeriodType::Monthly),
+        days_in_month,
+    );
     conn.execute(
         "UPDATE envelope
          SET amount_cents = ?1, stamped_amount_cents = ?2, label = ?3,
              period_type = ?4, mode = ?5
-         WHERE id = ?6",
+        WHERE id = ?6",
         rusqlite::params![
-            entry.amount,
-            entry.amount,
+            amount,
+            amount,
             s.label,
-            s.period_type.unwrap_or(PeriodType::Monthly),
+            calc::active_period(s.period_type.unwrap_or(PeriodType::Monthly)),
             s.mode.expect("envelope series must have a mode"),
             id
         ],
@@ -666,6 +690,38 @@ pub fn set_series_mode(conn: &Connection, series_id: &str, mode: Mode) -> Result
 }
 
 pub fn set_series_period(conn: &Connection, series_id: &str, period: PeriodType) -> Result<()> {
+    let period = calc::active_period(period);
+    let current = conn
+        .query_row(
+            "SELECT period_type FROM series WHERE id = ?1",
+            [series_id],
+            |r| r.get::<_, Option<PeriodType>>("period_type"),
+        )
+        .optional()?
+        .flatten()
+        .map(calc::active_period)
+        .unwrap_or(PeriodType::Monthly);
+
+    if current != period {
+        match (current, period) {
+            (PeriodType::Monthly, PeriodType::Daily) => {
+                conn.execute(
+                    "UPDATE plan_item
+                     SET amount_cents = CAST(ROUND(amount_cents / 30.0) AS INTEGER)
+                     WHERE series_id = ?1",
+                    [series_id],
+                )?;
+            }
+            (PeriodType::Daily, PeriodType::Monthly) => {
+                conn.execute(
+                    "UPDATE plan_item SET amount_cents = amount_cents * 30 WHERE series_id = ?1",
+                    [series_id],
+                )?;
+            }
+            _ => {}
+        }
+    }
+
     conn.execute(
         "UPDATE series SET period_type = ?1 WHERE id = ?2",
         rusqlite::params![period, series_id],
@@ -747,6 +803,9 @@ pub fn add_series_envelope_instance(
     if series.kind != Kind::Envelope {
         anyhow::bail!("series is not an envelope");
     }
+    let period = calc::active_period(series.period_type.unwrap_or(PeriodType::Monthly));
+    let days_in_month = queries::month_days(conn, month_id)?;
+    let amount = calc::monthlyized_envelope_amount(amount, period, days_in_month);
 
     let id = new_id();
     conn.execute(
@@ -761,7 +820,7 @@ pub fn add_series_envelope_instance(
             series.label,
             amount,
             amount,
-            series.period_type.unwrap_or(PeriodType::Monthly),
+            period,
             series.mode.expect("envelope series must have a mode"),
         ],
     )?;
@@ -804,6 +863,9 @@ pub fn add_oneoff_envelope(
     period_type: PeriodType,
     mode: Mode,
 ) -> Result<String> {
+    let period_type = calc::active_period(period_type);
+    let days_in_month = queries::month_days(conn, month_id)?;
+    let amount = calc::monthlyized_envelope_amount(amount, period_type, days_in_month);
     let id = new_id();
     conn.execute(
         "INSERT INTO envelope
@@ -827,11 +889,16 @@ pub fn add_envelope_spending(
     amount: Money,
 ) -> Result<String> {
     let id = new_id();
-    conn.execute(
+    let inserted = conn.execute(
         "INSERT INTO txn (id, month_id, envelope_id, label, direction, amount_cents, settled)
-         VALUES (?1, ?2, ?3, ?4, 'out', ?5, 1)",
+         SELECT ?1, ?2, id, ?4, 'out', ?5, 1
+         FROM envelope
+         WHERE id = ?3 AND month_id = ?2 AND mode = 'manual'",
         rusqlite::params![id, month_id, envelope_id, label, amount],
     )?;
+    if inserted == 0 {
+        anyhow::bail!("manual envelope not found in the selected month");
+    }
     Ok(id)
 }
 
@@ -1063,6 +1130,97 @@ mod tests {
         assert_eq!(rent.amount, Money::from_dollars(1800.0));
         assert_eq!(rent.stamped_amount, Some(Money::from_dollars(1800.0)));
         assert!(!rent.settled);
+    }
+
+    #[test]
+    fn stamping_daily_envelope_stores_monthly_total() {
+        let mut conn = db::open_in_memory().unwrap();
+        let plan_id = create_plan(&conn, "Daily rates").unwrap();
+        let lunch = create_series(
+            &conn,
+            Kind::Envelope,
+            "Lunch",
+            None,
+            Some(PeriodType::Daily),
+            Some(Mode::Automatic),
+        )
+        .unwrap();
+        add_plan_item(&conn, &plan_id, &lunch, Money::from_dollars(15.0)).unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let month_id = stamp(&mut conn, &plan_id, "2026-09", start, 30).unwrap();
+        let envelopes = queries::load_envelopes(&conn, &month_id).unwrap();
+        let lunch = envelopes
+            .iter()
+            .find(|envelope| envelope.label == "Lunch")
+            .unwrap();
+
+        assert_eq!(lunch.period_type, PeriodType::Daily);
+        assert_eq!(lunch.amount, Money::from_dollars(450.0));
+        assert_eq!(lunch.stamped_amount, Money::from_dollars(450.0));
+    }
+
+    #[test]
+    fn changing_series_period_converts_plan_amounts() {
+        let conn = db::open_in_memory().unwrap();
+        let plan_id = create_plan(&conn, "Rates").unwrap();
+        let lunch = create_series(
+            &conn,
+            Kind::Envelope,
+            "Lunch",
+            None,
+            Some(PeriodType::Monthly),
+            Some(Mode::Automatic),
+        )
+        .unwrap();
+        let item_id = add_plan_item(&conn, &plan_id, &lunch, Money::from_dollars(450.0)).unwrap();
+
+        set_series_period(&conn, &lunch, PeriodType::Daily).unwrap();
+        let entries = queries::load_plan_entries(&conn, &plan_id).unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.item_id == item_id)
+            .unwrap();
+        assert_eq!(entry.series.period_type, Some(PeriodType::Daily));
+        assert_eq!(entry.amount, Money::from_dollars(15.0));
+
+        set_series_period(&conn, &lunch, PeriodType::Monthly).unwrap();
+        let entries = queries::load_plan_entries(&conn, &plan_id).unwrap();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.item_id == item_id)
+            .unwrap();
+        assert_eq!(entry.series.period_type, Some(PeriodType::Monthly));
+        assert_eq!(entry.amount, Money::from_dollars(450.0));
+    }
+
+    #[test]
+    fn changing_series_period_uses_nearest_thirty_day_equivalent() {
+        let conn = db::open_in_memory().unwrap();
+        let plan_id = create_plan(&conn, "Rates").unwrap();
+        let lunch = create_series(
+            &conn,
+            Kind::Envelope,
+            "Lunch",
+            None,
+            Some(PeriodType::Monthly),
+            Some(Mode::Automatic),
+        )
+        .unwrap();
+        let item_id = add_plan_item(&conn, &plan_id, &lunch, Money::from_dollars(100.0)).unwrap();
+
+        set_series_period(&conn, &lunch, PeriodType::Daily).unwrap();
+        let daily = queries::load_plan_entries(&conn, &plan_id).unwrap();
+        let daily = daily.iter().find(|entry| entry.item_id == item_id).unwrap();
+        assert_eq!(daily.amount, Money::from_dollars(3.33));
+
+        set_series_period(&conn, &lunch, PeriodType::Monthly).unwrap();
+        let monthly = queries::load_plan_entries(&conn, &plan_id).unwrap();
+        let monthly = monthly
+            .iter()
+            .find(|entry| entry.item_id == item_id)
+            .unwrap();
+        assert_eq!(monthly.amount, Money::from_dollars(99.90));
     }
 
     #[test]
@@ -1504,10 +1662,7 @@ mod tests {
         let after = crate::view::MonthView::build_for(&conn, today, today.year(), today.month())
             .unwrap()
             .unwrap();
-        assert_eq!(
-            after.whats_left.checking_buffer,
-            Money::from_dollars(500.0)
-        );
+        assert_eq!(after.whats_left.checking_buffer, Money::from_dollars(500.0));
         assert_eq!(after.whats_left.card_carry, Money::from_dollars(300.0));
         assert_eq!(
             after.whats_left.carry_adjustment,
@@ -1875,6 +2030,70 @@ mod tests {
             .collect::<Vec<_>>();
         let consumed = calc::envelope_consumed(&env, Mode::Manual, &env_txns, 0.0);
         assert_eq!(consumed, Money::from_dollars(50.0));
+    }
+
+    #[test]
+    fn envelope_spending_requires_a_manual_envelope_in_the_same_month() {
+        let mut conn = db::open_in_memory().unwrap();
+        seed_demo(&mut conn).unwrap();
+        let current = queries::current_month(&conn).unwrap().unwrap();
+        let plan_id = queries::plans(&conn).unwrap()[0].id.clone();
+        let other_month = stamp(
+            &mut conn,
+            &plan_id,
+            "2030-01",
+            NaiveDate::from_ymd_opt(2030, 1, 1).unwrap(),
+            31,
+        )
+        .unwrap();
+        let manual = add_oneoff_envelope(
+            &conn,
+            &current.id,
+            "Fun",
+            Money::from_dollars(200.0),
+            PeriodType::Monthly,
+            Mode::Manual,
+        )
+        .unwrap();
+        let automatic = add_oneoff_envelope(
+            &conn,
+            &current.id,
+            "Groceries",
+            Money::from_dollars(200.0),
+            PeriodType::Monthly,
+            Mode::Automatic,
+        )
+        .unwrap();
+
+        assert!(
+            add_envelope_spending(
+                &conn,
+                &other_month,
+                &manual,
+                "Lunch",
+                Money::from_dollars(10.0),
+            )
+            .is_err()
+        );
+        assert!(
+            add_envelope_spending(
+                &conn,
+                &current.id,
+                &automatic,
+                "Lunch",
+                Money::from_dollars(10.0),
+            )
+            .is_err()
+        );
+
+        let err = conn
+            .execute(
+                "INSERT INTO txn (id, month_id, envelope_id, label, direction, amount_cents, settled)
+                 VALUES (?1, ?2, ?3, 'Lunch', 'out', ?4, 1)",
+                rusqlite::params![new_id(), other_month, manual, Money::from_dollars(10.0)],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("another month"));
     }
 
     #[test]

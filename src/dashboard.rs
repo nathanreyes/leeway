@@ -4,8 +4,8 @@
 //! read-only data, and `handle_key` mutates `App` (and the database) in response to a key.
 
 use crate::{
-    AddDestination, App, BudgetBlock, ChoiceOption, ConfirmAction, DashFocus, ModalAction,
-    PromptKind,
+    AddDestination, App, BudgetBlock, ChoiceOption, ConfirmAction, DashFocus, EnvelopeDetail,
+    Modal, ModalAction, PromptKind,
     anim::{SummaryAnimations, SummaryTerm, display_cents},
 };
 use anyhow::Result;
@@ -125,10 +125,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         // The edit verbs mirror the plan editor's keys, but here they edit this month's
         // independent snapshot. Direction changes intentionally stay out of this fast path:
         // moving between income and expenses is safer as remove/re-add.
+        KeyCode::Char('r') | KeyCode::Char('a') | KeyCode::Char('m') | KeyCode::Char('p')
+            if app.dash_focus == DashFocus::Envelopes =>
+        {
+            app.status = Some("Press e to edit envelope details".into());
+        }
         KeyCode::Char('r') => edit_label(app, view), // rename / label
         KeyCode::Char('a') => edit_amount(app, view), // amount
         KeyCode::Char('m') => cycle_mode(app, view)?, // envelope mode
-        KeyCode::Char('t') => cycle_period(app, view)?, // envelope period type
+        KeyCode::Char('p') => cycle_period(app, view)?, // envelope period type
         KeyCode::Char('s') => feed_spending(app, view), // file spending into a manual envelope
         KeyCode::Char('x') => delete_selected(app, view), // delete this month's row
 
@@ -143,22 +148,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         KeyCode::Char('e') => {
             if app.dash_focus == DashFocus::Accounts {
                 act_on_focus(app, view)?;
+            } else if app.dash_focus == DashFocus::Envelopes {
+                open_envelope_detail(app, view);
             }
         }
         // Edit a credit card's limit (rarely changed, so it gets its own key).
-        KeyCode::Char('l') => {
-            if app.dash_focus == DashFocus::Accounts {
-                if let Some(acct) = view.accounts.get(app.dash_acct_sel) {
-                    if acct.account_type == AccountType::CreditCard {
-                        app.open_text_replace_on_type(
-                            format!("Credit limit for {}", acct.name),
-                            crate::amount_edit_string(acct.credit_limit.unwrap_or(Money::ZERO)),
-                            PromptKind::CardLimit {
-                                id: acct.id.clone(),
-                            },
-                        );
-                    }
-                }
+        KeyCode::Char('l') if app.dash_focus == DashFocus::Accounts => {
+            if let Some(acct) = view.accounts.get(app.dash_acct_sel)
+                && acct.account_type == AccountType::CreditCard
+            {
+                app.open_text_replace_on_type(
+                    format!("Credit limit for {}", acct.name),
+                    crate::amount_edit_string(acct.credit_limit.unwrap_or(Money::ZERO)),
+                    PromptKind::CardLimit {
+                        id: acct.id.clone(),
+                    },
+                );
             }
         }
         _ => {}
@@ -209,11 +214,11 @@ fn selected_txn<'v>(app: &App, view: &'v MonthView) -> Option<&'v ballpark::mode
     }
 }
 
-fn selected_txn_by_direction<'v>(
-    view: &'v MonthView,
+fn selected_txn_by_direction(
+    view: &MonthView,
     direction: Direction,
     selected: usize,
-) -> Option<&'v ballpark::models::Txn> {
+) -> Option<&ballpark::models::Txn> {
     view.standalone
         .iter()
         .filter(|txn| txn.direction == direction)
@@ -301,16 +306,16 @@ fn edit_label(app: &mut App, view: &MonthView) {
                 id: e.envelope.id.clone(),
             },
         );
-    } else if app.dash_focus == DashFocus::Accounts {
-        if let Some(acct) = view.accounts.get(app.dash_acct_sel) {
-            app.open_text_replace_on_type(
-                "Account name",
-                acct.name.clone(),
-                PromptKind::AccountName {
-                    id: acct.id.clone(),
-                },
-            );
-        }
+    } else if app.dash_focus == DashFocus::Accounts
+        && let Some(acct) = view.accounts.get(app.dash_acct_sel)
+    {
+        app.open_text_replace_on_type(
+            "Account name",
+            acct.name.clone(),
+            PromptKind::AccountName {
+                id: acct.id.clone(),
+            },
+        );
     }
 }
 
@@ -355,11 +360,27 @@ fn edit_amount(app: &mut App, view: &MonthView) {
     } else if let Some(e) = selected_env(app, view) {
         app.open_text_replace_on_type(
             "Envelope amount (dollars)",
-            crate::amount_edit_string(e.envelope.amount),
+            crate::amount_edit_string(ballpark::calc::envelope_period_amount(
+                e.envelope.amount,
+                e.envelope.period_type,
+                view.month.days_in_month,
+            )),
             PromptKind::EnvelopeAmount {
                 id: e.envelope.id.clone(),
+                period_type: e.envelope.period_type,
+                days_in_month: view.month.days_in_month,
             },
         );
+    }
+}
+
+fn open_envelope_detail(app: &mut App, view: &MonthView) {
+    if let Some(e) = selected_env(app, view) {
+        app.modal = Some(Modal::EnvelopeDetail(EnvelopeDetail {
+            month_id: view.month.id.clone(),
+            envelope_id: e.envelope.id.clone(),
+            selected_spend: 0,
+        }));
     }
 }
 
@@ -375,13 +396,12 @@ fn cycle_mode(app: &mut App, view: &MonthView) -> Result<()> {
     Ok(())
 }
 
-/// `t`: cycle a month envelope's period type (daily → weekly → monthly → …).
+/// Cycle a month envelope's period type between daily and monthly.
 fn cycle_period(app: &mut App, view: &MonthView) -> Result<()> {
     if let Some(e) = selected_env(app, view) {
         let next = match e.envelope.period_type {
-            PeriodType::Daily => PeriodType::Weekly,
-            PeriodType::Weekly => PeriodType::Monthly,
-            PeriodType::Monthly => PeriodType::Daily,
+            PeriodType::Daily => PeriodType::Monthly,
+            PeriodType::Weekly | PeriodType::Monthly => PeriodType::Daily,
         };
         ops::set_envelope_period(&app.conn, &e.envelope.id, next)?;
     }
@@ -395,9 +415,9 @@ fn feed_spending(app: &mut App, view: &MonthView) {
     if let Some(e) = selected_env(app, view) {
         match e.envelope.mode {
             Mode::Manual => app.open_text(
-                format!("Spend in “{}” (dollars)", e.envelope.label),
+                format!("Spending label for {}", e.envelope.label),
                 String::new(),
-                PromptKind::EnvelopeSpend {
+                PromptKind::EnvelopeSpendLabel {
                     envelope_id: e.envelope.id.clone(),
                     month_id: view.month.id.clone(),
                 },
@@ -427,15 +447,15 @@ fn delete_selected(app: &mut App, view: &MonthView) {
                 id: e.envelope.id.clone(),
             },
         );
-    } else if app.dash_focus == DashFocus::Accounts {
-        if let Some(acct) = view.accounts.get(app.dash_acct_sel) {
-            app.open_confirm(
-                format!("Delete account “{}”?", acct.name),
-                ConfirmAction::DeleteAccount {
-                    id: acct.id.clone(),
-                },
-            );
-        }
+    } else if app.dash_focus == DashFocus::Accounts
+        && let Some(acct) = view.accounts.get(app.dash_acct_sel)
+    {
+        app.open_confirm(
+            format!("Delete account “{}”?", acct.name),
+            ConfirmAction::DeleteAccount {
+                id: acct.id.clone(),
+            },
+        );
     }
 }
 
@@ -557,7 +577,7 @@ fn draw_missing_month(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(format!("  {label} isn't stamped yet.").bold()),
         Line::raw(""),
         Line::from(Span::styled(
-            "  Press p to open Plans and stamp one onto it,",
+            "  Press P to open Plans and stamp one onto it,",
             dim,
         )),
         Line::from(Span::styled(
@@ -608,10 +628,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             Span::raw(" move  "),
             key(" s "),
             Span::raw(" spend  "),
+            key(" e "),
+            Span::raw(" detail  "),
             key(" n "),
             Span::raw(" new  "),
-            key(" r/a/m/t "),
-            Span::raw(" edit  "),
             key(" x "),
             Span::raw(" del"),
         ]),
@@ -994,14 +1014,22 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
         .map(|e| {
             let mode = match e.envelope.mode {
                 Mode::Automatic => "auto",
-                Mode::Manual => "man ",
+                Mode::Manual => "man",
+            };
+            let period = match e.envelope.period_type {
+                PeriodType::Daily => "day",
+                PeriodType::Weekly | PeriodType::Monthly => "mo",
             };
             let meter = meter_bar(e.consumed, e.envelope.amount, 8);
             let line = Line::from(vec![
                 Span::raw(format!("{:<12}", crate::truncate(&e.envelope.label, 12))),
-                Span::styled(format!("{} ", mode), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{mode}/{period:<3} "),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(format!("{:>10} mo ", e.envelope.amount.to_string())),
                 Span::styled(meter, Style::default().fg(Color::Magenta)),
-                Span::raw(format!("  {:>9} left", e.remaining.to_string())),
+                Span::raw(format!(" {:>10} left", e.remaining.to_string())),
             ]);
             ListItem::new(line)
         })
@@ -1157,6 +1185,18 @@ mod tests {
         KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)
     }
 
+    fn period_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)
+    }
+
+    fn edit_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)
+    }
+
+    fn spend_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)
+    }
+
     fn direction_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
     }
@@ -1306,6 +1346,92 @@ mod tests {
                 PromptKind::AccountCarry { id } => assert_eq!(id, account_id),
                 _ => panic!("expected account carry prompt"),
             },
+            _ => panic!("expected text prompt"),
+        }
+    }
+
+    #[test]
+    fn period_key_points_envelope_edits_to_detail_modal() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Envelopes;
+        let view = month_view(&app);
+        let dining = view
+            .envelopes
+            .iter()
+            .find(|row| row.envelope.label == "Dining")
+            .unwrap();
+        assert_eq!(dining.envelope.period_type, PeriodType::Monthly);
+        let expected_id = dining.envelope.id.clone();
+
+        handle_key(&mut app, period_key(), &Some(view)).unwrap();
+
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Press e to edit envelope details")
+        );
+        let refreshed = month_view(&app);
+        let dining = refreshed
+            .envelopes
+            .iter()
+            .find(|row| row.envelope.id == expected_id)
+            .unwrap();
+        assert_eq!(dining.envelope.period_type, PeriodType::Monthly);
+    }
+
+    #[test]
+    fn edit_key_opens_envelope_detail_modal() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Envelopes;
+        let view = month_view(&app);
+        let dining = view
+            .envelopes
+            .iter()
+            .find(|row| row.envelope.label == "Dining")
+            .unwrap();
+        let expected_id = dining.envelope.id.clone();
+        let expected_month_id = view.month.id.clone();
+
+        handle_key(&mut app, edit_key(), &Some(view)).unwrap();
+
+        match app.modal {
+            Some(crate::Modal::EnvelopeDetail(detail)) => {
+                assert_eq!(detail.envelope_id, expected_id);
+                assert_eq!(detail.month_id, expected_month_id);
+                assert_eq!(detail.selected_spend, 0);
+            }
+            _ => panic!("expected envelope detail modal"),
+        }
+    }
+
+    #[test]
+    fn spend_key_prompts_for_envelope_spending_label() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Envelopes;
+        let view = month_view(&app);
+        let dining = view
+            .envelopes
+            .iter()
+            .find(|row| row.envelope.label == "Dining")
+            .unwrap();
+        let expected_id = dining.envelope.id.clone();
+        let expected_month_id = view.month.id.clone();
+
+        handle_key(&mut app, spend_key(), &Some(view)).unwrap();
+
+        match app.modal {
+            Some(crate::Modal::Text(prompt)) => {
+                assert_eq!(prompt.title, "Spending label for Dining");
+                match prompt.kind {
+                    PromptKind::EnvelopeSpendLabel {
+                        envelope_id,
+                        month_id,
+                    } => {
+                        assert_eq!(envelope_id, expected_id);
+                        assert_eq!(month_id, expected_month_id);
+                    }
+                    _ => panic!("expected envelope spending label prompt"),
+                }
+            }
             _ => panic!("expected text prompt"),
         }
     }
