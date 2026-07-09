@@ -1,6 +1,8 @@
 //! The Series screen: recurring-item management plus range-scoped trend stats.
 
-use crate::{App, BudgetBlock, ChoiceOption, ConfirmAction, ModalAction, PromptKind, Screen};
+use crate::{
+    App, BudgetBlock, ChoiceOption, ConfirmAction, ModalAction, PromptKind, Screen, SeriesFilter,
+};
 use anyhow::Result;
 use ballpark::models::{Kind, Mode, PeriodType};
 use ballpark::money::Money;
@@ -45,6 +47,12 @@ pub fn handle_key(
         KeyCode::Char('j') | KeyCode::Down => move_selection(app, view, 1),
         KeyCode::Char('k') | KeyCode::Up => move_selection(app, view, -1),
         KeyCode::Char('t') => open_range_choice(app, today),
+        // `f` cycles the membership filter (Both → Plans → Ad-hoc). Reset the selection so it
+        // doesn't linger past the end of a now-shorter list.
+        KeyCode::Char('f') => {
+            app.series_filter = app.series_filter.next();
+            app.series_sel = 0;
+        }
         // `n` creates a series. The list is a flat, grouped sidebar (no block focus), so we
         // pick the kind with a little menu first, then prompt for the label.
         KeyCode::Char('n') => open_new_series_choice(app),
@@ -272,21 +280,18 @@ pub fn draw(frame: &mut Frame, app: &App, view: &SeriesPageView) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) {
+    let total = view.details.len();
     let visible = visible_count(app, view);
-    let label = if app.series_search.is_empty() {
+    // Show the plain total unless a search or the membership filter is hiding rows, in which
+    // case surface "visible of total" so the count matches what's on screen.
+    let label = if visible == total {
         format!(
-            " Series - {} recurring item{} - {} ",
-            view.details.len(),
-            if view.details.len() == 1 { "" } else { "s" },
+            " Series - {total} recurring item{} - {} ",
+            if total == 1 { "" } else { "s" },
             view.range_label
         )
     } else {
-        format!(
-            " Series - {} of {} matches - {} ",
-            visible,
-            view.details.len(),
-            view.range_label
-        )
+        format!(" Series - {visible} of {total} - {} ", view.range_label)
     };
     let p = Paragraph::new(Line::from(label.bold()))
         .alignment(Alignment::Center)
@@ -302,10 +307,45 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) {
 }
 
 fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) {
-    let [search_area, list_area] =
-        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+    let [search_area, list_area, filter_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(3),
+    ])
+    .areas(area);
     draw_search(frame, search_area, app);
     draw_series_list(frame, list_area, app, view);
+    draw_filter(frame, filter_area, app);
+}
+
+/// The membership filter, shown as a segmented control under the list. The active segment is
+/// highlighted; `f` cycles it. Drives `visible_indices`.
+fn draw_filter(frame: &mut Frame, area: Rect, app: &App) {
+    let segment = |label: &str, active: bool| {
+        if active {
+            Span::styled(
+                format!(" {label} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!(" {label} "), Style::default().fg(Color::DarkGray))
+        }
+    };
+    let line = Line::from(vec![
+        Span::raw(" "),
+        segment("Both", app.series_filter == SeriesFilter::Both),
+        Span::raw(" "),
+        segment("Plans", app.series_filter == SeriesFilter::Plans),
+        Span::raw(" "),
+        segment("Ad-hoc", app.series_filter == SeriesFilter::AdHoc),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).block(crate::titled_block(" Filter ")),
+        area,
+    );
 }
 
 fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
@@ -617,13 +657,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
             key(" n "),
             Span::raw(" new  "),
             key(" r/c "),
-            Span::raw(" label/category  "),
+            Span::raw(" rename/category  "),
             key(" m/p "),
             Span::raw(" mode/period  "),
             key(" x "),
             Span::raw(" delete  "),
             key(" / "),
             Span::raw(" search  "),
+            key(" f "),
+            Span::raw(" filter  "),
             key(" t "),
             Span::raw(" range"),
         ])
@@ -634,11 +676,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
             key(" n "),
             Span::raw(" new  "),
             key(" r/c "),
-            Span::raw(" label/category  "),
+            Span::raw(" rename/category  "),
             key(" x "),
             Span::raw(" delete  "),
             key(" / "),
             Span::raw(" search  "),
+            key(" f "),
+            Span::raw(" filter  "),
             key(" t "),
             Span::raw(" range"),
         ])
@@ -701,6 +745,12 @@ fn visible_indices(app: &App, view: &SeriesPageView) -> Vec<usize> {
     view.details
         .iter()
         .enumerate()
+        // Membership filter: a series is "in a plan" iff some plan lists it (plan_names).
+        .filter(|(_, detail)| match app.series_filter {
+            SeriesFilter::Both => true,
+            SeriesFilter::Plans => !detail.plan_names.is_empty(),
+            SeriesFilter::AdHoc => detail.plan_names.is_empty(),
+        })
         .filter(|(_, detail)| {
             needle.is_empty()
                 || detail.series.label.to_lowercase().contains(&needle)

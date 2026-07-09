@@ -1061,6 +1061,7 @@ mod tests {
             series_search: String::new(),
             series_search_active: false,
             series_range: ballpark::view::SeriesTimeRange::Last12Stamped,
+            series_filter: crate::SeriesFilter::Both,
             plan_focus: crate::PlanFocus::Income,
             editor_income_sel: 0,
             editor_expense_sel: 0,

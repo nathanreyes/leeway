@@ -64,6 +64,27 @@ pub enum PlanFocus {
     Envelopes,
 }
 
+/// The Series page's membership filter: show every series, only those used by some plan, or
+/// only "ad-hoc" ones (in no plan — freshly created, or only ever added straight into a
+/// month). Classification is by `SeriesDetailView.plan_names`: empty ⟺ ad-hoc.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SeriesFilter {
+    Both,
+    Plans,
+    AdHoc,
+}
+
+impl SeriesFilter {
+    /// Cycle order for the `f` key: Both → Plans → Ad-hoc → Both.
+    pub fn next(self) -> Self {
+        match self {
+            SeriesFilter::Both => SeriesFilter::Plans,
+            SeriesFilter::Plans => SeriesFilter::AdHoc,
+            SeriesFilter::AdHoc => SeriesFilter::Both,
+        }
+    }
+}
+
 /// A floating dialog that captures input while open. Free text (names, amounts, a month
 /// to stamp), a destructive-action confirm, or a hotkey menu (Merge/Replace/Cancel).
 pub enum Modal {
@@ -346,6 +367,7 @@ pub struct App {
     pub series_search: String,
     pub series_search_active: bool,
     pub series_range: SeriesTimeRange,
+    pub series_filter: SeriesFilter,
     pub plan_focus: PlanFocus,
     pub editor_income_sel: usize,
     pub editor_expense_sel: usize,
@@ -471,6 +493,7 @@ fn main() -> Result<()> {
         series_search: String::new(),
         series_search_active: false,
         series_range: SeriesTimeRange::Last12Stamped,
+        series_filter: SeriesFilter::Both,
         plan_focus: PlanFocus::Income,
         editor_income_sel: 0,
         editor_expense_sel: 0,
