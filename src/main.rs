@@ -621,6 +621,10 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                 if let Some(key) = read_key()? {
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
+                    } else if app.series_search_active {
+                        // Search is a text-entry mode: it must own every key (including the
+                        // would-be global jump/quit keys) so you can type them into the query.
+                        series::handle_key(app, key, &view, today)?;
                     } else if handle_global_key(app, key) {
                     } else {
                         series::handle_key(app, key, &view, today)?;
@@ -717,15 +721,31 @@ fn read_key() -> Result<Option<KeyEvent>> {
     }
 }
 
+/// Keys that mean the same thing on *every* page, checked ahead of the page's own handler.
+///
+/// The two sub-pages each get an uppercase jump key — `P`lans and `S`eries — so they're reachable
+/// from anywhere without hunting for a page-specific shortcut, and `q` always quits. The Dashboard
+/// (the month view) is the home page you return to with `Esc`, so it needs no jump key of its own.
+/// Keeping these in one place is what makes navigation consistent: previously each page decided
+/// for itself what `q` did (Plans treated it as "go back", everyone else quit), and the jump keys
+/// were a mix of upper- and lowercase scattered across the page handlers.
+///
+/// This runs *after* the modal check and (for Series) the search check in the event loop, so a
+/// text-entry mode still receives these characters as literal input rather than losing them to
+/// navigation. Lowercase `p`/`s`/`d` are left free for pages to use as their own verbs.
 fn handle_global_key(app: &mut App, key: KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Char('S') => {
-            app.screen = Screen::Series;
-            app.status = None;
-            true
+    let screen = match key.code {
+        KeyCode::Char('P') => Screen::Plans,
+        KeyCode::Char('S') => Screen::Series,
+        KeyCode::Char('q') => {
+            app.should_quit = true;
+            return true;
         }
-        _ => false,
-    }
+        _ => return false,
+    };
+    app.screen = screen;
+    app.status = None;
+    true
 }
 
 /// Clamp a selection index so it always points at a real row (or 0 when the list empties).

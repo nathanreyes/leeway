@@ -5,7 +5,7 @@
 
 use crate::{
     AddDestination, App, BudgetBlock, ChoiceOption, ConfirmAction, DashFocus, ModalAction,
-    PromptKind, Screen,
+    PromptKind,
 };
 use anyhow::Result;
 use ballpark::models::{AccountType, Direction, Mode, PeriodType};
@@ -23,18 +23,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
     // Clear any leftover status the moment the user acts again.
     app.status = None;
 
-    // Global keys work on every focus, and whether or not a month is stamped.
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => {
-            app.should_quit = true;
-            return Ok(());
-        }
-        KeyCode::Char('p') => {
-            app.plans_sel = 0;
-            app.screen = Screen::Plans;
-            return Ok(());
-        }
-        _ => {}
+    // Page jumps (`P`/`S`) and `q` to quit are handled globally in the event loop before we get
+    // here. The Dashboard is the home page, so `Esc` — the canonical "go back" key on the
+    // sub-pages — has nowhere further up to go and quits the app.
+    if key.code == KeyCode::Esc {
+        app.should_quit = true;
+        return Ok(());
     }
 
     // The month header owns month navigation. It's focusable like the panels, and when the
@@ -639,7 +633,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
         ]),
     };
     let nav_hints = Line::from(vec![
-        key(" p "),
+        key(" P "),
         Span::raw(" plans  "),
         key(" S "),
         Span::raw(" series  "),
@@ -1004,6 +998,7 @@ fn key(label: &str) -> Span<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Screen;
     use ballpark::models::Kind;
     use chrono::NaiveDate;
     use ratatui::crossterm::event::KeyModifiers;

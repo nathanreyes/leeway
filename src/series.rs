@@ -40,9 +40,9 @@ pub fn handle_key(
     }
 
     match key.code {
-        KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Esc | KeyCode::Char('d') => app.screen = Screen::Dashboard,
-        KeyCode::Char('P') => app.screen = Screen::Plans,
+        // `q` (quit) and `P` (jump to Plans) are handled globally. `Esc` is the canonical way
+        // back to the Dashboard/month view.
+        KeyCode::Esc => app.screen = Screen::Dashboard,
         KeyCode::Char('/') => app.series_search_active = true,
         KeyCode::Char('j') | KeyCode::Down => move_selection(app, view, 1),
         KeyCode::Char('k') | KeyCode::Up => move_selection(app, view, -1),
@@ -688,10 +688,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
         ])
     };
     let right = Line::from(vec![
-        key(" d "),
-        Span::raw(" dashboard  "),
         key(" P "),
         Span::raw(" plans  "),
+        key(" Esc "),
+        Span::raw(" back  "),
         key(" q "),
         Span::raw(" quit"),
     ]);

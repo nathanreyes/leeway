@@ -25,7 +25,9 @@ pub fn handle_list_key(app: &mut App, key: KeyEvent, summaries: &[PlanSummary]) 
     let selected = summaries.get(app.plans_sel);
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.screen = Screen::Dashboard,
+        // `q` (quit) and `S` (jump to Series) are handled globally; `Esc` goes back to the
+        // Dashboard/month view.
+        KeyCode::Esc => app.screen = Screen::Dashboard,
         KeyCode::Char('j') | KeyCode::Down => {
             if !summaries.is_empty() && app.plans_sel + 1 < summaries.len() {
                 app.plans_sel += 1;
@@ -143,7 +145,9 @@ pub fn draw_list(frame: &mut Frame, app: &App, summaries: &[PlanSummary]) {
         key(" S "),
         Span::raw(" series  "),
         key(" Esc "),
-        Span::raw(" back"),
+        Span::raw(" back  "),
+        key(" q "),
+        Span::raw(" quit"),
     ]);
     crate::draw_split_status_footer(frame, footer, hints, nav_hints, &app.status);
 }
@@ -159,7 +163,8 @@ pub fn handle_editor_key(
     app.status = None;
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.screen = Screen::Plans,
+        // `q` quits globally; `Esc` steps back up to the plans list.
+        KeyCode::Esc => app.screen = Screen::Plans,
         KeyCode::Tab => {
             app.plan_focus = next_plan_focus(app.plan_focus);
         }
@@ -341,7 +346,9 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
         key(" S "),
         Span::raw(" series  "),
         key(" Esc "),
-        Span::raw(" back"),
+        Span::raw(" back  "),
+        key(" q "),
+        Span::raw(" quit"),
     ]);
     crate::draw_split_status_footer(frame, footer, hints, nav_hints, &app.status);
 }
