@@ -356,7 +356,7 @@ fn draw_series_list(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageV
         .iter()
         .map(|row| match row {
             SidebarRow::Header(group) => ListItem::new(Line::from(Span::styled(
-                format!(" {}", group.label()),
+                group.label().to_string(),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -370,10 +370,11 @@ fn draw_series_list(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageV
     state.select(selected_row);
 
     // The right column is the range average (stats.avg), not a stored default — a series has
-    // no default amount. Naming it in the title stops the bare money value from reading like
-    // an editable default; the detail pane labels the same figure "avg".
-    let list =
-        crate::selectable_list(items).block(crate::selectable_block(" Series · avg / mo ", true));
+    // no default amount. A right-aligned title sits directly over that column so its meaning
+    // can't be missed; the detail pane labels the same figure "avg".
+    let block = crate::selectable_block(" Series ", true)
+        .title_top(Line::from(" avg / mo ").right_aligned());
+    let list = crate::selectable_list(items).block(block);
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -384,7 +385,11 @@ fn series_row(detail: &SeriesDetailView, width: usize) -> ListItem<'static> {
         .map(|m| m.to_string())
         .unwrap_or_else(|| "--".into());
     let avg_width = 12;
-    let label_width = width.saturating_sub(avg_width + 2).max(8);
+    // Fill the full content width (label + right-aligned amount) with no extra leading space,
+    // so the label's left edge lines up under the "Series" title and the amount's right edge
+    // lines up under the right-aligned "avg / mo" title. The amount's own right-alignment
+    // padding within `avg_width` keeps a gap between a long label and the number.
+    let label_width = width.saturating_sub(avg_width).max(8);
     let label = match detail.group {
         SeriesGroup::Envelopes => {
             let meta = envelope_meta(detail);
@@ -393,7 +398,7 @@ fn series_row(detail: &SeriesDetailView, width: usize) -> ListItem<'static> {
         _ => crate::truncate(&detail.series.label, label_width),
     };
     ListItem::new(Line::from(vec![
-        Span::raw(format!(" {:<label_width$}", label)),
+        Span::raw(format!("{:<label_width$}", label)),
         Span::styled(
             format!("{:>avg_width$}", avg),
             Style::default().fg(Color::DarkGray),
@@ -434,15 +439,23 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
         return;
     };
 
-    let [chart_area, summary_area, current_area] = Layout::vertical([
+    let [chart_area, mid_area, current_area] = Layout::vertical([
         Constraint::Min(8),
-        Constraint::Length(8),
+        Constraint::Length(10),
         Constraint::Length(4),
     ])
     .areas(area);
 
+    // Summary and "Used in plans" sit side by side: the stats read as an aligned single
+    // column on the left, and plan membership gets its own list on the right rather than
+    // being crammed onto the category line.
+    let [summary_area, plans_area] =
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .areas(mid_area);
+
     draw_chart(frame, chart_area, detail, &view.range_label);
     draw_summary(frame, summary_area, detail);
+    draw_plans_used(frame, plans_area, detail);
     draw_current(frame, current_area, detail);
 }
 
@@ -453,41 +466,29 @@ fn draw_summary(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
         SeriesGroup::Envelopes => "envelope",
     };
     let category = detail.series.category.as_deref().unwrap_or("--");
-    let plans = if detail.plan_names.is_empty() {
-        "--".into()
-    } else {
-        detail.plan_names.join(", ")
-    };
     let stats = &detail.stats;
     let delta = stats
         .avg_delta
         .map(format_signed_money)
         .unwrap_or_else(|| "--".into());
 
+    // A single aligned column: fixed-width labels, values starting at the same x. This reads
+    // cleanly at any panel width and lines up regardless of amount magnitude.
     let lines = vec![
         Line::from(vec![
             Span::styled(
-                crate::truncate(&detail.series.label, 32),
+                format!(" {}", crate::truncate(&detail.series.label, 24)),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("  {kind}"), Style::default().fg(Color::DarkGray)),
         ]),
-        Line::from(vec![
-            Span::styled("category: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(crate::truncate(category, 22)),
-            Span::raw("  "),
-            Span::styled("used in plans: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(crate::truncate(&plans, 32)),
-        ]),
-        stat_pair("latest", stats.latest, "avg", stats.avg),
-        stat_pair("min", stats.min, "max", stats.max),
-        Line::from(vec![
-            Span::styled("planned avg: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format_money_opt(stats.planned_avg)),
-            Span::raw("  "),
-            Span::styled("avg delta: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(delta),
-        ]),
+        stat_row("category", crate::truncate(category, 22)),
+        stat_row("latest", format_money_opt(stats.latest)),
+        stat_row("avg", format_money_opt(stats.avg)),
+        stat_row("min", format_money_opt(stats.min)),
+        stat_row("max", format_money_opt(stats.max)),
+        stat_row("planned avg", format_money_opt(stats.planned_avg)),
+        stat_row("avg delta", delta),
     ];
 
     frame.render_widget(
@@ -496,24 +497,33 @@ fn draw_summary(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
     );
 }
 
-fn stat_pair(
-    left_label: &str,
-    left: Option<Money>,
-    right_label: &str,
-    right: Option<Money>,
-) -> Line<'static> {
+/// One aligned `label   value` row: a readable (not too dim) label in a fixed column, then
+/// the value in the terminal's default foreground for contrast.
+fn stat_row(label: &str, value: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("{left_label}: "),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw(format!("{:<14}", format_money_opt(left))),
-        Span::styled(
-            format!("{right_label}: "),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw(format_money_opt(right)),
+        Span::styled(format!(" {label:<12}"), Style::default().fg(Color::Gray)),
+        Span::raw(value),
     ])
+}
+
+/// The plans that currently include this series — its own panel beside the stats, so
+/// membership isn't squeezed onto the category line.
+fn draw_plans_used(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
+    let block = crate::titled_block(" Used in plans ");
+    let width = area.width.saturating_sub(3) as usize;
+    let lines: Vec<Line> = if detail.plan_names.is_empty() {
+        vec![Line::from(Span::styled(
+            " Not in any plan",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        detail
+            .plan_names
+            .iter()
+            .map(|name| Line::from(Span::raw(format!(" {}", crate::truncate(name, width)))))
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_chart(frame: &mut Frame, area: Rect, detail: &SeriesDetailView, range_label: &str) {
