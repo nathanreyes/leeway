@@ -154,7 +154,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
             if app.dash_focus == DashFocus::Accounts {
                 if let Some(acct) = view.accounts.get(app.dash_acct_sel) {
                     if acct.account_type == AccountType::CreditCard {
-                        app.open_text(
+                        app.open_text_replace_on_type(
                             format!("Credit limit for {}", acct.name),
                             crate::amount_edit_string(acct.credit_limit.unwrap_or(Money::ZERO)),
                             PromptKind::CardLimit {
@@ -351,13 +351,13 @@ fn edit_account_carry(app: &mut App, view: &MonthView) {
 /// `a`: edit the amount of the selected month txn or envelope.
 fn edit_amount(app: &mut App, view: &MonthView) {
     if let Some(t) = selected_txn(app, view) {
-        app.open_text(
+        app.open_text_replace_on_type(
             "Amount (dollars)",
             crate::amount_edit_string(t.amount),
             PromptKind::TxnAmount { id: t.id.clone() },
         );
     } else if let Some(e) = selected_env(app, view) {
-        app.open_text(
+        app.open_text_replace_on_type(
             "Envelope amount (dollars)",
             crate::amount_edit_string(e.envelope.amount),
             PromptKind::EnvelopeAmount {
@@ -472,7 +472,7 @@ fn act_on_focus(app: &mut App, view: &MonthView) -> Result<()> {
             if let Some(acct) = view.accounts.get(app.dash_acct_sel) {
                 match acct.account_type {
                     // Checking: edit the spendable balance.
-                    AccountType::Checking => app.open_text(
+                    AccountType::Checking => app.open_text_replace_on_type(
                         format!("New balance for {}", acct.name),
                         crate::amount_edit_string(acct.balance),
                         PromptKind::AccountBalance {
@@ -481,7 +481,7 @@ fn act_on_focus(app: &mut App, view: &MonthView) -> Result<()> {
                     ),
                     // Credit card: the primary edit is available credit (owed is derived);
                     // the limit gets its own key (`l`).
-                    AccountType::CreditCard => app.open_text(
+                    AccountType::CreditCard => app.open_text_replace_on_type(
                         format!("Available credit for {}", acct.name),
                         crate::amount_edit_string(acct.available_credit.unwrap_or(Money::ZERO)),
                         PromptKind::CardAvailable {

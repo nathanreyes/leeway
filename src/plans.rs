@@ -198,7 +198,7 @@ pub fn handle_editor_key(
         }
         KeyCode::Char('a') => {
             if let Some(en) = selected_entry(app, entries) {
-                app.open_text(
+                app.open_text_replace_on_type(
                     "Amount for this plan (dollars)",
                     crate::amount_edit_string(en.amount),
                     PromptKind::ItemAmount {

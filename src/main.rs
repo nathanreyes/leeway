@@ -361,6 +361,9 @@ impl App {
         }));
     }
 
+    /// Like `open_text_replace_on_type` (the seeded text is preselected, so the first
+    /// keystroke replaces it) but also shows explanatory `help` lines. Its only use today
+    /// is the account carry-balance edit, which is an amount, so it preselects.
     fn open_text_with_help(
         &mut self,
         title: impl Into<String>,
@@ -372,7 +375,7 @@ impl App {
             title: title.into(),
             buffer: buffer.into(),
             help,
-            replace_on_next_char: false,
+            replace_on_next_char: true,
             kind,
         }));
     }
