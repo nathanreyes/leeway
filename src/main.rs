@@ -12,10 +12,12 @@
 //!   3. The event loop: for the current screen, load its data, draw, read one key, and
 //!      route it either to the open modal or to the screen's own handler.
 
+mod anim;
 mod dashboard;
 mod plans;
 mod series;
 
+use anim::SummaryAnimations;
 use anyhow::Result;
 use ballpark::models::{AccountType, Direction, Kind, PeriodType, Series};
 use ballpark::money::Money;
@@ -32,7 +34,7 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Which screen is showing. `PlanEditor` carries the id of the plan being edited —
 /// that's how the loop knows which plan's items to load.
@@ -387,6 +389,8 @@ pub struct App {
     /// its id here, and the event loop resolves it to the (search-filtered) list position on
     /// the next reload so the new series lands selected.
     pub pending_series_select: Option<String>,
+    pub summary_anims: SummaryAnimations,
+    pub frame_now: Instant,
     pub modal: Option<Modal>,
     /// A transient one-liner (errors, confirmations) shown in the footer.
     pub status: Option<String>,
@@ -505,6 +509,8 @@ fn main() -> Result<()> {
         pending_dash_env: None,
         pending_dash_account: None,
         pending_series_select: None,
+        summary_anims: SummaryAnimations::new(),
+        frame_now: Instant::now(),
         modal: None,
         status: None,
     };
@@ -593,11 +599,24 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     // on screen (and stops Tab from stranding focus on an absent panel).
                     None => app.dash_focus = DashFocus::Header,
                 }
+                let now = Instant::now();
+                app.frame_now = now;
+                app.summary_anims.sync(
+                    view.as_ref().map(|v| &v.whats_left),
+                    view.as_ref().map(|v| v.is_current).unwrap_or(false),
+                    (app.viewed_year, app.viewed_month),
+                    now,
+                );
                 terminal.draw(|f| {
                     dashboard::draw(f, app, &view);
                     draw_modal(f, app);
                 })?;
-                if let Some(key) = read_key()? {
+                let tick = if app.summary_anims.is_animating(now) {
+                    FRAME_TICK
+                } else {
+                    IDLE_TICK
+                };
+                if let Some(key) = read_key(tick)? {
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
                     } else if handle_global_key(app, key) {
@@ -620,7 +639,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     series::draw(f, app, &view);
                     draw_modal(f, app);
                 })?;
-                if let Some(key) = read_key()? {
+                if let Some(key) = read_key(IDLE_TICK)? {
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
                     } else if app.series_search_active {
@@ -641,7 +660,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     plans::draw_list(f, app, &summaries);
                     draw_modal(f, app);
                 })?;
-                if let Some(key) = read_key()? {
+                if let Some(key) = read_key(IDLE_TICK)? {
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
                     } else if handle_global_key(app, key) {
@@ -690,7 +709,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     plans::draw_editor(f, app, &plan, &entries);
                     draw_modal(f, app);
                 })?;
-                if let Some(key) = read_key()? {
+                if let Some(key) = read_key(IDLE_TICK)? {
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
                     } else if handle_global_key(app, key) {
@@ -709,12 +728,14 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 /// often, re-resolve `today`, and repaint. A minute is far finer than a day, so the header
 /// updates within a minute of midnight, at negligible idle cost.
 const IDLE_TICK: Duration = Duration::from_secs(60);
+const FRAME_TICK: Duration = Duration::from_millis(33);
 
 /// Read one key *press*. Returns `None` for releases, resizes, mouse, or an idle timeout —
 /// anything we don't act on (the next frame redraws regardless). `event::poll` returns as
-/// soon as input arrives, so waiting up to `IDLE_TICK` never adds latency to real keystrokes.
-fn read_key() -> Result<Option<KeyEvent>> {
-    if !event::poll(IDLE_TICK)? {
+/// soon as input arrives, so waiting up to the requested timeout never adds latency to real
+/// keystrokes.
+fn read_key(timeout: Duration) -> Result<Option<KeyEvent>> {
+    if !event::poll(timeout)? {
         return Ok(None); // idle wake-up: no input, but let the loop redraw with a fresh date
     }
     match event::read()? {

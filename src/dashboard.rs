@@ -6,6 +6,7 @@
 use crate::{
     AddDestination, App, BudgetBlock, ChoiceOption, ConfirmAction, DashFocus, ModalAction,
     PromptKind,
+    anim::{SummaryAnimations, SummaryTerm, display_cents},
 };
 use anyhow::Result;
 use ballpark::models::{AccountType, Direction, Mode, PeriodType};
@@ -18,6 +19,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{ListItem, ListState, Paragraph};
+use std::time::Instant;
 
 pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Result<()> {
     // Clear any leftover status the moment the user acts again.
@@ -532,7 +534,7 @@ fn draw_month_body(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
     draw_transactions(frame, income_area, app, view, Direction::In);
     draw_transactions(frame, expense_area, app, view, Direction::Out);
     draw_envelopes(frame, env_area, app, view);
-    draw_whats_left(frame, summary_area, view);
+    draw_whats_left(frame, summary_area, view, &app.summary_anims, app.frame_now);
 }
 
 /// One row per account plus the bordered block, capped so a large account list does not
@@ -799,7 +801,13 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, view: Option<&MonthView
     frame.render_widget(p, area);
 }
 
-fn draw_whats_left(frame: &mut Frame, area: Rect, view: &MonthView) {
+fn draw_whats_left(
+    frame: &mut Frame,
+    area: Rect,
+    view: &MonthView,
+    anims: &SummaryAnimations,
+    now: Instant,
+) {
     let wl = &view.whats_left;
     let result_color = if wl.whats_left.cents() >= 0 {
         Color::Green
@@ -813,24 +821,44 @@ fn draw_whats_left(frame: &mut Frame, area: Rect, view: &MonthView) {
     // the current month; the view already zeroed them off-month. So we only *show* them for
     // the current month, and otherwise say why the balance is income − bills − envelopes.
     if view.is_current {
-        let mut row = summary_term(wl.funds_available, "funds", Color::Cyan);
+        let mut row = summary_term(
+            SummaryTerm::Funds,
+            Money(display_cents(SummaryTerm::Funds, wl)),
+            "funds",
+            Color::Cyan,
+            anims,
+            now,
+        );
         row.push(Span::raw("  "));
         if wl.checking_buffer != Money::ZERO {
             row.extend(summary_term(
-                Money(-wl.checking_buffer.cents()),
+                SummaryTerm::Buffer,
+                Money(display_cents(SummaryTerm::Buffer, wl)),
                 "buffer",
                 Color::Yellow,
+                anims,
+                now,
             ));
             row.push(Span::raw("  "));
         }
         row.extend(summary_term(
-            Money(-wl.card_debt.cents()),
+            SummaryTerm::CardDebt,
+            Money(display_cents(SummaryTerm::CardDebt, wl)),
             "card debt",
             Color::Red,
+            anims,
+            now,
         ));
         if wl.card_carry != Money::ZERO {
             row.push(Span::raw("  "));
-            row.extend(summary_term(wl.card_carry, "carry", Color::Yellow));
+            row.extend(summary_term(
+                SummaryTerm::Carry,
+                Money(display_cents(SummaryTerm::Carry, wl)),
+                "carry",
+                Color::Yellow,
+                anims,
+                now,
+            ));
         }
         lines.push(Line::from(row));
     } else {
@@ -840,37 +868,46 @@ fn draw_whats_left(frame: &mut Frame, area: Rect, view: &MonthView) {
         )));
     }
 
-    let mut row = summary_term(wl.income_remaining, "income left", Color::Green);
+    let mut row = summary_term(
+        SummaryTerm::IncomeLeft,
+        Money(display_cents(SummaryTerm::IncomeLeft, wl)),
+        "income left",
+        Color::Green,
+        anims,
+        now,
+    );
     row.push(Span::raw("  "));
     row.extend(summary_term(
-        Money(-wl.bills_remaining.cents()),
+        SummaryTerm::BillsLeft,
+        Money(display_cents(SummaryTerm::BillsLeft, wl)),
         "bills left",
         Color::Red,
+        anims,
+        now,
     ));
     lines.push(Line::from(row));
 
-    if view.is_current {
-        lines.push(Line::from(summary_term(
-            Money(-wl.envelopes_remaining.cents()),
-            "envelopes",
-            Color::Magenta,
-        )));
-    } else {
-        lines.push(Line::from(summary_term(
-            Money(-wl.envelopes_remaining.cents()),
-            "envelopes",
-            Color::Magenta,
-        )));
-    }
+    lines.push(Line::from(summary_term(
+        SummaryTerm::Envelopes,
+        Money(display_cents(SummaryTerm::Envelopes, wl)),
+        "envelopes",
+        Color::Magenta,
+        anims,
+        now,
+    )));
 
+    let (wl_cents, wl_style) = anims.render(
+        SummaryTerm::WhatsLeft,
+        display_cents(SummaryTerm::WhatsLeft, wl),
+        result_color,
+        now,
+    );
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         Span::raw("= "),
         Span::styled(
-            format!("{:>10}", wl.whats_left.to_string()),
-            Style::default()
-                .fg(result_color)
-                .add_modifier(Modifier::BOLD),
+            format!("{:>10}", Money(wl_cents).to_string()),
+            wl_style.add_modifier(Modifier::BOLD),
         ),
         Span::raw("  what's left"),
     ]));
@@ -879,15 +916,20 @@ fn draw_whats_left(frame: &mut Frame, area: Rect, view: &MonthView) {
     frame.render_widget(p, area);
 }
 
-fn summary_term(amount: Money, label: &str, color: Color) -> Vec<Span<'static>> {
-    let sign = if amount.cents() < 0 { "−" } else { "+" };
-    let amount = Money(amount.cents().abs());
+fn summary_term(
+    term: SummaryTerm,
+    amount: Money,
+    label: &str,
+    color: Color,
+    anims: &SummaryAnimations,
+    now: Instant,
+) -> Vec<Span<'static>> {
+    let (cents, amount_style) = anims.render(term, amount.cents(), color, now);
+    let sign = if cents < 0 { "−" } else { "+" };
+    let amount = Money(cents.abs());
     vec![
         Span::raw(format!("{sign} ")),
-        Span::styled(
-            format!("{:>10}", amount.to_string()),
-            Style::default().fg(color),
-        ),
+        Span::styled(format!("{:>10}", amount.to_string()), amount_style),
         Span::raw(format!("  {:<width$}", label, width = 11)),
     ]
 }
@@ -1066,6 +1108,8 @@ mod tests {
             pending_dash_env: None,
             pending_dash_account: None,
             pending_series_select: None,
+            summary_anims: crate::anim::SummaryAnimations::new(),
+            frame_now: std::time::Instant::now(),
             modal: None,
             status: None,
         }

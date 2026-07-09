@@ -499,6 +499,8 @@ mod tests {
             pending_dash_env: None,
             pending_dash_account: None,
             pending_series_select: None,
+            summary_anims: crate::anim::SummaryAnimations::new(),
+            frame_now: std::time::Instant::now(),
             modal: None,
             status: None,
         };
