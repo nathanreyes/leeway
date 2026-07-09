@@ -82,7 +82,7 @@ Common dashboard keys:
 - `Enter`: perform the focused row's primary action; opens the selected envelope.
 - `Space`: perform the focused row's lightweight action without leaving the dashboard.
 - `n`: add an item to the focused panel.
-- `r`: rename the focused item.
+- `l`: edit a label.
 - `a`: edit an amount.
 - `s`: record a transaction in the selected envelope.
 - `P`: open Plans.

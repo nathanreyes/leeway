@@ -48,10 +48,10 @@ pub fn handle_list_key(app: &mut App, key: KeyEvent, summaries: &[PlanSummary]) 
                 };
             }
         }
-        KeyCode::Char('r') => {
+        KeyCode::Char('l') => {
             if let Some(s) = selected {
                 app.open_text_replace_on_type(
-                    "Rename plan",
+                    "Plan label",
                     s.plan.name.clone(),
                     PromptKind::RenamePlan {
                         id: s.plan.id.clone(),
@@ -134,8 +134,8 @@ pub fn draw_list(frame: &mut Frame, app: &App, summaries: &[PlanSummary]) {
         Span::raw(" new  "),
         key(" Enter "),
         Span::raw(" edit  "),
-        key(" r "),
-        Span::raw(" rename  "),
+        key(" l "),
+        Span::raw(" label  "),
         key(" s "),
         Span::raw(" stamp  "),
         key(" x "),
@@ -193,8 +193,8 @@ pub fn handle_editor_key(
         // The plan editor only changes plan-scoped things: which series are in the plan and
         // this plan's amount for each. Label, mode, and period belong to the *shared* series
         // (they'd change every plan), so those edits live on the Series page. Redirect the
-        // old keys there rather than leaving them as silent dead ends.
-        KeyCode::Char('r') | KeyCode::Char('m') | KeyCode::Char('p') => {
+        // mode and period keys there rather than leaving them as silent dead ends.
+        KeyCode::Char('m') | KeyCode::Char('p') => {
             app.status = Some("Edit the series itself on the Series page (S)".into());
         }
         KeyCode::Char('a') => {
@@ -511,7 +511,7 @@ mod tests {
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
     }
 
-    fn rename_key() -> KeyEvent {
+    fn r_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)
     }
 
@@ -531,15 +531,14 @@ mod tests {
     }
 
     #[test]
-    fn rename_key_no_longer_edits_shared_series_label() {
-        // Series-definition edits moved to the Series page; `r` in the plan editor must not
-        // open a rename prompt or touch the shared label — it just points the user there.
+    fn r_key_is_inert_in_plan_editor() {
+        // `r` is no longer a label-edit shortcut, even as a redirect to the Series page.
         let (mut app, plan, entries, rent_series_id) = app_with_transaction_plan();
 
-        handle_editor_key(&mut app, rename_key(), &plan, &entries).unwrap();
+        handle_editor_key(&mut app, r_key(), &plan, &entries).unwrap();
 
-        assert!(app.modal.is_none(), "no rename prompt opened");
-        assert!(app.status.is_some(), "shows a redirect hint instead");
+        assert!(app.modal.is_none(), "no label prompt opened");
+        assert!(app.status.is_none(), "r has no action");
         let series = queries::get_series(&app.conn, &rent_series_id)
             .unwrap()
             .unwrap();

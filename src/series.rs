@@ -58,7 +58,7 @@ pub fn handle_key(
         KeyCode::Char('n') => open_new_series_choice(app),
         // `x` deletes the selected series, with the plan/month guard the user asked for.
         KeyCode::Char('x') => delete_selected_series(app, view)?,
-        KeyCode::Char('r') => {
+        KeyCode::Char('l') => {
             if let Some(detail) = selected_detail(app, view) {
                 let label = detail.series.label.clone();
                 let id = detail.series.id.clone();
@@ -642,8 +642,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
             Span::raw(" move  "),
             key(" n "),
             Span::raw(" new  "),
-            key(" r "),
-            Span::raw(" rename  "),
+            key(" l "),
+            Span::raw(" label  "),
             key(" m/p "),
             Span::raw(" mode/period  "),
             key(" x "),
@@ -661,8 +661,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
             Span::raw(" move  "),
             key(" n "),
             Span::raw(" new  "),
-            key(" r "),
-            Span::raw(" rename  "),
+            key(" l "),
+            Span::raw(" label  "),
             key(" x "),
             Span::raw(" delete  "),
             key(" / "),

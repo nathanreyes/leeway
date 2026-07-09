@@ -129,12 +129,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         // The edit verbs mirror the plan editor's keys, but here they edit this month's
         // independent snapshot. Direction changes intentionally stay out of this fast path:
         // moving between income and expenses is safer as remove/re-add.
-        KeyCode::Char('r') | KeyCode::Char('a') | KeyCode::Char('m') | KeyCode::Char('p')
+        KeyCode::Char('l') | KeyCode::Char('a') | KeyCode::Char('m') | KeyCode::Char('p')
             if app.dash_focus == DashFocus::Envelopes =>
         {
             app.status = Some("Press Enter to edit envelope details".into());
         }
-        KeyCode::Char('r') => edit_label(app, view), // rename / label
+        KeyCode::Char('l') => edit_label(app, view),
         KeyCode::Char('a') => edit_amount(app, view), // amount
         KeyCode::Char('m') => cycle_mode(app, view)?, // envelope mode
         KeyCode::Char('p') => cycle_period(app, view)?, // envelope period type
@@ -149,7 +149,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         }
 
         // Edit a credit card's limit (rarely changed, so it gets its own key).
-        KeyCode::Char('l') if app.dash_focus == DashFocus::Accounts => {
+        KeyCode::Char('L') if app.dash_focus == DashFocus::Accounts => {
             if let Some(acct) = view.accounts.get(app.dash_acct_sel)
                 && acct.account_type == AccountType::CreditCard
             {
@@ -286,7 +286,7 @@ fn add_account(app: &mut App) {
     );
 }
 
-/// `r`: edit the label/name of the selected row.
+/// `l`: edit the label of the selected row.
 fn edit_label(app: &mut App, view: &MonthView) {
     if let Some(t) = selected_txn(app, view) {
         app.open_text_replace_on_type(
@@ -306,7 +306,7 @@ fn edit_label(app: &mut App, view: &MonthView) {
         && let Some(acct) = view.accounts.get(app.dash_acct_sel)
     {
         app.open_text_replace_on_type(
-            "Account name",
+            "Account label",
             acct.name.clone(),
             PromptKind::AccountName {
                 id: acct.id.clone(),
@@ -609,8 +609,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             Span::raw(" paid  "),
             key(" n "),
             Span::raw(" new  "),
-            key(" r/a "),
-            Span::raw(" edit item  "),
+            key(" l/a "),
+            Span::raw(" label/amount  "),
             key(" x "),
             Span::raw(" del"),
         ]),
@@ -637,11 +637,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             Span::raw(" edit  "),
             key(" n "),
             Span::raw(" new  "),
-            key(" r "),
-            Span::raw(" name  "),
+            key(" l "),
+            Span::raw(" label  "),
             key(" c "),
             Span::raw(" carry  "),
-            key(" l "),
+            key(" L "),
             Span::raw(" limit  "),
             key(" x "),
             Span::raw(" del"),

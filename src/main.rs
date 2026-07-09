@@ -1026,7 +1026,7 @@ fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         _ => match detail.focus {
             EnvelopeDetailFocus::Details => match key.code {
-                KeyCode::Char('r') => app.open_text_from_envelope_detail(
+                KeyCode::Char('l') => app.open_text_from_envelope_detail(
                     "Envelope label",
                     envelope.label,
                     PromptKind::EnvelopeLabel { id: envelope.id },
@@ -1106,7 +1106,7 @@ fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         false,
                     );
                 }
-                KeyCode::Enter => {
+                KeyCode::Char('a') => {
                     if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
                         app.open_text_from_envelope_detail(
                             format!("Amount for {}", txn.label),
@@ -1128,7 +1128,7 @@ fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         );
                     }
                 }
-                KeyCode::Char('d') => {
+                KeyCode::Char('x') => {
                     if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
                         app.open_confirm_from_envelope_detail(
                             format!("Delete transaction “{}”?", txn.label),
@@ -2053,16 +2053,16 @@ fn draw_envelope_detail_section(
 
 fn details_footer_line() -> Line<'static> {
     Line::from(vec![
-        modal_key(" r "),
+        modal_key(" l "),
         Span::raw(" label  "),
         modal_key(" a "),
         Span::raw(" amount  "),
         modal_key(" m "),
         Span::raw(" mode  "),
         modal_key(" p "),
-        Span::raw(" cadence  "),
+        Span::raw(" period  "),
         modal_key(" x "),
-        Span::raw(" delete envelope"),
+        Span::raw(" delete"),
     ])
 }
 
@@ -2072,11 +2072,11 @@ fn transactions_footer_line() -> Line<'static> {
         Span::raw(" add  "),
         modal_key(" j/k "),
         Span::raw(" move  "),
-        modal_key(" Enter "),
+        modal_key(" a "),
         Span::raw(" amount  "),
         modal_key(" l "),
         Span::raw(" label  "),
-        modal_key(" d "),
+        modal_key(" x "),
         Span::raw(" delete"),
     ])
 }
@@ -2459,7 +2459,7 @@ mod tests {
     fn canceling_envelope_label_prompt_returns_to_detail_screen() {
         let (mut app, detail, _) = app_with_envelope_detail();
 
-        handle_envelope_detail_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('l'))).unwrap();
         match &app.modal {
             Some(Modal::Text(prompt)) => {
                 assert_eq!(prompt.title, "Envelope label");
@@ -2477,7 +2477,7 @@ mod tests {
     fn submitting_envelope_label_returns_to_detail_screen() {
         let (mut app, detail, envelope_id) = app_with_envelope_detail();
 
-        handle_envelope_detail_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('l'))).unwrap();
         for c in "Travel".chars() {
             handle_modal_key(&mut app, key(KeyCode::Char(c))).unwrap();
         }
@@ -2490,6 +2490,16 @@ mod tests {
             .find(|envelope| envelope.id == envelope_id)
             .unwrap();
         assert_eq!(envelope.label, "Travel");
+    }
+
+    #[test]
+    fn r_no_longer_edits_an_envelope_label() {
+        let (mut app, detail, _) = app_with_envelope_detail();
+
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+
+        assert!(app.modal.is_none());
+        assert_envelope_detail_screen(&app, &detail);
     }
 
     #[test]
@@ -2506,7 +2516,7 @@ mod tests {
         assert_envelope_detail_screen(&app, &transactions_detail);
 
         // Transactions own transaction creation; envelope label edits are inert here.
-        handle_envelope_detail_key(&mut app, key(KeyCode::Char('r'))).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('l'))).unwrap();
         assert_envelope_detail_screen(&app, &transactions_detail);
 
         handle_envelope_detail_key(&mut app, key(KeyCode::Char('s'))).unwrap();
@@ -2522,6 +2532,69 @@ mod tests {
                 );
             }
             _ => panic!("expected transaction label prompt"),
+        }
+    }
+
+    #[test]
+    fn x_confirms_deleting_the_selected_envelope_transaction() {
+        let (mut app, mut detail, _) = app_with_envelope_detail();
+        let transaction_id = ops::add_envelope_spending(
+            &app.conn,
+            &detail.month_id,
+            &detail.envelope_id,
+            "Coffee",
+            Money::from_dollars(4.5),
+        )
+        .unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Tab)).unwrap();
+        detail.focus = EnvelopeDetailFocus::Transactions;
+
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('x'))).unwrap();
+
+        match &app.modal {
+            Some(Modal::Confirm(confirm)) => {
+                assert_eq!(confirm.title, "Delete transaction “Coffee”?");
+                match &confirm.action {
+                    ConfirmAction::DeleteTxn { id } => assert_eq!(id, &transaction_id),
+                    _ => panic!("expected transaction delete confirmation"),
+                }
+                assert_eq!(
+                    confirm
+                        .return_to_envelope_detail
+                        .as_ref()
+                        .map(|detail| detail.focus),
+                    Some(EnvelopeDetailFocus::Transactions)
+                );
+            }
+            _ => panic!("expected delete confirmation"),
+        }
+    }
+
+    #[test]
+    fn a_edits_the_selected_envelope_transaction_amount() {
+        let (mut app, mut detail, _) = app_with_envelope_detail();
+        let transaction_id = ops::add_envelope_spending(
+            &app.conn,
+            &detail.month_id,
+            &detail.envelope_id,
+            "Coffee",
+            Money::from_dollars(4.5),
+        )
+        .unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Tab)).unwrap();
+        detail.focus = EnvelopeDetailFocus::Transactions;
+
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('a'))).unwrap();
+
+        match &app.modal {
+            Some(Modal::Text(prompt)) => {
+                assert_eq!(prompt.title, "Amount for Coffee");
+                match &prompt.kind {
+                    PromptKind::TxnAmount { id } => assert_eq!(id, &transaction_id),
+                    _ => panic!("expected transaction amount prompt"),
+                }
+            }
+            _ => panic!("expected amount prompt"),
         }
     }
 
