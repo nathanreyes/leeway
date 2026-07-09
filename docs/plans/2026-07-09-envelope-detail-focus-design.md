@@ -39,7 +39,8 @@ confirmation returns to the screen. Split rendering into a compact Details panel
 a Transactions panel, and one split footer. Use the shared dashboard footer helper
 so focus-specific commands occupy the left side and global navigation occupies the
 right. Use aligned rows and right-aligned money values for a clear read path, and
-include an explicit empty state in the transaction panel.
+include an explicit empty state in the transaction panel. Stack the panels without
+an extra layout spacer so their vertical separation matches the dashboard.
 
 ## Verification
 
