@@ -1,4 +1,4 @@
-//! Ballpark's terminal UI.
+//! Leeway's terminal UI.
 //!
 //! The app is now multi-screen, so this file holds the *shared* scaffolding and each
 //! screen lives in its own module:
@@ -16,13 +16,14 @@ mod anim;
 mod dashboard;
 mod plans;
 mod series;
+mod theme;
 
 use anim::SummaryAnimations;
 use anyhow::{Context, Result};
-use ballpark::models::{AccountType, Direction, Kind, Mode, PeriodType, Series, Txn};
-use ballpark::money::Money;
-use ballpark::view::SeriesTimeRange;
-use ballpark::{calc, db, ops, queries};
+use leeway::models::{AccountType, Direction, Kind, Mode, PeriodType, Series, Txn};
+use leeway::money::Money;
+use leeway::view::SeriesTimeRange;
+use leeway::{calc, db, ops, queries};
 use chrono::{Datelike, Local, NaiveDate};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
@@ -129,7 +130,7 @@ pub(crate) fn titled_block(title: impl Into<String>) -> Block<'static> {
 pub(crate) fn focusable_block(title: impl Into<String>, focused: bool) -> Block<'static> {
     let block = titled_block(title);
     if focused {
-        block.border_style(Style::default().fg(Color::Cyan))
+        block.border_style(Style::default().fg(theme::MAUVE))
     } else {
         block
     }
@@ -143,7 +144,7 @@ pub(crate) fn selectable_block(title: impl Into<String>, focused: bool) -> Block
 /// than inverse video (`Modifier::REVERSED`): inverse video swaps every cell's
 /// fg/bg, which inverts colored content like the envelope meters and reads as
 /// harsh. Paired with the `▌` highlight symbol for a clear-but-quiet cue.
-const SELECTION_BG: Color = Color::Rgb(69, 71, 90);
+const SELECTION_BG: Color = theme::SELECTION;
 
 pub(crate) fn selection_style() -> Style {
     Style::default().bg(SELECTION_BG)
@@ -551,7 +552,7 @@ impl App {
 }
 
 fn main() -> Result<()> {
-    let path = PathBuf::from("ballpark.db");
+    let path = PathBuf::from("leeway.db");
     let mut conn = db::open(&path)?;
     // On a fresh database this stamps the current calendar month, satisfying "if no month
     // exists, create one" for a first-ever launch.
@@ -613,7 +614,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         // for loading is released before we take a `&mut app` to handle input.
         match &app.screen {
             Screen::Dashboard => {
-                let view = ballpark::view::MonthView::build_for(
+                let view = leeway::view::MonthView::build_for(
                     &app.conn,
                     today,
                     app.viewed_year,
@@ -627,8 +628,8 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             && let Some(txn) = v.standalone.iter().find(|t| t.id == target)
                         {
                             app.dash_focus = match txn.direction {
-                                ballpark::models::Direction::In => DashFocus::Income,
-                                ballpark::models::Direction::Out => DashFocus::Expenses,
+                                leeway::models::Direction::In => DashFocus::Income,
+                                leeway::models::Direction::Out => DashFocus::Expenses,
                             };
                             if let Some(idx) = dashboard_txn_index(v, &target, app.dash_focus) {
                                 match app.dash_focus {
@@ -728,7 +729,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 
             Screen::Series => {
                 let view =
-                    ballpark::view::SeriesPageView::build(&app.conn, today, app.series_range)?;
+                    leeway::view::SeriesPageView::build(&app.conn, today, app.series_range)?;
                 // Resolve "select the series I just created" now that the list is loaded.
                 if let Some(target) = app.pending_series_select.take() {
                     series::select_series_by_id(app, &view, &target);
@@ -935,7 +936,7 @@ fn reset_editor_selections(app: &mut App) {
     app.editor_env_sel = 0;
 }
 
-fn dashboard_txn_count(view: &ballpark::view::MonthView, focus: DashFocus) -> usize {
+fn dashboard_txn_count(view: &leeway::view::MonthView, focus: DashFocus) -> usize {
     view.standalone
         .iter()
         .filter(|txn| dashboard_txn_matches(txn, focus))
@@ -943,7 +944,7 @@ fn dashboard_txn_count(view: &ballpark::view::MonthView, focus: DashFocus) -> us
 }
 
 fn dashboard_txn_index(
-    view: &ballpark::view::MonthView,
+    view: &leeway::view::MonthView,
     txn_id: &str,
     focus: DashFocus,
 ) -> Option<usize> {
@@ -953,15 +954,15 @@ fn dashboard_txn_index(
         .position(|txn| txn.id == txn_id)
 }
 
-fn dashboard_txn_matches(txn: &ballpark::models::Txn, focus: DashFocus) -> bool {
+fn dashboard_txn_matches(txn: &leeway::models::Txn, focus: DashFocus) -> bool {
     matches!(
         (focus, txn.direction),
-        (DashFocus::Income, ballpark::models::Direction::In)
-            | (DashFocus::Expenses, ballpark::models::Direction::Out)
+        (DashFocus::Income, leeway::models::Direction::In)
+            | (DashFocus::Expenses, leeway::models::Direction::Out)
     )
 }
 
-fn plan_entry_count(entries: &[ballpark::models::PlanEntry], focus: PlanFocus) -> usize {
+fn plan_entry_count(entries: &[leeway::models::PlanEntry], focus: PlanFocus) -> usize {
     entries
         .iter()
         .filter(|entry| plan_entry_matches(entry, focus))
@@ -969,7 +970,7 @@ fn plan_entry_count(entries: &[ballpark::models::PlanEntry], focus: PlanFocus) -
 }
 
 fn plan_entry_index(
-    entries: &[ballpark::models::PlanEntry],
+    entries: &[leeway::models::PlanEntry],
     item_id: &str,
     focus: PlanFocus,
 ) -> Option<usize> {
@@ -979,27 +980,27 @@ fn plan_entry_index(
         .position(|entry| entry.item_id == item_id)
 }
 
-fn plan_focus_for_entry(entry: &ballpark::models::PlanEntry) -> PlanFocus {
+fn plan_focus_for_entry(entry: &leeway::models::PlanEntry) -> PlanFocus {
     match entry.series.kind {
-        ballpark::models::Kind::Envelope => PlanFocus::Envelopes,
-        ballpark::models::Kind::Transaction => match entry.series.direction {
-            Some(ballpark::models::Direction::In) => PlanFocus::Income,
+        leeway::models::Kind::Envelope => PlanFocus::Envelopes,
+        leeway::models::Kind::Transaction => match entry.series.direction {
+            Some(leeway::models::Direction::In) => PlanFocus::Income,
             _ => PlanFocus::Expenses,
         },
     }
 }
 
-fn plan_entry_matches(entry: &ballpark::models::PlanEntry, focus: PlanFocus) -> bool {
+fn plan_entry_matches(entry: &leeway::models::PlanEntry, focus: PlanFocus) -> bool {
     match focus {
         PlanFocus::Income => {
-            entry.series.kind == ballpark::models::Kind::Transaction
-                && entry.series.direction == Some(ballpark::models::Direction::In)
+            entry.series.kind == leeway::models::Kind::Transaction
+                && entry.series.direction == Some(leeway::models::Direction::In)
         }
         PlanFocus::Expenses => {
-            entry.series.kind == ballpark::models::Kind::Transaction
-                && entry.series.direction != Some(ballpark::models::Direction::In)
+            entry.series.kind == leeway::models::Kind::Transaction
+                && entry.series.direction != Some(leeway::models::Direction::In)
         }
-        PlanFocus::Envelopes => entry.series.kind == ballpark::models::Kind::Envelope,
+        PlanFocus::Envelopes => entry.series.kind == leeway::models::Kind::Envelope,
     }
 }
 
@@ -1157,7 +1158,7 @@ fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
 fn load_detail_envelope(
     app: &App,
     detail: &EnvelopeDetail,
-) -> Result<Option<ballpark::models::Envelope>> {
+) -> Result<Option<leeway::models::Envelope>> {
     Ok(queries::load_envelopes(&app.conn, &detail.month_id)?
         .into_iter()
         .find(|envelope| envelope.id == detail.envelope_id))
@@ -1926,12 +1927,12 @@ fn draw_modal(frame: &mut Frame, _app: &App) {
             if prompt.replace_on_next_char && !prompt.buffer.is_empty() {
                 input.push(Span::styled(
                     prompt.buffer.clone(),
-                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                    Style::default().fg(Color::Black).bg(theme::CYAN),
                 ));
             } else {
                 input.push(Span::raw(&prompt.buffer));
             }
-            input.push(Span::styled("▏", Style::default().fg(Color::Cyan)));
+            input.push(Span::styled("▏", Style::default().fg(theme::CYAN)));
             let mut body = vec![Line::raw(""), Line::from(input), Line::raw("")];
             if !prompt.help.is_empty() {
                 for line in &prompt.help {
@@ -1969,7 +1970,7 @@ fn draw_modal(frame: &mut Frame, _app: &App) {
         Modal::Choice(choice) => {
             let area = centered_rect(60, 20, frame.area());
             frame.render_widget(Clear, area);
-            let block = titled_block(" Choose ").border_style(Style::default().fg(Color::Cyan));
+            let block = titled_block(" Choose ").border_style(Style::default().fg(theme::CYAN));
             let mut body = vec![
                 Line::raw(""),
                 Line::from(Span::raw(format!(" {}", choice.title))),
@@ -2154,7 +2155,7 @@ fn envelope_detail_content(
         envelope_detail_metric_line(
             ("Monthly", envelope.amount.to_string(), Color::White),
             ("Consumed", consumed.to_string(), Color::White),
-            ("Remaining", remaining.to_string(), Color::Cyan),
+            ("Remaining", remaining.to_string(), theme::CYAN),
         ),
     ];
 
@@ -2188,7 +2189,7 @@ fn envelope_detail_content(
             transaction_lines.push(Line::from(vec![
                 Span::styled(
                     if selected { "▌" } else { " " },
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(theme::CYAN),
                 ),
                 Span::styled(
                     format!(" {:<42} {:>14}", truncate(&txn.label, 42), txn.amount),
@@ -2229,14 +2230,14 @@ fn draw_series_search_modal(frame: &mut Frame, prompt: &SeriesSearch) {
     frame.render_widget(Clear, area);
 
     let block =
-        titled_block(format!(" {} ", prompt.title)).border_style(Style::default().fg(Color::Cyan));
+        titled_block(format!(" {} ", prompt.title)).border_style(Style::default().fg(theme::CYAN));
 
     let mut body = vec![
         Line::raw(""),
         Line::from(vec![
             Span::raw(" > "),
             Span::raw(&prompt.buffer),
-            Span::styled("▏", Style::default().fg(Color::Cyan)),
+            Span::styled("▏", Style::default().fg(theme::CYAN)),
         ]),
         Line::raw(""),
     ];
@@ -2271,7 +2272,7 @@ fn draw_series_search_modal(frame: &mut Frame, prompt: &SeriesSearch) {
                 Style::default()
             };
             body.push(Line::from(vec![
-                Span::styled(marker, Style::default().fg(Color::Cyan)),
+                Span::styled(marker, Style::default().fg(theme::CYAN)),
                 Span::styled(format!(" {:<36}", truncate(&series.label, 36)), style),
             ]));
         }
@@ -2382,7 +2383,7 @@ mod tests {
 
     fn app_with_envelope_detail() -> (App, EnvelopeDetail, String) {
         let mut path = std::env::temp_dir();
-        path.push(format!("ballpark-envelope-detail-{}.db", Uuid::new_v4()));
+        path.push(format!("leeway-envelope-detail-{}.db", Uuid::new_v4()));
         let mut conn = db::open(&path).unwrap();
         let plan_id = ops::create_plan(&conn, "Normal").unwrap();
         let dining_series = ops::create_series(

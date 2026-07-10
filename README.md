@@ -1,6 +1,6 @@
-# Ballpark
+# Leeway
 
-Ballpark is a local-first terminal budgeting app focused on one question:
+Leeway is a local-first terminal budgeting app focused on one question:
 **what's left?**
 
 It is a forecasting tool, not an accounting ledger. You keep your current
@@ -8,7 +8,7 @@ checking balance as the ground truth, toggle known income and bills when they
 settle, and let spending envelopes draw down over the month. The goal is a
 low-friction monthly budget you can trust without entering every transaction.
 
-Ballpark is early open source software. The current first-run experience seeds
+Leeway is early open source software. The current first-run experience seeds
 a starter plan, accounts, and month so you can explore the app immediately; that
 onboarding flow will change as the project matures.
 
@@ -27,12 +27,12 @@ onboarding flow will change as the project matures.
 
 ## Installation
 
-Ballpark currently ships from source. You need a Rust toolchain installed; the
+Leeway currently ships from source. You need a Rust toolchain installed; the
 standard route is [rustup](https://rustup.rs/).
 
 ```sh
-git clone https://github.com/nathanreyes/ballpark.git
-cd ballpark
+git clone https://github.com/nathanreyes/leeway.git
+cd leeway
 cargo run
 ```
 
@@ -40,10 +40,10 @@ To install the local checkout as a command:
 
 ```sh
 cargo install --path .
-ballpark
+leeway
 ```
 
-On first run, Ballpark creates `ballpark.db` in the current working directory,
+On first run, Leeway creates `leeway.db` in the current working directory,
 applies the database schema, seeds starter data if the database is empty, and
 opens the dashboard for the current month.
 
@@ -52,7 +52,7 @@ opens the dashboard for the current month.
 The long-term goal is for users not to need a source checkout.
 
 - Rust users should be able to install from crates.io with
-  `cargo install ballpark`.
+  `cargo install leeway`.
 - Most users should be able to download prebuilt macOS, Linux, and Windows
   binaries from GitHub Releases.
 - Package-manager installs, such as Homebrew, can come after the release process
@@ -69,7 +69,7 @@ installers from tagged versions.
 Run the app:
 
 ```sh
-ballpark
+leeway
 ```
 
 The dashboard is the daily loop. It shows account balances, remaining income,
@@ -93,12 +93,12 @@ Plans are reusable templates. Stamp a plan into a month to create an independent
 monthly snapshot. Editing a plan later does not rewrite past months.
 
 Series are the durable identities behind recurring budget items. They let
-Ballpark connect "Rent" or "Groceries" across months and plans even when labels
+Leeway connect "Rent" or "Groceries" across months and plans even when labels
 or plan amounts change.
 
 ## Data
 
-Ballpark stores data in a local SQLite database named `ballpark.db` by default.
+Leeway stores data in a local SQLite database named `leeway.db` by default.
 The file is ignored by git and stays on your machine. Money values are stored as
 integer cents, and the app derives the dashboard totals from the stored account,
 transaction, envelope, plan, month, and series records.
@@ -110,5 +110,5 @@ files there are design notes for current and planned behavior.
 
 ## Status
 
-Ballpark is pre-release. Expect the UI, onboarding, packaging, and docs to
+Leeway is pre-release. Expect the UI, onboarding, packaging, and docs to
 change before a stable release.

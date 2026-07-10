@@ -4,12 +4,12 @@ use crate::{
     App, BudgetBlock, ChoiceOption, ConfirmAction, ModalAction, PromptKind, Screen, SeriesFilter,
 };
 use anyhow::Result;
-use ballpark::models::{Kind, Mode, PeriodType};
-use ballpark::money::Money;
-use ballpark::view::{
+use leeway::models::{Kind, Mode, PeriodType};
+use leeway::money::Money;
+use leeway::view::{
     SeriesDetailView, SeriesGroup, SeriesPageView, SeriesTimeRange, SeriesTrendPoint,
 };
-use ballpark::{ops, queries};
+use leeway::{ops, queries};
 use chrono::{Datelike, NaiveDate};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -317,7 +317,7 @@ fn draw_filter(frame: &mut Frame, area: Rect, app: &App) {
                 format!(" {label} "),
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .bg(crate::theme::CYAN)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
@@ -345,7 +345,7 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::raw(" "),
             Span::raw(&app.series_search),
-            Span::styled("|", Style::default().fg(Color::Cyan)),
+            Span::styled("|", Style::default().fg(crate::theme::CYAN)),
         ])
     } else if app.series_search.is_empty() {
         Line::from(Span::styled(
@@ -388,7 +388,7 @@ fn draw_series_list(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageV
             SidebarRow::Header(group) => ListItem::new(Line::from(Span::styled(
                 group.label().to_string(),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(crate::theme::CYAN)
                     .add_modifier(Modifier::BOLD),
             ))),
             SidebarRow::Item(idx) => series_row(&view.details[*idx], inner_width),
@@ -572,11 +572,11 @@ fn draw_chart(frame: &mut Frame, area: Rect, detail: &SeriesDetailView, range_la
     let chart = BarChart::new(bars)
         .bar_width(bar_width)
         .bar_gap(bar_gap)
-        .bar_style(Style::default().fg(Color::Cyan))
+        .bar_style(Style::default().fg(crate::theme::CYAN))
         .value_style(
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(crate::theme::CYAN)
                 .add_modifier(Modifier::BOLD),
         )
         .label_style(Style::default().fg(Color::DarkGray));

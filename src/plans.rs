@@ -8,8 +8,8 @@
 
 use crate::{AddDestination, App, BudgetBlock, ConfirmAction, PlanFocus, PromptKind, Screen};
 use anyhow::Result;
-use ballpark::models::{Direction, Kind, Mode, PeriodType, Plan, PlanEntry};
-use ballpark::queries::PlanSummary;
+use leeway::models::{Direction, Kind, Mode, PeriodType, Plan, PlanEntry};
+use leeway::queries::PlanSummary;
 use chrono::Local;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -435,17 +435,17 @@ fn key(label: &str) -> Span<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ballpark::money::Money;
-    use ballpark::ops;
-    use ballpark::queries;
+    use leeway::money::Money;
+    use leeway::ops;
+    use leeway::queries;
     use ratatui::crossterm::event::KeyModifiers;
     use rusqlite::Connection;
     use uuid::Uuid;
 
     fn open_test_conn() -> Connection {
         let mut path = std::env::temp_dir();
-        path.push(format!("ballpark-plans-{}.db", Uuid::new_v4()));
-        ballpark::db::open(&path).unwrap()
+        path.push(format!("leeway-plans-{}.db", Uuid::new_v4()));
+        leeway::db::open(&path).unwrap()
     }
 
     fn app_with_transaction_plan() -> (App, Plan, Vec<PlanEntry>, String) {
@@ -487,7 +487,7 @@ mod tests {
             series_sel: 0,
             series_search: String::new(),
             series_search_active: false,
-            series_range: ballpark::view::SeriesTimeRange::Last12Stamped,
+            series_range: leeway::view::SeriesTimeRange::Last12Stamped,
             series_filter: crate::SeriesFilter::Both,
             plan_focus: PlanFocus::Expenses,
             editor_income_sel: 0,

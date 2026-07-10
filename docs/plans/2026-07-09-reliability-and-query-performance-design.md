@@ -6,7 +6,7 @@ The audit identified unsafe money parsing, non-reversible daily/monthly plan con
 weak envelope-spending integrity, repeated read queries in the Series screen, repeated
 transaction cloning in the dashboard, missing query indexes, and unfinished quality gates.
 
-Ballpark remains a local-first, single-user budgeting application. Changes must preserve
+Leeway remains a local-first, single-user budgeting application. Changes must preserve
 its integer-cent money model and the snapshot semantics of stamped months.
 
 ## Decisions

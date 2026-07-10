@@ -1,4 +1,4 @@
--- Ballpark schema — v1 (consolidated)
+-- Leeway schema — v1 (consolidated)
 --
 -- No database has shipped yet, so rather than carry a chain of migrations we keep ONE
 -- clean initial schema that reflects the current design. Once real users exist, evolve it

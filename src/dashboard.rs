@@ -9,10 +9,10 @@ use crate::{
     anim::{SummaryAnimations, SummaryTerm, display_cents},
 };
 use anyhow::Result;
-use ballpark::models::{AccountType, Direction, Mode, PeriodType};
-use ballpark::money::Money;
-use ballpark::ops;
-use ballpark::view::{EnvelopeRow, MonthView};
+use leeway::models::{AccountType, Direction, Mode, PeriodType};
+use leeway::money::Money;
+use leeway::ops;
+use leeway::view::{EnvelopeRow, MonthView};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -200,7 +200,7 @@ fn previous_dash_focus(current: DashFocus, is_current_month: bool) -> DashFocus 
 }
 
 /// The currently-selected standalone transaction, if an income/expense panel is focused.
-fn selected_txn<'v>(app: &App, view: &'v MonthView) -> Option<&'v ballpark::models::Txn> {
+fn selected_txn<'v>(app: &App, view: &'v MonthView) -> Option<&'v leeway::models::Txn> {
     match app.dash_focus {
         DashFocus::Income => selected_txn_by_direction(view, Direction::In, app.dash_income_sel),
         DashFocus::Expenses => {
@@ -214,7 +214,7 @@ fn selected_txn_by_direction(
     view: &MonthView,
     direction: Direction,
     selected: usize,
-) -> Option<&ballpark::models::Txn> {
+) -> Option<&leeway::models::Txn> {
     view.standalone
         .iter()
         .filter(|txn| txn.direction == direction)
@@ -356,7 +356,7 @@ fn edit_amount(app: &mut App, view: &MonthView) {
     } else if let Some(e) = selected_env(app, view) {
         app.open_text_replace_on_type(
             "Envelope amount (dollars)",
-            crate::amount_edit_string(ballpark::calc::envelope_period_amount(
+            crate::amount_edit_string(leeway::calc::envelope_period_amount(
                 e.envelope.amount,
                 e.envelope.period_type,
                 view.month.days_in_month,
@@ -578,7 +578,7 @@ fn draw_missing_month(frame: &mut Frame, area: Rect, app: &App) {
             dim,
         )),
     ];
-    let p = Paragraph::new(lines).block(crate::titled_block(" Ballpark "));
+    let p = Paragraph::new(lines).block(crate::titled_block(" Leeway "));
     frame.render_widget(p, area);
 }
 
@@ -696,7 +696,7 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                 let color = if a.balance.cents() < 0 {
                     Color::Red
                 } else {
-                    Color::Green
+                    crate::theme::GREEN
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw(format!(
@@ -717,7 +717,7 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                 let owed_color = if owed.cents() > 0 {
                     Color::Red
                 } else {
-                    Color::Green
+                    crate::theme::GREEN
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw(format!(
@@ -782,7 +782,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, view: Option<&MonthView
         // label it reads a day short, so +1 turns it into the calendar day (7th → "day 7").
         Some(v) if v.is_current => {
             format!(
-                " Ballpark — {}   (day {} of {}) ",
+                " Leeway — {}   (day {} of {}) ",
                 label,
                 v.days_elapsed + 1,
                 v.month.days_in_month
@@ -796,15 +796,15 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, view: Option<&MonthView
             } else {
                 "upcoming"
             };
-            format!(" Ballpark — {label}   ({when}) ")
+            format!(" Leeway — {label}   ({when}) ")
         }
-        None => format!(" Ballpark — {label}   (not stamped) "),
+        None => format!(" Leeway — {label}   (not stamped) "),
     };
 
     let focused = app.dash_focus == DashFocus::Header;
     let block = crate::bordered_block();
     let block = if focused {
-        block.border_style(Style::default().fg(Color::Cyan))
+        block.border_style(Style::default().fg(crate::theme::MAUVE))
     } else {
         block
     };
@@ -823,7 +823,7 @@ fn draw_whats_left(
 ) {
     let wl = &view.whats_left;
     let result_color = if wl.whats_left.cents() >= 0 {
-        Color::Green
+        crate::theme::GREEN
     } else {
         Color::Red
     };
@@ -838,7 +838,7 @@ fn draw_whats_left(
             SummaryTerm::Funds,
             Money(display_cents(SummaryTerm::Funds, wl)),
             "funds",
-            Color::Cyan,
+            crate::theme::CYAN,
             anims,
             now,
         );
@@ -885,7 +885,7 @@ fn draw_whats_left(
         SummaryTerm::IncomeLeft,
         Money(display_cents(SummaryTerm::IncomeLeft, wl)),
         "income left",
-        Color::Green,
+        crate::theme::GREEN,
         anims,
         now,
     );
@@ -904,7 +904,7 @@ fn draw_whats_left(
         SummaryTerm::Envelopes,
         Money(display_cents(SummaryTerm::Envelopes, wl)),
         "envelopes",
-        Color::Magenta,
+        crate::theme::MAUVE,
         anims,
         now,
     )));
@@ -1017,7 +1017,18 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                 PeriodType::Daily => "day",
                 PeriodType::Weekly | PeriodType::Monthly => "mo",
             };
-            let meter = meter_bar(e.consumed, e.envelope.amount, 8);
+            // Segmented meter, echoing the landing page's block style: discrete
+            // `▮` cells (the glyph carries its own side gaps) split into a mauve
+            // fill and a lighter slate track. Two spans so each gets its own
+            // colour; both render over the selection band unchanged.
+            const METER_WIDTH: usize = 8;
+            let filled = meter_fill(e.consumed, e.envelope.amount, METER_WIDTH);
+            let meter_fill_span =
+                Span::styled("▮".repeat(filled), Style::default().fg(crate::theme::MAUVE));
+            let meter_track_span = Span::styled(
+                "▮".repeat(METER_WIDTH - filled),
+                Style::default().fg(crate::theme::METER_TRACK),
+            );
 
             // Left portion: name (12) · cadence (8) · meter (8) · "$X left".
             // The cadence token is padded as a whole ("auto/mo"=7, "man/mo"=6)
@@ -1027,7 +1038,8 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
             let left_spans = vec![
                 Span::raw(format!("{:<12}", crate::truncate(&e.envelope.label, 12))),
                 Span::styled(format!("{cadence:<8}"), Style::default().fg(Color::DarkGray)),
-                Span::styled(meter, Style::default().fg(Color::Magenta)),
+                meter_fill_span,
+                meter_track_span,
                 Span::raw(format!(" {:>10} left", e.remaining.to_string())),
             ];
 
@@ -1063,16 +1075,14 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// A `██████░░░░`-style bar showing `consumed / total`, `width` chars wide.
-fn meter_bar(consumed: Money, total: Money, width: usize) -> String {
+/// Number of filled cells in a `width`-wide meter showing `consumed / total`.
+/// Zero when there's no budget to fill against.
+fn meter_fill(consumed: Money, total: Money, width: usize) -> usize {
     if total.cents() <= 0 {
-        return "░".repeat(width);
+        return 0;
     }
     let frac = (consumed.cents() as f64 / total.cents() as f64).clamp(0.0, 1.0);
-    let filled = (frac * width as f64).round() as usize;
-    let mut s = "█".repeat(filled);
-    s.push_str(&"░".repeat(width.saturating_sub(filled)));
-    s
+    (frac * width as f64).round() as usize
 }
 
 /// A small pill-styled key hint, e.g. ` j/k `.
@@ -1087,7 +1097,7 @@ fn key(label: &str) -> Span<'_> {
 mod tests {
     use super::*;
     use crate::Screen;
-    use ballpark::models::Kind;
+    use leeway::models::Kind;
     use chrono::NaiveDate;
     use ratatui::crossterm::event::KeyModifiers;
     use rusqlite::Connection;
@@ -1095,8 +1105,8 @@ mod tests {
 
     fn open_test_conn() -> Connection {
         let mut path = std::env::temp_dir();
-        path.push(format!("ballpark-dashboard-{}.db", Uuid::new_v4()));
-        ballpark::db::open(&path).unwrap()
+        path.push(format!("leeway-dashboard-{}.db", Uuid::new_v4()));
+        leeway::db::open(&path).unwrap()
     }
 
     fn app_with_stamped_month() -> App {
@@ -1143,7 +1153,7 @@ mod tests {
             series_sel: 0,
             series_search: String::new(),
             series_search_active: false,
-            series_range: ballpark::view::SeriesTimeRange::Last12Stamped,
+            series_range: leeway::view::SeriesTimeRange::Last12Stamped,
             series_filter: crate::SeriesFilter::Both,
             plan_focus: crate::PlanFocus::Income,
             editor_income_sel: 0,

@@ -5,7 +5,7 @@
 //! any in-flight tweens, so the renderer can make changed numbers roll and glow without
 //! making the read-model stateful.
 
-use ballpark::calc::WhatsLeft;
+use leeway::calc::WhatsLeft;
 use ratatui::style::{Color, Style};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -211,7 +211,7 @@ fn rgb_color(rgb: (u8, u8, u8), strength: f64) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ballpark::money::Money;
+    use leeway::money::Money;
 
     fn wl(funds: i64, income: i64, bills: i64) -> WhatsLeft {
         WhatsLeft::compute_with_carry_parts(

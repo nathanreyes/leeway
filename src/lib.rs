@@ -1,4 +1,4 @@
-//! Ballpark — the headless core.
+//! Leeway — the headless core.
 //!
 //! This library crate holds everything *except* the UI: the data model, money type,
 //! SQLite access, the §4 calculations, the §5 operations, and the read-model the UI
