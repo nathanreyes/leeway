@@ -1001,6 +1001,10 @@ fn draw_transactions(
 }
 
 fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
+    // Usable inner width of the list rows, so we can push the dim total flush
+    // against the panel's right edge (accounts for borders/padding/highlight).
+    let content_width = crate::selectable_list_content_width(area);
+
     let items: Vec<ListItem> = view
         .envelopes
         .iter()
@@ -1014,17 +1018,38 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                 PeriodType::Weekly | PeriodType::Monthly => "mo",
             };
             let meter = meter_bar(e.consumed, e.envelope.amount, 8);
-            let line = Line::from(vec![
+
+            // Left portion: name (12) · cadence (8) · meter (8) · "$X left".
+            // The cadence token is padded as a whole ("auto/mo"=7, "man/mo"=6)
+            // to a fixed 8 cols, so `mode`'s length no longer shifts the meter —
+            // every meter now starts at the same column.
+            let cadence = format!("{mode}/{period}");
+            let left_spans = vec![
                 Span::raw(format!("{:<12}", crate::truncate(&e.envelope.label, 12))),
-                Span::styled(
-                    format!("{mode}/{period:<3} "),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(format!("{:>10} mo ", e.envelope.amount.to_string())),
+                Span::styled(format!("{cadence:<8}"), Style::default().fg(Color::DarkGray)),
                 Span::styled(meter, Style::default().fg(Color::Magenta)),
                 Span::raw(format!(" {:>10} left", e.remaining.to_string())),
-            ]);
-            ListItem::new(line)
+            ];
+
+            // The envelope's total, de-emphasized and right-aligned to the panel
+            // edge. The "of" prefix reads it as the total (not another balance);
+            // the period is already shown in the cadence column, so it's omitted.
+            let total = Span::styled(
+                format!("of {}", e.envelope.amount),
+                Style::default().fg(Color::DarkGray),
+            );
+
+            // Filler spaces so `total` sits flush right. Measure actual rendered
+            // widths (block chars and ASCII are single-width) rather than assume
+            // fixed columns, so an over-long "left" amount can't misalign it.
+            let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+            let total_w = total.content.chars().count();
+            let gap = content_width.saturating_sub(left_w + total_w).max(1);
+
+            let mut spans = left_spans;
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(total);
+            ListItem::new(Line::from(spans))
         })
         .collect();
 

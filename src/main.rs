@@ -26,7 +26,7 @@ use ballpark::{calc, db, ops, queries};
 use chrono::{Datelike, Local, NaiveDate};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph,
@@ -139,9 +139,19 @@ pub(crate) fn selectable_block(title: impl Into<String>, focused: bool) -> Block
     focusable_block(title, focused).padding(Padding::new(0, LIST_RIGHT_PADDING, 0, 0))
 }
 
+/// Subtle background band marking the selected row. We use a quiet tint rather
+/// than inverse video (`Modifier::REVERSED`): inverse video swaps every cell's
+/// fg/bg, which inverts colored content like the envelope meters and reads as
+/// harsh. Paired with the `▌` highlight symbol for a clear-but-quiet cue.
+const SELECTION_BG: Color = Color::Rgb(69, 71, 90);
+
+pub(crate) fn selection_style() -> Style {
+    Style::default().bg(SELECTION_BG)
+}
+
 pub(crate) fn selectable_list<'a>(items: Vec<ListItem<'a>>) -> List<'a> {
     List::new(items)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_style(selection_style())
         .highlight_symbol(LIST_HIGHLIGHT_SYMBOL)
         .highlight_spacing(HighlightSpacing::Always)
 }
@@ -2171,7 +2181,7 @@ fn envelope_detail_content(
                         .selected_spend
                         .min(transactions.len().saturating_sub(1));
             let style = if selected {
-                Style::default().add_modifier(Modifier::REVERSED)
+                selection_style().fg(Color::White)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -2256,7 +2266,7 @@ fn draw_series_search_modal(frame: &mut Frame, prompt: &SeriesSearch) {
             let is_selected = idx == selected_idx;
             let marker = if is_selected { "▌" } else { " " };
             let style = if is_selected {
-                Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+                selection_style()
             } else {
                 Style::default()
             };
