@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn editing_a_balance_moves_whats_left() {
         let mut conn = db::open_in_memory().unwrap();
-        ops::seed_demo(&mut conn).unwrap();
+        ops::seed_starter(&mut conn).unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
 
         let before = MonthView::build(&conn, today).unwrap().unwrap();
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn automatic_envelope_transactions_do_not_change_whats_left() {
         let mut conn = db::open_in_memory().unwrap();
-        ops::seed_demo(&mut conn).unwrap();
+        ops::seed_starter(&mut conn).unwrap();
         let today = Local::now().date_naive();
         let month = queries::current_month(&conn).unwrap().unwrap();
         let envelope_id = ops::add_oneoff_envelope(
@@ -524,11 +524,24 @@ mod tests {
     #[test]
     fn credit_card_owed_reduces_whats_left() {
         let mut conn = db::open_in_memory().unwrap();
-        ops::seed_demo(&mut conn).unwrap();
+        ops::seed_starter(&mut conn).unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
 
+        // Fund the checking account and draw the card down so it carries a balance.
+        for acct in queries::load_accounts(&conn).unwrap() {
+            match acct.name.as_str() {
+                "Checking" => {
+                    ops::set_balance(&conn, &acct.id, Money::from_dollars(4200.0)).unwrap()
+                }
+                "Credit Card" => {
+                    ops::set_available_credit(&conn, &acct.id, Money::from_dollars(4150.0)).unwrap()
+                }
+                _ => {}
+            }
+        }
+
         let before = MonthView::build(&conn, today).unwrap().unwrap();
-        // Funds are checking only; the demo card owes 5000 − 4150 = 850.
+        // Funds are checking only; the card owes 5000 − 4150 = 850.
         assert_eq!(
             before.whats_left.funds_available,
             Money::from_dollars(4200.0)
@@ -564,10 +577,18 @@ mod tests {
     fn off_month_excludes_account_balances() {
         use crate::ops;
         let mut conn = db::open_in_memory().unwrap();
-        ops::seed_demo(&mut conn).unwrap(); // stamps the current calendar month
+        ops::seed_starter(&mut conn).unwrap(); // stamps the current calendar month
         let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
 
-        // Stamp a clearly non-current period (next year) from the same demo plan.
+        // Fund the checking account so the current month has a balance to fold in.
+        let checking = queries::load_accounts(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.name == "Checking")
+            .unwrap();
+        ops::set_balance(&conn, &checking.id, Money::from_dollars(4200.0)).unwrap();
+
+        // Stamp a clearly non-current period (next year) from the same starter plan.
         let plan_id = queries::plans(&conn).unwrap()[0].id.clone();
         let start = NaiveDate::from_ymd_opt(2027, 3, 1).unwrap();
         ops::stamp(&mut conn, &plan_id, "2027-03", start, 31).unwrap();
@@ -602,7 +623,7 @@ mod tests {
     #[test]
     fn unstamped_period_has_no_view() {
         let mut conn = db::open_in_memory().unwrap();
-        ops::seed_demo(&mut conn).unwrap();
+        ops::seed_starter(&mut conn).unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
         // A period nobody stamped returns None — the dashboard renders its "not stamped"
         // prompt for this and still lets you navigate away.

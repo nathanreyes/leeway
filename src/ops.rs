@@ -994,16 +994,17 @@ pub fn days_in_month(year: i32, month: u32) -> i64 {
     last_this.day() as i64
 }
 
-/// If the database is empty, populate a realistic starter: a couple of accounts, one
-/// plan with a few items, and this month already stamped from it. Idempotent — does
-/// nothing once any month exists.
-pub fn seed_demo(conn: &mut Connection) -> Result<()> {
+/// If the database is empty, lay down a generic starter template: a couple of accounts, one
+/// plan with the common bills/envelopes, and this month already stamped from it. All budgeted
+/// amounts are $0 placeholders the user fills in. Idempotent — does nothing once any month
+/// exists.
+pub fn seed_starter(conn: &mut Connection) -> Result<()> {
     if queries::current_month(conn)?.is_some() {
         return Ok(()); // already has data
     }
 
-    // Accounts. Checking holds a spendable balance; the card holds limit + available
-    // (owed = 5000 − 4150 = 850).
+    // Accounts. A checking account starting empty, and a fresh credit card with its full
+    // limit available (owed = 5000 − 5000 = 0).
     let checking = new_id();
     let card = new_id();
     conn.execute(
@@ -1012,7 +1013,7 @@ pub fn seed_demo(conn: &mut Connection) -> Result<()> {
             checking,
             "Checking",
             AccountType::Checking.as_str(),
-            Money::from_dollars(4200.0)
+            Money::from_dollars(0.0)
         ],
     )?;
     conn.execute(
@@ -1023,15 +1024,15 @@ pub fn seed_demo(conn: &mut Connection) -> Result<()> {
             "Credit Card",
             AccountType::CreditCard.as_str(),
             Money::from_dollars(5000.0),
-            Money::from_dollars(4150.0)
+            Money::from_dollars(5000.0)
         ],
     )?;
 
-    // A plan and its recurring items.
+    // A plan and its recurring items. Every amount is a $0 placeholder.
     let plan_id = new_id();
     conn.execute(
         "INSERT INTO plan (id, name) VALUES (?1, ?2)",
-        rusqlite::params![plan_id, "Normal Month"],
+        rusqlite::params![plan_id, "Monthly Budget"],
     )?;
 
     // Helper: create a series and immediately add it to the plan at `amount`.
@@ -1048,54 +1049,22 @@ pub fn seed_demo(conn: &mut Connection) -> Result<()> {
         Ok(())
     };
 
-    add(
-        Kind::Transaction,
-        "Paycheck",
-        Some(Direction::In),
-        Money::from_dollars(5200.0),
-        None,
-        None,
-    )?;
-    add(
-        Kind::Transaction,
-        "Rent",
-        Some(Direction::Out),
-        Money::from_dollars(1800.0),
-        None,
-        None,
-    )?;
-    add(
-        Kind::Transaction,
-        "Electric",
-        Some(Direction::Out),
-        Money::from_dollars(140.0),
-        None,
-        None,
-    )?;
-    add(
-        Kind::Transaction,
-        "Internet",
-        Some(Direction::Out),
-        Money::from_dollars(70.0),
-        None,
-        None,
-    )?;
-    add(
-        Kind::Envelope,
-        "Groceries",
-        None,
-        Money::from_dollars(2000.0),
-        Some(PeriodType::Monthly),
-        Some(Mode::Automatic),
-    )?;
-    add(
-        Kind::Envelope,
-        "Dining",
-        None,
-        Money::from_dollars(300.0),
-        Some(PeriodType::Monthly),
-        Some(Mode::Manual),
-    )?;
+    let zero = Money::from_dollars(0.0);
+
+    // Income.
+    add(Kind::Transaction, "Paycheck", Some(Direction::In), zero, None, None)?;
+    // Recurring bills. Internet and Phone are separate lines.
+    add(Kind::Transaction, "Rent/Mortgage", Some(Direction::Out), zero, None, None)?;
+    add(Kind::Transaction, "Utilities", Some(Direction::Out), zero, None, None)?;
+    add(Kind::Transaction, "Internet", Some(Direction::Out), zero, None, None)?;
+    add(Kind::Transaction, "Phone", Some(Direction::Out), zero, None, None)?;
+    // A monthly set-aside for savings (modeled as an outflow — there's no transfer concept).
+    add(Kind::Transaction, "Savings", Some(Direction::Out), zero, None, None)?;
+    // Everyday spending envelopes, mixing automatic/manual to show both modes.
+    add(Kind::Envelope, "Groceries", None, zero, Some(PeriodType::Monthly), Some(Mode::Automatic))?;
+    add(Kind::Envelope, "Dining Out", None, zero, Some(PeriodType::Monthly), Some(Mode::Manual))?;
+    add(Kind::Envelope, "Transportation", None, zero, Some(PeriodType::Monthly), Some(Mode::Automatic))?;
+    add(Kind::Envelope, "Personal", None, zero, Some(PeriodType::Monthly), Some(Mode::Manual))?;
 
     // Stamp it for the current calendar month.
     let today = Local::now().date_naive();
@@ -1116,17 +1085,29 @@ mod tests {
     #[test]
     fn stamp_copies_items_and_freezes_amounts() {
         let mut conn = db::open_in_memory().unwrap();
-        seed_demo(&mut conn).unwrap();
+        seed_starter(&mut conn).unwrap();
 
         let month = queries::current_month(&conn).unwrap().unwrap();
         let txns = queries::load_txns(&conn, &month.id).unwrap();
         let envelopes = queries::load_envelopes(&conn, &month.id).unwrap();
 
-        assert_eq!(txns.len(), 4); // paycheck, rent, electric, internet
-        assert_eq!(envelopes.len(), 2); // groceries, dining
+        assert_eq!(txns.len(), 6); // paycheck, rent, utilities, internet, phone, savings
+        assert_eq!(envelopes.len(), 4); // groceries, dining, transportation, personal
 
-        // stamped_amount is frozen equal to amount at stamp time.
-        let rent = txns.iter().find(|t| t.label == "Rent").unwrap();
+        // Give one plan item a concrete amount, then stamp a fresh month and confirm the
+        // instance's stamped_amount is frozen equal to its amount at stamp time.
+        let plan_id = month.plan_id.clone().unwrap();
+        let rent_entry = queries::load_plan_entries(&conn, &plan_id)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.series.label == "Rent/Mortgage")
+            .unwrap();
+        set_item_amount(&conn, &rent_entry.item_id, Money::from_dollars(1800.0)).unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
+        let month_id = stamp(&mut conn, &plan_id, "2099-01", start, 31).unwrap();
+        let txns = queries::load_txns(&conn, &month_id).unwrap();
+        let rent = txns.iter().find(|t| t.label == "Rent/Mortgage").unwrap();
         assert_eq!(rent.amount, Money::from_dollars(1800.0));
         assert_eq!(rent.stamped_amount, Some(Money::from_dollars(1800.0)));
         assert!(!rent.settled);
@@ -1313,31 +1294,43 @@ mod tests {
     #[test]
     fn mark_and_unmark_paid_roundtrip() {
         let mut conn = db::open_in_memory().unwrap();
-        seed_demo(&mut conn).unwrap();
+        seed_starter(&mut conn).unwrap();
         let month = queries::current_month(&conn).unwrap().unwrap();
-        let txns = queries::load_txns(&conn, &month.id).unwrap();
-        let electric = txns.iter().find(|t| t.label == "Electric").unwrap();
+
+        // Give the Utilities bill a planned $140, then stamp a fresh month so the instance
+        // freezes that as its stamped amount (the value a revert restores to).
+        let plan_id = month.plan_id.clone().unwrap();
+        let utilities_entry = queries::load_plan_entries(&conn, &plan_id)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.series.label == "Utilities")
+            .unwrap();
+        set_item_amount(&conn, &utilities_entry.item_id, Money::from_dollars(140.0)).unwrap();
+        let start = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
+        let month_id = stamp(&mut conn, &plan_id, "2099-01", start, 31).unwrap();
+        let txns = queries::load_txns(&conn, &month_id).unwrap();
+        let utilities = txns.iter().find(|t| t.label == "Utilities").unwrap();
 
         // Pay it at a corrected actual.
         mark_paid(
             &conn,
-            &electric.id,
+            &utilities.id,
             Money::from_dollars(152.30),
             Some("2026-07-05"),
         )
         .unwrap();
-        let after = queries::load_txns(&conn, &month.id).unwrap();
-        let electric = after.iter().find(|t| t.label == "Electric").unwrap();
-        assert!(electric.settled);
-        assert_eq!(electric.amount, Money::from_dollars(152.30));
-        assert_eq!(calc::txn_remaining(electric), Money::ZERO);
+        let after = queries::load_txns(&conn, &month_id).unwrap();
+        let utilities = after.iter().find(|t| t.label == "Utilities").unwrap();
+        assert!(utilities.settled);
+        assert_eq!(utilities.amount, Money::from_dollars(152.30));
+        assert_eq!(calc::txn_remaining(utilities), Money::ZERO);
 
         // Un-mark with revert -> back to the planned $140.
-        unmark_paid(&conn, &electric.id, true).unwrap();
-        let after = queries::load_txns(&conn, &month.id).unwrap();
-        let electric = after.iter().find(|t| t.label == "Electric").unwrap();
-        assert!(!electric.settled);
-        assert_eq!(electric.amount, Money::from_dollars(140.0));
+        unmark_paid(&conn, &utilities.id, true).unwrap();
+        let after = queries::load_txns(&conn, &month_id).unwrap();
+        let utilities = after.iter().find(|t| t.label == "Utilities").unwrap();
+        assert!(!utilities.settled);
+        assert_eq!(utilities.amount, Money::from_dollars(140.0));
     }
 
     #[test]
@@ -1556,13 +1549,18 @@ mod tests {
     #[test]
     fn card_owed_recomputes_from_limit_and_available() {
         let mut conn = db::open_in_memory().unwrap();
-        seed_demo(&mut conn).unwrap();
+        seed_starter(&mut conn).unwrap();
         let card_id = {
             let accts = queries::load_accounts(&conn).unwrap();
             let card = accts.iter().find(|a| a.name == "Credit Card").unwrap();
-            assert_eq!(card.owed(), Money::from_dollars(850.0)); // 5000 − 4150
             card.id.clone()
         };
+
+        // Draw the card down so it carries a balance, then confirm owed recomputes.
+        set_available_credit(&conn, &card_id, Money::from_dollars(4150.0)).unwrap();
+        let accts = queries::load_accounts(&conn).unwrap();
+        let card = accts.iter().find(|a| a.id == card_id).unwrap();
+        assert_eq!(card.owed(), Money::from_dollars(850.0)); // 5000 − 4150
 
         set_credit_limit(&conn, &card_id, Money::from_dollars(6000.0)).unwrap();
         let accts = queries::load_accounts(&conn).unwrap();
@@ -1640,7 +1638,7 @@ mod tests {
     #[test]
     fn account_carry_balance_flows_into_whats_left() {
         let mut conn = db::open_in_memory().unwrap();
-        seed_demo(&mut conn).unwrap();
+        seed_starter(&mut conn).unwrap();
         let today = Local::now().date_naive();
         let before = crate::view::MonthView::build_for(&conn, today, today.year(), today.month())
             .unwrap()
@@ -1677,7 +1675,7 @@ mod tests {
     #[test]
     fn delete_account_is_blocked_while_referenced_by_transactions() {
         let mut conn = db::open_in_memory().unwrap();
-        seed_demo(&mut conn).unwrap();
+        seed_starter(&mut conn).unwrap();
         let month = queries::current_month(&conn).unwrap().unwrap();
         let account_id =
             create_checking_account(&conn, "Bills", Money::from_dollars(100.0)).unwrap();
@@ -1738,7 +1736,7 @@ mod tests {
     #[test]
     fn adhoc_items_are_hand_entered_and_seriesless() {
         let mut conn = db::open_in_memory().unwrap();
-        seed_demo(&mut conn).unwrap();
+        seed_starter(&mut conn).unwrap();
         let month = queries::current_month(&conn).unwrap().unwrap();
 
         // A fresh stamped month from the demo has no hand-entered data yet.
@@ -1787,7 +1785,7 @@ mod tests {
     #[test]
     fn month_adds_series_backed_budget_items() {
         let mut conn = db::open_in_memory().unwrap();
-        seed_demo(&mut conn).unwrap();
+        seed_starter(&mut conn).unwrap();
         let month = queries::current_month(&conn).unwrap().unwrap();
         let plan_id = queries::plans(&conn).unwrap()[0].id.clone();
 
@@ -1988,7 +1986,7 @@ mod tests {
     fn feeding_a_manual_envelope_consumes_it() {
         use crate::calc;
         let mut conn = db::open_in_memory().unwrap();
-        seed_demo(&mut conn).unwrap();
+        seed_starter(&mut conn).unwrap();
         let month = queries::current_month(&conn).unwrap().unwrap();
 
         let env_id = add_oneoff_envelope(
@@ -2035,7 +2033,7 @@ mod tests {
     #[test]
     fn envelope_transactions_require_an_envelope_in_the_same_month() {
         let mut conn = db::open_in_memory().unwrap();
-        seed_demo(&mut conn).unwrap();
+        seed_starter(&mut conn).unwrap();
         let current = queries::current_month(&conn).unwrap().unwrap();
         let plan_id = queries::plans(&conn).unwrap()[0].id.clone();
         let other_month = stamp(

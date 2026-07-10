@@ -556,7 +556,7 @@ fn main() -> Result<()> {
     let mut conn = db::open(&path)?;
     // On a fresh database this stamps the current calendar month, satisfying "if no month
     // exists, create one" for a first-ever launch.
-    ops::seed_demo(&mut conn)?;
+    ops::seed_starter(&mut conn)?;
 
     // The app opens on the current calendar month.
     let today = Local::now().date_naive();
