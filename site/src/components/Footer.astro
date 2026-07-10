@@ -1,0 +1,58 @@
+---
+/* Footer.astro */
+const repo = "https://github.com/nathanreyes/leeway";
+---
+
+<footer class="foot">
+  <div class="container foot__inner">
+    <div class="foot__brand">
+      <span class="brand__glyph">▮</span> leeway
+      <p class="foot__note">Early open-source software. Expect the UI, onboarding, and packaging to change before a stable release.</p>
+    </div>
+    <div class="foot__links">
+      <a href={repo} target="_blank" rel="noopener">GitHub ↗</a>
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+    </div>
+  </div>
+  <div class="container foot__base t-faint">
+    <span>Built in Rust with Ratatui.</span>
+    <span>what's&nbsp;left?</span>
+  </div>
+</footer>
+
+<style>
+  .foot {
+    border-top: 1px solid var(--line-soft);
+    padding: 44px 0 32px;
+    margin-top: 20px;
+  }
+  .foot__inner {
+    display: flex;
+    justify-content: space-between;
+    gap: 32px;
+    flex-wrap: wrap;
+  }
+  .foot__brand { font-weight: 600; }
+  .brand__glyph { color: var(--mauve); }
+  .foot__note {
+    font-weight: 400;
+    color: var(--dim);
+    font-size: 13px;
+    max-width: 46ch;
+    margin: 10px 0 0;
+  }
+  .foot__links { display: flex; gap: 22px; font-size: 14px; height: fit-content; }
+  .foot__links a { color: var(--dim); }
+  .foot__links a:hover { color: var(--text); text-decoration: none; }
+
+  .foot__base {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 32px;
+    padding-top: 18px;
+    border-top: 1px solid var(--line-soft);
+    font-size: 12.5px;
+  }
+  .foot__base .serif { font-style: italic; }
+</style>

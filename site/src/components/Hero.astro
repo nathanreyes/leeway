@@ -1,0 +1,79 @@
+---
+/* Hero.astro — the opening pitch + the terminal centerpiece below it. */
+import Terminal from "./Terminal.astro";
+const repo = "https://github.com/nathanreyes/leeway";
+---
+
+<section id="top" class="hero">
+  <div class="container hero__inner">
+    <p class="eyebrow reveal">local-first · terminal · rust</p>
+
+    <h1 class="hero__title reveal" style="animation-delay: 0.06s">
+      A budget that answers<br />
+      one question: <span class="serif hero__hook">what's left?</span><span class="cursor"></span>
+    </h1>
+
+    <p class="hero__sub reveal" style="animation-delay: 0.12s">
+      Leeway is a forecasting tool, not an accounting ledger. Keep your checking
+      balance as the ground truth, toggle income and bills as they settle, and let
+      spending envelopes draw down over the month — a low-friction budget you can
+      trust without entering every transaction.
+    </p>
+
+    <div class="hero__cta reveal" style="animation-delay: 0.18s">
+      <a class="btn btn--primary" href="#install">
+        Get started <span class="btn__key">cargo run</span>
+      </a>
+      <a class="btn" href={repo} target="_blank" rel="noopener">View source ↗</a>
+      <span class="hero__badge">pre-release</span>
+    </div>
+  </div>
+
+  <div class="container hero__terminal">
+    <Terminal />
+  </div>
+</section>
+
+<style>
+  .hero { padding: 72px 0 40px; }
+  .hero__inner { max-width: 760px; text-align: center; margin-inline: auto; }
+
+  .hero__title {
+    font-size: clamp(30px, 5.2vw, 52px);
+    line-height: 1.12;
+    margin-top: 20px;
+  }
+  .hero__hook {
+    font-size: 1.15em;
+    color: var(--mauve);
+    font-style: italic;
+  }
+
+  .hero__sub {
+    color: var(--dim);
+    font-size: clamp(14px, 1.6vw, 16px);
+    line-height: 1.7;
+    max-width: 60ch;
+    margin: 22px auto 0;
+  }
+
+  .hero__cta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    margin-top: 30px;
+  }
+  .hero__badge {
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--amber);
+    border: 1px dashed color-mix(in srgb, var(--amber) 55%, transparent);
+    border-radius: 999px;
+    padding: 4px 12px;
+  }
+
+  .hero__terminal { margin-top: 54px; }
+</style>

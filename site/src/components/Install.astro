@@ -1,0 +1,101 @@
+---
+/*
+ * Install.astro — the install instructions, straight from README.md. Rendered
+ * as a terminal window so it stays on-theme. Future-distribution note keeps
+ * expectations honest (pre-release, source-only for now).
+ */
+const repo = "https://github.com/nathanreyes/leeway";
+
+// Lines of the install session: [prompt?, text, kind]
+const lines = [
+  { p: true,  t: "git clone https://github.com/nathanreyes/leeway.git", k: "cmd" },
+  { p: true,  t: "cd leeway", k: "cmd" },
+  { p: true,  t: "cargo run", k: "cmd" },
+  { p: false, t: "Creates leeway.db, seeds starter data, opens the app.", k: "out" },
+  { p: false, t: "", k: "gap" },
+  { p: false, t: "# install as a command", k: "comment" },
+  { p: true,  t: "cargo install --path .", k: "cmd" },
+  { p: true,  t: "leeway", k: "cmd" },
+];
+---
+
+<section id="install" class="install">
+  <div class="container install__inner">
+    <div class="install__copy">
+      <p class="eyebrow">install</p>
+      <h2 class="install__h">Ships from source today.</h2>
+      <p class="install__sub">
+        You need a Rust toolchain — the standard route is <a
+          href="https://rustup.rs/"
+          target="_blank"
+          rel="noopener">rustup</a>. On first run Leeway creates a local
+        database, applies the schema, seeds starter data, and opens the dashboard.
+      </p>
+      <p class="install__next">
+        <span class="t-mauve">next up →</span> <code>cargo install leeway</code> from
+        crates.io and prebuilt macOS / Linux / Windows binaries on GitHub Releases.
+      </p>
+      <a class="btn" href={repo} target="_blank" rel="noopener">Full README ↗</a>
+    </div>
+
+    <div class="term install__term">
+      <div class="term__bar">
+        <span class="dot dot--r"></span>
+        <span class="dot dot--y"></span>
+        <span class="dot dot--g"></span>
+        <span class="term__name">~/code</span>
+      </div>
+      <pre class="install__code">{lines.map((l) => (
+        l.k === "gap" ? <div class="ln">&nbsp;</div> :
+        <div class:list={["ln", `ln--${l.k}`]}>{l.p && <span class="prompt">$</span>}<span>{l.t}</span></div>
+      ))}</pre>
+    </div>
+  </div>
+</section>
+
+<style>
+  .install { padding: 40px 0 72px; }
+  .install__inner {
+    display: grid;
+    grid-template-columns: 1fr 1.1fr;
+    gap: 40px;
+    align-items: center;
+  }
+  .install__h { font-size: clamp(22px, 3vw, 30px); margin: 12px 0 16px; }
+  .install__sub { color: var(--dim); margin: 0 0 16px; }
+  .install__next {
+    color: var(--faint);
+    font-size: 13px;
+    border-left: 2px solid var(--line-bright);
+    padding-left: 12px;
+    margin: 0 0 22px;
+  }
+  .install__next code { color: var(--dim); }
+
+  .install__term {
+    border: 1px solid var(--line-bright);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+    background: var(--bg-soft);
+  }
+  .install__code {
+    margin: 0;
+    padding: 20px 22px;
+    font-family: var(--mono);
+    font-size: 13.5px;
+    line-height: 2;
+    overflow-x: auto;
+  }
+  .ln { white-space: pre; }
+  .prompt { color: var(--green); margin-right: 10px; user-select: none; }
+  .ln--cmd { color: var(--text); }
+  /* Prose lines wrap instead of clipping if they run long. */
+  .ln--out, .ln--comment { white-space: pre-wrap; }
+  .ln--out { color: var(--dim); }
+  .ln--comment { color: var(--faint); }
+
+  @media (max-width: 780px) {
+    .install__inner { grid-template-columns: 1fr; gap: 28px; }
+  }
+</style>

@@ -1,0 +1,50 @@
+---
+/* Nav.astro — minimal sticky top bar. */
+const repo = "https://github.com/nathanreyes/leeway";
+---
+
+<header class="nav">
+  <div class="container nav__inner">
+    <a class="brand" href="#top">
+      <span class="brand__glyph">▮</span>leeway
+    </a>
+    <nav class="nav__links">
+      <a href="#features">features</a>
+      <a href="#install">install</a>
+      <a href={repo} target="_blank" rel="noopener">github ↗</a>
+    </nav>
+  </div>
+</header>
+
+<style>
+  .nav {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .nav__inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 58px;
+  }
+  .brand {
+    color: var(--text);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .brand:hover { text-decoration: none; }
+  .brand__glyph { color: var(--mauve); }
+  .nav__links { display: flex; gap: 22px; font-size: 14px; }
+  .nav__links a { color: var(--dim); }
+  .nav__links a:hover { color: var(--text); text-decoration: none; }
+  @media (max-width: 560px) {
+    .nav__links a:not(:last-child) { display: none; }
+  }
+</style>

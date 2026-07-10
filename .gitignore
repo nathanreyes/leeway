@@ -1,6 +1,12 @@
 # Rust build artifacts
 /target/
 
+# Web (site/) build artifacts — site/ has its own .gitignore too; these guard
+# against tooling accidentally run from the repo root.
+node_modules/
+site/dist/
+site/.astro/
+
 # Backtrace/profiling output
 *.profraw
 

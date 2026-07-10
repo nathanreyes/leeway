@@ -1,0 +1,153 @@
+---
+/*
+ * Terminal.astro — a faithful HTML recreation of the Leeway dashboard TUI.
+ *
+ * This is the hero visual: the landing page shows the actual product. It mirrors
+ * the real dashboard — a titled window, an "Envelopes" panel with block-char
+ * meters, the dim right-aligned "of $X" total, one selected row using the same
+ * selection band (#45475a), and the "= what's left" rollup in green.
+ *
+ * Envelope rows are laid out with CSS grid (not hand-aligned box characters) so
+ * the columns stay crisp at any zoom. The meters themselves are real ██░░ glyphs.
+ */
+
+// Sample data, matching the screenshots. `fill` = filled meter cells (of 8).
+const envelopes = [
+  { name: "Groceries", fill: 4, left: "$1,419.35", total: "$2,000.00", sel: false },
+  { name: "Dining",    fill: 3, left: "$1,206.45", total: "$1,700.00", sel: true  },
+  { name: "Auto",      fill: 5, left: "$271.81",   total: "$383.00",   sel: false },
+  { name: "Healthcare", fill: 3, left: "$177.42",  total: "$250.00",   sel: false },
+];
+
+const METER = 8;
+---
+
+<div class="term reveal" style="animation-delay: 0.25s">
+  <!-- Window chrome -->
+  <div class="term__bar">
+    <span class="dot dot--r"></span>
+    <span class="dot dot--y"></span>
+    <span class="dot dot--g"></span>
+    <span class="term__name">leeway — dashboard</span>
+  </div>
+
+  <!-- Window body -->
+  <div class="term__body">
+    <div class="term__head">
+      <span class="t-mauve">Leeway</span>
+      <span class="t-dim"> — 2026-07 · day 10 of 31</span>
+    </div>
+
+    <div class="panel term__panel">
+      <span class="panel__title">Envelopes</span>
+
+      {envelopes.map((e) => (
+        <div class:list={["row", { "row--sel": e.sel }]}>
+          <span class="row__mark">{e.sel ? "▌" : " "}</span>
+          <span class="row__name">{e.name}</span>
+          <span class="row__cadence t-dim">auto/mo</span>
+          <span class="meter">
+            <span class="fill">{"█".repeat(e.fill)}</span><span class="track">{"█".repeat(METER - e.fill)}</span>
+          </span>
+          <span class="row__left"><span class="t-green">{e.left}</span> <span class="t-faint">left</span></span>
+          <span class="row__total t-faint">of {e.total}</span>
+        </div>
+      ))}
+    </div>
+
+    <!-- what's-left rollup -->
+    <div class="term__wl">
+      <span class="t-faint">=</span>
+      <span class="t-green">$1,284.10</span>
+      <span class="t-dim">what's left</span>
+    </div>
+
+    <!-- footer hint bar, like the app's status footer -->
+    <div class="term__hints t-faint">
+      <span><b>Tab</b> panel</span>
+      <span><b>j/k</b> move</span>
+      <span><b>Enter</b> open</span>
+      <span><b>s</b> spend</span>
+      <span><b>q</b> quit</span>
+    </div>
+  </div>
+</div>
+
+<style>
+  .term {
+    border: 1px solid var(--line-bright);
+    border-radius: 12px;
+    background: var(--bg-soft);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    font-size: 13.5px;
+    line-height: 1.9;
+  }
+
+  .term__bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--line);
+  }
+  .dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+  .dot--r { background: #f2a7c3; }
+  .dot--y { background: #e8c583; }
+  .dot--g { background: #93e0a0; }
+  .term__name {
+    margin-left: 8px;
+    color: var(--dim);
+    font-size: 12px;
+    letter-spacing: 0.04em;
+  }
+
+  .term__body { padding: 20px 22px 18px; }
+  .term__head { margin-bottom: 20px; }
+
+  .term__panel { padding: 20px 16px 16px; }
+
+  /* Envelope row grid: mark · name · cadence · meter · left · total(right) */
+  .row {
+    display: grid;
+    grid-template-columns: 1ch 8.5em 5em auto 1fr auto;
+    align-items: center;
+    gap: 0 12px;
+    padding: 1px 12px 1px 8px;
+    border-radius: 5px;
+    white-space: nowrap;
+  }
+  .row--sel { background: var(--line-bright); }   /* the selection band */
+  .row__mark { color: var(--cyan); }
+  .row__total { justify-self: end; }
+  .row__left { text-align: right; }
+
+  .term__wl {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    margin-top: 18px;
+    padding-left: 8px;
+    font-size: 15px;
+  }
+  .term__wl .t-green { font-weight: 600; }
+
+  .term__hints {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-top: 18px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line-soft);
+    font-size: 12px;
+  }
+  .term__hints b { color: var(--dim); font-weight: 600; }
+
+  @media (max-width: 560px) {
+    .term { font-size: 12px; }
+    .row { grid-template-columns: 1ch 6.5em auto 1fr; }
+    /* Drop cadence + total on narrow screens to keep the meter/left readable. */
+    .row__cadence, .row__total { display: none; }
+  }
+</style>
