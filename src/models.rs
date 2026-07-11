@@ -1,4 +1,4 @@
-//! The domain types: enums for the "coded" text columns and one struct per table.
+//! The domain types: enums for the "coded" text columns and one struct per table/read row.
 //!
 //! These are plain data — no behavior beyond conversions. The calculations live in
 //! `calc.rs`, the SQL in `queries.rs`/`ops.rs`. Keeping data and behavior separate is
@@ -77,9 +77,10 @@ impl rusqlite::ToSql for Money {
     }
 }
 
-// --- Table structs -------------------------------------------------------------
-// One struct per row shape. `Option<T>` mirrors a nullable column. Note `account_type`
-// rather than `type` (a reserved word), and `NaiveDate` for the parsed start date.
+// --- Table/read structs --------------------------------------------------------
+// One struct per row shape. `Option<T>` mirrors a nullable column or an optional joined
+// value such as the current canonical series label. Note `account_type` rather than `type`
+// (a reserved word), and `NaiveDate` for the parsed start date.
 
 /// A cash-flow account. `balance` is the spendable ground truth for a **checking**
 /// account. A **credit card** instead carries `credit_limit` + `available_credit` (both
@@ -178,11 +179,21 @@ pub struct Envelope {
     /// **ad-hoc** envelope added straight into the month (no plan behind it). Same meaning
     /// as `Txn::series_id`: `Some` = plan-derived, `None` = hand-entered.
     pub series_id: Option<String>,
+    /// Label copied onto this month instance at creation/stamp time. Month-facing queries
+    /// also load `series_label`; use `display_label()` for UI so a surviving series owns
+    /// the canonical name while this value remains the deletion/legacy fallback.
     pub label: String,
+    pub series_label: Option<String>,
     pub amount: Money,
     pub stamped_amount: Money,
     pub period_type: PeriodType,
     pub mode: Mode, // frozen at stamp time; never re-resolved against the global default
+}
+
+impl Envelope {
+    pub fn display_label(&self) -> &str {
+        self.series_label.as_deref().unwrap_or(&self.label)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -192,10 +203,20 @@ pub struct Txn {
     pub series_id: Option<String>,
     pub envelope_id: Option<String>,
     pub account_id: Option<String>,
+    /// Label stored on this particular transaction. For a series-backed top-level budget
+    /// row, `series_label` supplies the live canonical display name. For legacy one-offs
+    /// and envelope spending it is `None`, so this stored label remains the display name.
     pub label: String,
+    pub series_label: Option<String>,
     pub direction: Direction,
     pub amount: Money,
     pub stamped_amount: Option<Money>,
     pub settled: bool,
     pub date_paid: Option<String>,
+}
+
+impl Txn {
+    pub fn display_label(&self) -> &str {
+        self.series_label.as_deref().unwrap_or(&self.label)
+    }
 }

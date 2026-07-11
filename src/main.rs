@@ -39,6 +39,8 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+pub(crate) const SERIES_RENAME_GUIDANCE: &str = "Rename this item from its Series page — press S";
+
 /// Which screen is showing. `PlanEditor` carries the id of the plan being edited —
 /// that's how the loop knows which plan's items to load. Series carries its own compact
 /// navigation state so a contextual detail drill-in can return to its exact origin.
@@ -429,7 +431,7 @@ pub enum PromptKind {
     AccountCarry {
         id: String,
     },
-    /// Edit a month transaction's label (this instance only).
+    /// Edit a seriesless month transaction or an individual envelope-spending label.
     TxnLabel {
         id: String,
     },
@@ -437,7 +439,7 @@ pub enum PromptKind {
     TxnAmount {
         id: String,
     },
-    /// Edit a month envelope's label.
+    /// Edit a legacy seriesless month envelope's label.
     EnvelopeLabel {
         id: String,
     },
@@ -1252,13 +1254,19 @@ fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         _ => match detail.focus {
             EnvelopeDetailFocus::Details => match key.code {
-                KeyCode::Char('l') => app.open_text_from_envelope_detail(
-                    "Envelope label",
-                    envelope.label,
-                    PromptKind::EnvelopeLabel { id: envelope.id },
-                    detail.clone(),
-                    true,
-                ),
+                KeyCode::Char('l') => {
+                    if envelope.series_id.is_some() {
+                        app.status = Some(SERIES_RENAME_GUIDANCE.into());
+                    } else {
+                        app.open_text_from_envelope_detail(
+                            "Envelope label",
+                            envelope.label,
+                            PromptKind::EnvelopeLabel { id: envelope.id },
+                            detail.clone(),
+                            true,
+                        );
+                    }
+                }
                 KeyCode::Char('a') => {
                     let days_in_month = queries::month_days(&app.conn, &detail.month_id)?;
                     let amount = calc::envelope_period_amount(
@@ -1267,9 +1275,11 @@ fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         days_in_month,
                     );
                     let title = match calc::active_period(envelope.period_type) {
-                        PeriodType::Daily => format!("Daily amount for {}", envelope.label),
+                        PeriodType::Daily => {
+                            format!("Daily amount for {}", envelope.display_label())
+                        }
                         PeriodType::Monthly | PeriodType::Weekly => {
-                            format!("Monthly amount for {}", envelope.label)
+                            format!("Monthly amount for {}", envelope.display_label())
                         }
                     };
                     app.open_text_from_envelope_detail(
@@ -1300,7 +1310,10 @@ fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 }
                 KeyCode::Char('x') => {
                     app.open_confirm_from_envelope_detail(
-                        format!("Delete envelope “{}” and its transactions?", envelope.label),
+                        format!(
+                            "Delete envelope “{}” and its transactions?",
+                            envelope.display_label()
+                        ),
                         ConfirmAction::DeleteEnvelope { id: envelope.id },
                         detail.clone(),
                     );
@@ -1322,7 +1335,7 @@ fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 }
                 KeyCode::Char('s') | KeyCode::Char('n') => {
                     app.open_text_from_envelope_detail(
-                        format!("Transaction label for {}", envelope.label),
+                        format!("Transaction label for {}", envelope.display_label()),
                         String::new(),
                         PromptKind::EnvelopeSpendLabel {
                             envelope_id: envelope.id,
@@ -1335,7 +1348,7 @@ fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 KeyCode::Char('a') => {
                     if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
                         app.open_text_from_envelope_detail(
-                            format!("Amount for {}", txn.label),
+                            format!("Amount for {}", txn.display_label()),
                             amount_edit_string(txn.amount),
                             PromptKind::TxnAmount { id: txn.id.clone() },
                             detail.clone(),
@@ -1357,7 +1370,7 @@ fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 KeyCode::Char('x') => {
                     if let Some(txn) = selected_spending(&spending, detail.selected_spend) {
                         app.open_confirm_from_envelope_detail(
-                            format!("Delete transaction “{}”?", txn.label),
+                            format!("Delete transaction “{}”?", txn.display_label()),
                             ConfirmAction::DeleteTxn { id: txn.id.clone() },
                             detail.clone(),
                         );
@@ -2329,8 +2342,6 @@ fn draw_envelope_detail_section(
 
 fn details_footer_line() -> Line<'static> {
     Line::from(vec![
-        modal_key(" l "),
-        Span::raw(" label  "),
         modal_key(" a "),
         Span::raw(" amount  "),
         modal_key(" m "),
@@ -2459,7 +2470,11 @@ fn envelope_detail_content(
                     Style::default().fg(theme::CYAN),
                 ),
                 Span::styled(
-                    format!(" {:<42} {:>14}", truncate(&txn.label, 42), txn.amount),
+                    format!(
+                        " {:<42} {:>14}",
+                        truncate(txn.display_label(), 42),
+                        txn.amount
+                    ),
                     style,
                 ),
             ]));
@@ -2467,7 +2482,7 @@ fn envelope_detail_content(
     }
 
     Ok((
-        format!(" Envelope · {} ", envelope.label),
+        format!(" Envelope · {} ", envelope.display_label()),
         details,
         transaction_lines,
     ))
@@ -2868,8 +2883,32 @@ mod tests {
     }
 
     #[test]
-    fn canceling_envelope_label_prompt_returns_to_detail_screen() {
+    fn series_backed_envelope_label_key_points_to_the_series_page() {
         let (mut app, detail, _) = app_with_envelope_detail();
+
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('l'))).unwrap();
+
+        assert!(app.modal.is_none());
+        assert_eq!(app.status.as_deref(), Some(SERIES_RENAME_GUIDANCE));
+        assert_envelope_detail_screen(&app, &detail);
+    }
+
+    #[test]
+    fn seriesless_envelope_label_still_has_a_local_compatibility_editor() {
+        let (mut app, mut detail, _) = app_with_envelope_detail();
+        let envelope_id = ops::add_oneoff_envelope(
+            &app.conn,
+            &detail.month_id,
+            "Legacy",
+            Money::from_dollars(50.0),
+            PeriodType::Monthly,
+            Mode::Manual,
+        )
+        .unwrap();
+        detail.envelope_id = envelope_id.clone();
+        app.screen = Screen::EnvelopeDetail {
+            detail: detail.clone(),
+        };
 
         handle_envelope_detail_key(&mut app, key(KeyCode::Char('l'))).unwrap();
         match &app.modal {
@@ -2879,17 +2918,6 @@ mod tests {
             }
             _ => panic!("expected envelope label prompt"),
         }
-
-        handle_modal_key(&mut app, key(KeyCode::Esc)).unwrap();
-
-        assert_envelope_detail_screen(&app, &detail);
-    }
-
-    #[test]
-    fn submitting_envelope_label_returns_to_detail_screen() {
-        let (mut app, detail, envelope_id) = app_with_envelope_detail();
-
-        handle_envelope_detail_key(&mut app, key(KeyCode::Char('l'))).unwrap();
         for c in "Travel".chars() {
             handle_modal_key(&mut app, key(KeyCode::Char(c))).unwrap();
         }
@@ -3144,7 +3172,8 @@ mod tests {
         // With a text modal open, `h` is typed into the buffer, not swallowed as help.
         // (The event loop consults the modal before the global `h` handler.)
         let (mut app, _, _) = app_with_envelope_detail();
-        handle_envelope_detail_key(&mut app, key(KeyCode::Char('l'))).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Tab)).unwrap();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('s'))).unwrap();
 
         handle_modal_key(&mut app, key(KeyCode::Char('h'))).unwrap();
         match &app.modal {

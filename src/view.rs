@@ -150,7 +150,7 @@ impl MonthView {
         let mut standalone = standalone;
         standalone.sort_by(|a, b| {
             let dir = dir_rank(a.direction).cmp(&dir_rank(b.direction));
-            dir.then_with(|| a.label.cmp(&b.label))
+            dir.then_with(|| a.display_label().cmp(b.display_label()))
         });
 
         let whats_left = WhatsLeft::compute_with_carry_parts(

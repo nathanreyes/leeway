@@ -116,9 +116,13 @@ pub fn months(conn: &Connection) -> Result<Vec<Month>> {
 
 pub fn load_envelopes(conn: &Connection, month_id: &str) -> Result<Vec<Envelope>> {
     let mut stmt = conn.prepare(
-        "SELECT id, month_id, series_id, label, amount_cents,
-                stamped_amount_cents, period_type, mode
-         FROM envelope WHERE month_id = ?1 ORDER BY label, id",
+        "SELECT e.id, e.month_id, e.series_id, e.label,
+                s.label AS series_label, e.amount_cents,
+                e.stamped_amount_cents, e.period_type, e.mode
+         FROM envelope e
+         LEFT JOIN series s ON s.id = e.series_id
+         WHERE e.month_id = ?1
+         ORDER BY COALESCE(s.label, e.label), e.id",
     )?;
     let rows = stmt
         .query_map([month_id], map_envelope)?
@@ -128,9 +132,13 @@ pub fn load_envelopes(conn: &Connection, month_id: &str) -> Result<Vec<Envelope>
 
 pub fn load_txns(conn: &Connection, month_id: &str) -> Result<Vec<Txn>> {
     let mut stmt = conn.prepare(
-        "SELECT id, month_id, series_id, envelope_id, account_id, label,
-                direction, amount_cents, stamped_amount_cents, settled, date_paid
-         FROM txn WHERE month_id = ?1 ORDER BY direction DESC, label, id",
+        "SELECT t.id, t.month_id, t.series_id, t.envelope_id, t.account_id, t.label,
+                s.label AS series_label, t.direction, t.amount_cents,
+                t.stamped_amount_cents, t.settled, t.date_paid
+         FROM txn t
+         LEFT JOIN series s ON s.id = t.series_id
+         WHERE t.month_id = ?1
+         ORDER BY t.direction DESC, COALESCE(s.label, t.label), t.id",
     )?;
     let rows = stmt
         .query_map([month_id], map_txn)?
@@ -144,11 +152,13 @@ pub fn load_envelope_txns(
     envelope_id: &str,
 ) -> Result<Vec<Txn>> {
     let mut stmt = conn.prepare(
-        "SELECT id, month_id, series_id, envelope_id, account_id, label,
-                direction, amount_cents, stamped_amount_cents, settled, date_paid
-         FROM txn
-         WHERE month_id = ?1 AND envelope_id = ?2
-         ORDER BY label, id",
+        "SELECT t.id, t.month_id, t.series_id, t.envelope_id, t.account_id, t.label,
+                s.label AS series_label, t.direction, t.amount_cents,
+                t.stamped_amount_cents, t.settled, t.date_paid
+         FROM txn t
+         LEFT JOIN series s ON s.id = t.series_id
+         WHERE t.month_id = ?1 AND t.envelope_id = ?2
+         ORDER BY COALESCE(s.label, t.label), t.id",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![month_id, envelope_id], map_txn)?
@@ -496,6 +506,7 @@ fn map_envelope(r: &Row) -> rusqlite::Result<Envelope> {
         month_id: r.get("month_id")?,
         series_id: r.get("series_id")?,
         label: r.get("label")?,
+        series_label: r.get("series_label")?,
         amount: r.get("amount_cents")?,
         stamped_amount: r.get("stamped_amount_cents")?,
         period_type: r.get("period_type")?,
@@ -511,6 +522,7 @@ fn map_txn(r: &Row) -> rusqlite::Result<Txn> {
         envelope_id: r.get("envelope_id")?,
         account_id: r.get("account_id")?,
         label: r.get("label")?,
+        series_label: r.get("series_label")?,
         direction: r.get("direction")?,
         amount: r.get("amount_cents")?,
         stamped_amount: r.get("stamped_amount_cents")?,
@@ -557,4 +569,135 @@ fn map_month_raw(r: &Row) -> rusqlite::Result<MonthRaw> {
         start_date: r.get("start_date")?,
         days_in_month: r.get("days_in_month")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Direction, Kind, Mode, PeriodType};
+    use crate::money::Money;
+    use crate::{db, ops};
+    use chrono::NaiveDate;
+
+    #[test]
+    fn month_rows_use_live_series_labels_with_snapshot_fallback() {
+        let mut conn = db::open_in_memory().unwrap();
+        let plan_id = ops::create_plan(&conn, "Normal").unwrap();
+        let txn_series = ops::create_series(
+            &conn,
+            Kind::Transaction,
+            "Electric",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        let envelope_series = ops::create_series(
+            &conn,
+            Kind::Envelope,
+            "Groceries",
+            None,
+            Some(PeriodType::Monthly),
+            Some(Mode::Manual),
+        )
+        .unwrap();
+        let txn_item =
+            ops::add_plan_item(&conn, &plan_id, &txn_series, Money::from_dollars(90.0)).unwrap();
+        let envelope_item = ops::add_plan_item(
+            &conn,
+            &plan_id,
+            &envelope_series,
+            Money::from_dollars(500.0),
+        )
+        .unwrap();
+
+        let months = [
+            ops::stamp(
+                &mut conn,
+                &plan_id,
+                "2026-06",
+                NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+                30,
+            )
+            .unwrap(),
+            ops::stamp(
+                &mut conn,
+                &plan_id,
+                "2026-07",
+                NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                31,
+            )
+            .unwrap(),
+        ];
+
+        ops::set_series_label(&conn, &txn_series, "Electricity").unwrap();
+        ops::set_series_label(&conn, &envelope_series, "Food").unwrap();
+
+        for month_id in &months {
+            let txn = load_txns(&conn, month_id).unwrap().remove(0);
+            assert_eq!(txn.label, "Electric", "stored snapshot is unchanged");
+            assert_eq!(txn.series_label.as_deref(), Some("Electricity"));
+            assert_eq!(txn.display_label(), "Electricity");
+
+            let envelope = load_envelopes(&conn, month_id).unwrap().remove(0);
+            assert_eq!(envelope.label, "Groceries", "stored snapshot is unchanged");
+            assert_eq!(envelope.series_label.as_deref(), Some("Food"));
+            assert_eq!(envelope.display_label(), "Food");
+        }
+
+        ops::delete_plan_item(&conn, &txn_item).unwrap();
+        ops::delete_plan_item(&conn, &envelope_item).unwrap();
+        ops::delete_series(&conn, &txn_series).unwrap();
+        ops::delete_series(&conn, &envelope_series).unwrap();
+
+        let txn = load_txns(&conn, &months[0]).unwrap().remove(0);
+        assert!(txn.series_label.is_none());
+        assert_eq!(txn.display_label(), "Electric");
+        let envelope = load_envelopes(&conn, &months[0]).unwrap().remove(0);
+        assert!(envelope.series_label.is_none());
+        assert_eq!(envelope.display_label(), "Groceries");
+    }
+
+    #[test]
+    fn month_rows_sort_by_the_effective_series_label() {
+        let mut conn = db::open_in_memory().unwrap();
+        let plan_id = ops::create_plan(&conn, "Normal").unwrap();
+        let zulu = ops::create_series(
+            &conn,
+            Kind::Transaction,
+            "Zulu",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        let alpha = ops::create_series(
+            &conn,
+            Kind::Transaction,
+            "Alpha",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        ops::add_plan_item(&conn, &plan_id, &zulu, Money::from_dollars(1.0)).unwrap();
+        ops::add_plan_item(&conn, &plan_id, &alpha, Money::from_dollars(1.0)).unwrap();
+        let month_id = ops::stamp(
+            &mut conn,
+            &plan_id,
+            "2026-07",
+            NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+            31,
+        )
+        .unwrap();
+
+        ops::set_series_label(&conn, &zulu, "Aaron").unwrap();
+
+        let labels: Vec<String> = load_txns(&conn, &month_id)
+            .unwrap()
+            .into_iter()
+            .map(|txn| txn.display_label().to_string())
+            .collect();
+        assert_eq!(labels, ["Aaron", "Alpha"]);
+    }
 }

@@ -129,7 +129,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         // The edit verbs mirror the plan editor's keys, but here they edit this month's
         // independent snapshot. Direction changes intentionally stay out of this fast path:
         // moving between income and expenses is safer as remove/re-add.
-        KeyCode::Char('l') | KeyCode::Char('a') | KeyCode::Char('m') | KeyCode::Char('p')
+        KeyCode::Char('a') | KeyCode::Char('m') | KeyCode::Char('p')
             if app.dash_focus == DashFocus::Envelopes =>
         {
             app.status = Some("Press Enter to edit envelope details".into());
@@ -297,22 +297,31 @@ fn add_account(app: &mut App) {
     );
 }
 
-/// `l`: edit the label of the selected row.
+/// `l`: account names and legacy seriesless labels stay local. A series-backed budget
+/// row points at the canonical Series workflow without silently navigating there.
 fn edit_label(app: &mut App, view: &MonthView) {
     if let Some(t) = selected_txn(app, view) {
-        app.open_text_replace_on_type(
-            "Label",
-            t.label.clone(),
-            PromptKind::TxnLabel { id: t.id.clone() },
-        );
+        if t.series_id.is_some() {
+            app.status = Some(crate::SERIES_RENAME_GUIDANCE.into());
+        } else {
+            app.open_text_replace_on_type(
+                "Label",
+                t.label.clone(),
+                PromptKind::TxnLabel { id: t.id.clone() },
+            );
+        }
     } else if let Some(e) = selected_env(app, view) {
-        app.open_text_replace_on_type(
-            "Envelope label",
-            e.envelope.label.clone(),
-            PromptKind::EnvelopeLabel {
-                id: e.envelope.id.clone(),
-            },
-        );
+        if e.envelope.series_id.is_some() {
+            app.status = Some(crate::SERIES_RENAME_GUIDANCE.into());
+        } else {
+            app.open_text_replace_on_type(
+                "Envelope label",
+                e.envelope.label.clone(),
+                PromptKind::EnvelopeLabel {
+                    id: e.envelope.id.clone(),
+                },
+            );
+        }
     } else if app.dash_focus == DashFocus::Accounts
         && let Some(acct) = view.accounts.get(app.dash_acct_sel)
     {
@@ -423,7 +432,7 @@ fn cycle_period(app: &mut App, view: &MonthView) -> Result<()> {
 fn feed_spending(app: &mut App, view: &MonthView) {
     if let Some(e) = selected_env(app, view) {
         app.open_text(
-            format!("Transaction label for {}", e.envelope.label),
+            format!("Transaction label for {}", e.envelope.display_label()),
             String::new(),
             PromptKind::EnvelopeSpendLabel {
                 envelope_id: e.envelope.id.clone(),
@@ -438,14 +447,14 @@ fn feed_spending(app: &mut App, view: &MonthView) {
 fn delete_selected(app: &mut App, view: &MonthView) {
     if let Some(t) = selected_txn(app, view) {
         app.open_confirm(
-            format!("Delete “{}”?", t.label),
+            format!("Delete “{}”?", t.display_label()),
             ConfirmAction::DeleteTxn { id: t.id.clone() },
         );
     } else if let Some(e) = selected_env(app, view) {
         app.open_confirm(
             format!(
                 "Delete envelope “{}” and its transactions?",
-                e.envelope.label
+                e.envelope.display_label()
             ),
             ConfirmAction::DeleteEnvelope {
                 id: e.envelope.id.clone(),
@@ -630,8 +639,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             Span::raw(" paid  "),
             key(" n "),
             Span::raw(" new  "),
-            key(" l/a "),
-            Span::raw(" label/amount  "),
+            key(" a "),
+            Span::raw(" amount  "),
             key(" x "),
             Span::raw(" del"),
         ]),
@@ -995,7 +1004,7 @@ fn draw_transactions(
             };
             let line = Line::from(vec![
                 Span::raw(format!("{} ", check)),
-                Span::raw(format!("{:<28}", crate::truncate(&t.label, 28))),
+                Span::raw(format!("{:<28}", crate::truncate(t.display_label(), 28))),
                 Span::styled(format!("{:>10}", amount), style),
             ]);
             ListItem::new(line).style(style)
@@ -1061,8 +1070,14 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
             // every meter now starts at the same column.
             let cadence = format!("{mode}/{period}");
             let left_spans = vec![
-                Span::raw(format!("{:<20}", crate::truncate(&e.envelope.label, 20))),
-                Span::styled(format!("{cadence:<8}"), Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(
+                    "{:<20}",
+                    crate::truncate(e.envelope.display_label(), 20)
+                )),
+                Span::styled(
+                    format!("{cadence:<8}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 meter_fill_span,
                 meter_track_span,
                 Span::raw(format!(" {:>10} left", e.remaining.to_string())),
@@ -1124,8 +1139,10 @@ fn key(label: &str) -> Span<'_> {
 mod tests {
     use super::*;
     use crate::Screen;
-    use leeway::models::Kind;
     use chrono::NaiveDate;
+    use leeway::models::Kind;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyModifiers;
     use rusqlite::Connection;
     use uuid::Uuid;
@@ -1254,6 +1271,95 @@ mod tests {
 
     fn direction_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+    }
+
+    fn label_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect()
+    }
+
+    #[test]
+    fn series_backed_label_key_points_to_the_series_page() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Expenses;
+        let view = month_view(&app);
+
+        handle_key(&mut app, label_key(), &Some(view)).unwrap();
+
+        assert!(app.modal.is_none());
+        assert_eq!(app.status.as_deref(), Some(crate::SERIES_RENAME_GUIDANCE));
+    }
+
+    #[test]
+    fn seriesless_label_key_keeps_the_local_compatibility_editor() {
+        let mut app = app_with_stamped_month();
+        let month_id = month_view(&app).month.id;
+        let legacy_id = ops::add_oneoff_txn(
+            &app.conn,
+            &month_id,
+            "ZZ Legacy",
+            Direction::Out,
+            Money::from_dollars(12.0),
+        )
+        .unwrap();
+        app.dash_focus = DashFocus::Expenses;
+        let view = month_view(&app);
+        app.dash_expense_sel = view
+            .standalone
+            .iter()
+            .filter(|txn| txn.direction == Direction::Out)
+            .position(|txn| txn.id == legacy_id)
+            .unwrap();
+
+        handle_key(&mut app, label_key(), &Some(view)).unwrap();
+
+        match app.modal {
+            Some(crate::Modal::Text(prompt)) => match prompt.kind {
+                PromptKind::TxnLabel { id } => assert_eq!(id, legacy_id),
+                _ => panic!("expected transaction label prompt"),
+            },
+            _ => panic!("expected local label prompt"),
+        }
+    }
+
+    #[test]
+    fn expense_footer_advertises_amount_but_not_label_editing() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Expenses;
+        let view = Some(month_view(&app));
+        let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app, &view)).unwrap();
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("amount"));
+        assert!(!text.contains("label/amount"));
+    }
+
+    #[test]
+    fn account_label_key_still_opens_the_account_editor() {
+        let mut app = app_with_stamped_month();
+        let account_id =
+            ops::create_checking_account(&app.conn, "Everyday", Money::from_dollars(100.0))
+                .unwrap();
+        app.dash_focus = DashFocus::Accounts;
+        let view = month_view(&app);
+
+        handle_key(&mut app, label_key(), &Some(view)).unwrap();
+
+        match app.modal {
+            Some(crate::Modal::Text(prompt)) => match prompt.kind {
+                PromptKind::AccountName { id } => assert_eq!(id, account_id),
+                _ => panic!("expected account name prompt"),
+            },
+            _ => panic!("expected account name prompt"),
+        }
     }
 
     #[test]

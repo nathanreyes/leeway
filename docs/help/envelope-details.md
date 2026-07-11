@@ -6,6 +6,8 @@ One envelope up close: its mode and cadence, and the math behind how much is lef
 
 An automatic envelope releases its budget evenly across the month, so 'consumed' grows with the calendar and 'remaining' reflects how far in you are. A manual envelope only moves when you record transactions. 'Remaining' is what this envelope hands back to what's left.
 
+The envelope name is shared Series metadata rather than a month-detail field. Press `S` to open the Series, then `l` there to rename it everywhere.
+
 ## Example
 
 ```
