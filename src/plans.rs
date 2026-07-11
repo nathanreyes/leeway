@@ -8,13 +8,14 @@
 
 use crate::{AddDestination, App, BudgetBlock, ConfirmAction, PlanFocus, PromptKind, Screen};
 use anyhow::Result;
-use leeway::models::{Direction, Kind, Mode, PeriodType, Plan, PlanEntry};
-use leeway::queries::PlanSummary;
 use chrono::Local;
+use leeway::models::{Direction, Kind, Mode, PeriodType, Plan, PlanEntry};
+use leeway::money::Money;
+use leeway::queries::PlanSummary;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{ListItem, ListState, Paragraph};
 
@@ -315,8 +316,11 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
         .block(crate::bordered_block());
     frame.render_widget(header_p, header);
 
+    let [blocks_area, summary_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(7)]).areas(body);
     let [left_items, env_area] =
-        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)]).areas(body);
+        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+            .areas(blocks_area);
     let [income_area, expense_area] = Layout::vertical([
         Constraint::Length(crate::income_block_height(entry_count(
             entries,
@@ -329,6 +333,7 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
     draw_plan_block(frame, income_area, app, entries, PlanFocus::Income);
     draw_plan_block(frame, expense_area, app, entries, PlanFocus::Expenses);
     draw_plan_block(frame, env_area, app, entries, PlanFocus::Envelopes);
+    draw_plan_summary(frame, summary_area, entries);
 
     // The editor's verbs are the same in every block now that series-definition edits moved
     // to the Series page: add, set this plan's amount, remove from this plan.
@@ -355,6 +360,70 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
         Span::raw(" quit"),
     ]);
     crate::draw_split_status_footer(frame, footer, hints, nav_hints, &app.status);
+}
+
+/// Render the reusable plan's cash-flow scenario without any live account terms.
+fn draw_plan_summary(frame: &mut Frame, area: Rect, entries: &[PlanEntry]) {
+    let projection = leeway::calc::project_plan(entries);
+    let result_color = if projection.whats_left.cents() >= 0 {
+        crate::theme::GREEN
+    } else {
+        Color::Red
+    };
+
+    let mut income_and_expenses =
+        plan_summary_term(projection.income, "planned income", crate::theme::GREEN);
+    income_and_expenses.push(Span::raw("  "));
+    income_and_expenses.extend(plan_summary_term(
+        Money::ZERO - projection.expenses,
+        "planned expenses",
+        Color::Red,
+    ));
+
+    let lines = vec![
+        Line::from(income_and_expenses),
+        Line::from(plan_summary_term(
+            Money::ZERO - projection.envelopes,
+            "planned envelopes",
+            crate::theme::MAUVE,
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("= "),
+            Span::styled(
+                format!("{:>10}", projection.whats_left),
+                Style::default()
+                    .fg(result_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  what's left"),
+        ]),
+        Line::from(Span::styled(
+            format!(
+                "Daily envelope rates assume a {}-day month.",
+                leeway::calc::PLAN_PROJECTION_DAYS
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines).block(crate::titled_block(" Summary ")),
+        area,
+    );
+}
+
+fn plan_summary_term(amount: Money, label: &str, color: Color) -> Vec<Span<'static>> {
+    let cents = amount.cents();
+    let sign = if cents < 0 { "−" } else { "+" };
+    vec![
+        Span::raw(format!("{sign} ")),
+        Span::styled(
+            format!("{:>10}", Money(cents.saturating_abs())),
+            Style::default().fg(color),
+        ),
+        Span::raw(format!("  {:<17}", label)),
+    ]
 }
 
 fn draw_plan_block(
@@ -442,6 +511,8 @@ mod tests {
     use leeway::money::Money;
     use leeway::ops;
     use leeway::queries;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyModifiers;
     use rusqlite::Connection;
     use uuid::Uuid;
@@ -521,6 +592,34 @@ mod tests {
 
     fn backtab_key() -> KeyEvent {
         KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol()))
+            .collect()
+    }
+
+    #[test]
+    fn plan_editor_renders_expenses_summary_and_projection_note() {
+        let (app, plan, entries, _) = app_with_transaction_plan();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_editor(frame, &app, &plan, &entries))
+            .unwrap();
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("Expenses"));
+        assert!(text.contains("Summary"));
+        assert!(text.contains("planned income"));
+        assert!(text.contains("planned expenses"));
+        assert!(text.contains("planned envelopes"));
+        assert!(text.contains("-$1,800.00"));
+        assert!(text.contains("Daily envelope rates assume a 30-day month."));
+        assert!(!text.contains("planned bills"));
     }
 
     #[test]

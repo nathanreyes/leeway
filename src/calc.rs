@@ -4,7 +4,7 @@
 //! clock, no I/O. That's what makes them trivial to unit-test (see the bottom of the
 //! file) and what lets a future web/desktop frontend reuse them unchanged.
 
-use crate::models::{Envelope, Mode, PeriodType, Txn};
+use crate::models::{Direction, Envelope, Kind, Mode, PeriodType, PlanEntry, Txn};
 use crate::money::Money;
 use chrono::NaiveDate;
 
@@ -88,6 +88,61 @@ pub fn txn_remaining(txn: &Txn) -> Money {
     if txn.settled { Money::ZERO } else { txn.amount }
 }
 
+/// The normalized month length used to compare reusable plans before they are stamped
+/// onto a concrete calendar month. Monthly envelope amounts pass through unchanged;
+/// daily rates are projected across this many days.
+pub const PLAN_PROJECTION_DAYS: i64 = 30;
+
+/// A plan-only cash-flow projection. Unlike [`WhatsLeft`], this deliberately has no
+/// account or settlement terms: a reusable plan describes commitments, not live money.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanProjection {
+    pub income: Money,
+    pub expenses: Money,
+    pub envelopes: Money,
+    pub whats_left: Money,
+}
+
+/// Sum a plan into the scenario shown on Plan Details.
+///
+/// A plan has no target calendar month yet, so daily envelope rates use the documented
+/// 30-day assumption. Legacy weekly envelopes continue to behave as monthly values,
+/// matching stamping behavior.
+pub fn project_plan(entries: &[PlanEntry]) -> PlanProjection {
+    let income: Money = entries
+        .iter()
+        .filter(|entry| {
+            entry.series.kind == Kind::Transaction && entry.series.direction == Some(Direction::In)
+        })
+        .map(|entry| entry.amount)
+        .sum();
+    let expenses: Money = entries
+        .iter()
+        .filter(|entry| {
+            entry.series.kind == Kind::Transaction && entry.series.direction == Some(Direction::Out)
+        })
+        .map(|entry| entry.amount)
+        .sum();
+    let envelopes: Money = entries
+        .iter()
+        .filter(|entry| entry.series.kind == Kind::Envelope)
+        .map(|entry| {
+            monthlyized_envelope_amount(
+                entry.amount,
+                entry.series.period_type.unwrap_or(PeriodType::Monthly),
+                PLAN_PROJECTION_DAYS,
+            )
+        })
+        .sum();
+
+    PlanProjection {
+        income,
+        expenses,
+        envelopes,
+        whats_left: income - expenses - envelopes,
+    }
+}
+
 /// The "what's left" rollup (spec §4). Each field is pre-summed by the caller so this
 /// function stays a pure, obvious formula — the single source of truth for the headline
 /// number the whole app exists to show.
@@ -157,7 +212,7 @@ impl WhatsLeft {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Direction, PeriodType};
+    use crate::models::{Direction, PeriodType, Series};
 
     fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -327,6 +382,88 @@ mod tests {
             monthlyized_envelope_amount(Money::from_dollars(80.0), PeriodType::Weekly, 31),
             Money::from_dollars(80.0)
         );
+    }
+
+    #[test]
+    fn plan_projection_classifies_income_and_expenses() {
+        let entries = vec![
+            plan_entry(
+                Kind::Transaction,
+                Some(Direction::In),
+                None,
+                Money::from_dollars(6000.0),
+            ),
+            plan_entry(
+                Kind::Transaction,
+                Some(Direction::Out),
+                None,
+                Money::from_dollars(2200.0),
+            ),
+        ];
+
+        let projection = project_plan(&entries);
+
+        assert_eq!(projection.income, Money::from_dollars(6000.0));
+        assert_eq!(projection.expenses, Money::from_dollars(2200.0));
+        assert_eq!(projection.envelopes, Money::ZERO);
+        assert_eq!(projection.whats_left, Money::from_dollars(3800.0));
+    }
+
+    #[test]
+    fn plan_projection_uses_monthly_and_thirty_day_envelopes() {
+        let entries = vec![
+            plan_entry(
+                Kind::Envelope,
+                None,
+                Some(PeriodType::Monthly),
+                Money::from_dollars(500.0),
+            ),
+            plan_entry(
+                Kind::Envelope,
+                None,
+                Some(PeriodType::Daily),
+                Money::from_dollars(12.0),
+            ),
+        ];
+
+        let projection = project_plan(&entries);
+
+        assert_eq!(projection.envelopes, Money::from_dollars(860.0));
+        assert_eq!(projection.whats_left, Money::from_dollars(-860.0));
+    }
+
+    #[test]
+    fn empty_plan_projection_is_zero() {
+        assert_eq!(
+            project_plan(&[]),
+            PlanProjection {
+                income: Money::ZERO,
+                expenses: Money::ZERO,
+                envelopes: Money::ZERO,
+                whats_left: Money::ZERO,
+            }
+        );
+    }
+
+    fn plan_entry(
+        kind: Kind,
+        direction: Option<Direction>,
+        period_type: Option<PeriodType>,
+        amount: Money,
+    ) -> PlanEntry {
+        PlanEntry {
+            item_id: "item".into(),
+            plan_id: "plan".into(),
+            amount,
+            series: Series {
+                id: "series".into(),
+                kind,
+                label: "Test".into(),
+                direction,
+                period_type,
+                mode: (kind == Kind::Envelope).then_some(Mode::Automatic),
+            },
+        }
     }
 
     fn mk_txn(amount: Money) -> Txn {
