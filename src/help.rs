@@ -121,6 +121,7 @@ pub fn topic_for(app: &App) -> HelpTopic {
         },
         Screen::Series { .. } => HelpTopic::Series,
         Screen::Plans => HelpTopic::PlansList,
+        Screen::StorageSync { .. } => HelpTopic::Overview,
     }
 }
 
@@ -154,6 +155,7 @@ pub fn screen_ring(app: &App) -> Vec<HelpTopic> {
         ],
         Screen::Series { .. } => vec![HelpTopic::Series],
         Screen::Plans => vec![HelpTopic::PlansList],
+        Screen::StorageSync { .. } => vec![HelpTopic::Overview],
     }
 }
 

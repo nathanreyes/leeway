@@ -23,4 +23,5 @@ Accounts hold your real balance today. Income and Expenses are dated money you t
 - `h` — help for the focused panel
 - `P` — plans (reusable templates)
 - `S` — selected series, then all series
+- `,` — Storage & Sync settings
 - `q` — quit

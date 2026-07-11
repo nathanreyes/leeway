@@ -11,4 +11,5 @@ pub mod models;
 pub mod money;
 pub mod ops;
 pub mod queries;
+pub mod sync;
 pub mod view;

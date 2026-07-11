@@ -24,6 +24,10 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
     ])
 });
 
+/// Latest SQLite schema understood by this build. Sync metadata records this separately
+/// from the folder-sync protocol version so older applications can fail closed.
+pub const SCHEMA_VERSION: u32 = 2;
+
 /// Open the database at `path` (creating the file if missing) and bring its schema up to
 /// the latest version. Returns the live connection the rest of the app uses.
 pub fn open(path: &Path) -> Result<Connection> {
@@ -41,6 +45,16 @@ pub fn open(path: &Path) -> Result<Connection> {
         .context("applying database migrations")?;
 
     Ok(conn)
+}
+
+/// Bring an already-open connection (for example one restored from a synchronized
+/// snapshot) up to the latest schema.
+pub fn migrate(conn: &mut Connection) -> Result<()> {
+    conn.pragma_update(None, "foreign_keys", true)
+        .context("enabling foreign keys")?;
+    MIGRATIONS
+        .to_latest(conn)
+        .context("applying database migrations")
 }
 
 /// Open a throwaway in-memory database with the schema applied — used by tests so they

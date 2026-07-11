@@ -684,10 +684,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
         Span::raw(" plans  "),
         key(" S "),
         Span::raw(" series  "),
+        key(" , "),
+        Span::raw(" sync  "),
         key(" q "),
         Span::raw(" quit"),
     ]);
-    crate::draw_split_status_footer(frame, area, left_hints, nav_hints, &app.status);
+    let status = crate::footer_status(app);
+    crate::draw_split_status_footer(frame, area, left_hints, nav_hints, status.as_deref());
 }
 
 /// The accounts panel. Full-width rows keep the current balance/owed amount near the
@@ -1212,6 +1215,8 @@ mod tests {
             frame_now: std::time::Instant::now(),
             modal: None,
             status: None,
+            sync: None,
+            legacy_database: None,
         }
     }
 

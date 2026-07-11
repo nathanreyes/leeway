@@ -604,10 +604,13 @@ fn draw_detail_footer(frame: &mut Frame, area: Rect, app: &App, detail: &SeriesD
         Span::raw(" plans  "),
         key(" Esc "),
         Span::raw(" back  "),
+        key(" , "),
+        Span::raw(" sync  "),
         key(" q "),
         Span::raw(" quit"),
     ]);
-    crate::draw_split_status_footer(frame, area, Line::from(actions), nav, &app.status);
+    let status = crate::footer_status(app);
+    crate::draw_split_status_footer(frame, area, Line::from(actions), nav, status.as_deref());
 }
 
 fn draw_summary(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
@@ -802,10 +805,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
         Span::raw(" plans  "),
         key(" Esc "),
         Span::raw(" back  "),
+        key(" , "),
+        Span::raw(" sync  "),
         key(" q "),
         Span::raw(" quit"),
     ]);
-    crate::draw_split_status_footer(frame, area, left, right, &app.status);
+    let status = crate::footer_status(app);
+    crate::draw_split_status_footer(frame, area, left, right, status.as_deref());
 }
 
 fn key(label: &str) -> Span<'static> {

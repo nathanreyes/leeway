@@ -25,6 +25,7 @@ use leeway::models::{AccountType, Direction, Kind, Mode, PeriodType, Series, Txn
 use leeway::money::Money;
 use leeway::view::SeriesTimeRange;
 use leeway::{calc, db, ops, queries};
+use leeway::sync::{self, Inspection, StorageMode, SyncStatus};
 use chrono::{Datelike, Local, NaiveDate};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Margin, Rect};
@@ -36,6 +37,7 @@ use ratatui::widgets::{
 };
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
+use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -50,6 +52,7 @@ pub enum Screen {
     Series { state: SeriesScreen },
     Plans,
     PlanEditor { plan_id: String },
+    StorageSync { origin: SeriesOrigin },
 }
 
 #[derive(Clone)]
@@ -87,6 +90,7 @@ impl SeriesOrigin {
                 plan_id: plan_id.clone(),
             }),
             Screen::Series { .. } => None,
+            Screen::StorageSync { origin } => Some(origin.clone()),
         }
     }
 
@@ -361,6 +365,9 @@ pub enum ModalAction {
     BeginNewSeries {
         block: BudgetBlock,
     },
+    EnableNewSync { parent: PathBuf },
+    AdoptSyncedBudget { parent: PathBuf },
+    ReplaceSyncedBudget { parent: PathBuf },
 }
 
 /// A single-line text input. `kind` records what to do with the text on submit.
@@ -460,6 +467,7 @@ pub enum PromptKind {
         month_id: String,
         label: String,
     },
+    EnableSyncPath,
 }
 
 pub enum SeriesSelection {
@@ -504,6 +512,11 @@ pub enum ConfirmAction {
     DeleteAccount {
         id: String,
     },
+    DisableSync,
+    TakeOverSync,
+    ImportLegacy { path: PathBuf },
+    ResolveUseSynced,
+    ResolveUseLocal,
 }
 
 /// All mutable UI state. Each screen keeps its own selection index so moving between
@@ -551,6 +564,11 @@ pub struct App {
     pub modal: Option<Modal>,
     /// A transient one-liner (errors, confirmations) shown in the footer.
     pub status: Option<String>,
+    /// Folder-sync runtime is absent only in focused UI unit tests.
+    pub sync: Option<sync::Runtime>,
+    /// A pre-managed-location `./leeway.db` discovered at startup. It remains untouched
+    /// until the user explicitly imports it from Storage & Sync.
+    pub legacy_database: Option<PathBuf>,
 }
 
 impl App {
@@ -681,18 +699,34 @@ impl App {
 }
 
 fn main() -> Result<()> {
-    let path = PathBuf::from("leeway.db");
-    let mut conn = db::open(&path)?;
+    let paths = sync::AppPaths::discover()?;
+    paths.create()?;
+    let managed_existed = paths.database.exists();
+    let legacy_path = env::current_dir()?.join("leeway.db");
+    let legacy_database = legacy_path
+        .is_file()
+        .then_some(legacy_path)
+        .filter(|path| path != &paths.database);
+    let mut conn = db::open(&paths.database)?;
     // On a fresh database this stamps the current calendar month, satisfying "if no month
     // exists, create one" for a first-ever launch.
     ops::seed_starter(&mut conn)?;
+
+    let mut sync_runtime = sync::Runtime::load(paths, &conn)?;
+    sync_runtime.reconcile_on_launch(&mut conn)?;
 
     // The app opens on the current calendar month.
     let today = Local::now().date_naive();
 
     let mut app = App {
         conn,
-        screen: Screen::Dashboard,
+        screen: if !managed_existed && legacy_database.is_some() {
+            Screen::StorageSync {
+                origin: SeriesOrigin::Dashboard,
+            }
+        } else {
+            Screen::Dashboard
+        },
         should_quit: false,
         dash_focus: DashFocus::Header,
         viewed_year: today.year(),
@@ -720,12 +754,21 @@ fn main() -> Result<()> {
         summary_anims: SummaryAnimations::new(),
         frame_now: Instant::now(),
         modal: None,
-        status: None,
+        status: (!managed_existed && legacy_database.is_some())
+            .then(|| "Existing ./leeway.db found — choose whether to import it".into()),
+        sync: Some(sync_runtime),
+        legacy_database,
     };
 
     let terminal = ratatui::init();
     let result = run(terminal, &mut app);
     ratatui::restore();
+    if result.is_ok()
+        && let Some(runtime) = app.sync.as_mut()
+        && let Err(error) = runtime.shutdown()
+    {
+        return Err(error).context("publishing changes before shutdown");
+    }
     result
 }
 
@@ -733,6 +776,11 @@ fn main() -> Result<()> {
 /// then reads and routes one key.
 fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
     while !app.should_quit {
+        if let Some(runtime) = app.sync.as_mut()
+            && let Err(error) = runtime.tick(&app.conn)
+        {
+            app.status = Some(format!("Sync: {error}"));
+        }
         // Resolve "today" fresh every iteration from the local system clock. Combined with
         // `read_key`'s idle wake-up (below), this means a date that rolls over while the app
         // sits open — e.g. left running past midnight — is picked up and redrawn on its own,
@@ -820,7 +868,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                 let tick = if app.summary_anims.is_animating(now) {
                     FRAME_TICK
                 } else {
-                    IDLE_TICK
+                    sync_tick(app)
                 };
                 if let Some(key) = read_key(tick)? {
                     let contextual_series_id = view
@@ -828,7 +876,9 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                         .and_then(|view| dashboard::selected_series_id(app, view));
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
-                    } else if handle_global_key_with_series(app, key, contextual_series_id) {
+                    } else if handle_global_key_with_series(app, key, contextual_series_id)
+                        || !budget_key_allowed(app, key)
+                    {
                     } else {
                         dashboard::handle_key(app, key, &view)?;
                     }
@@ -849,11 +899,13 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     draw_envelope_detail_screen(f, app, &detail);
                     draw_modal(f, app);
                 })?;
-                if let Some(key) = read_key(IDLE_TICK)? {
+                if let Some(key) = read_key(sync_tick(app))? {
                     let contextual_series_id = envelope.series_id.clone();
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
-                    } else if handle_global_key_with_series(app, key, contextual_series_id) {
+                    } else if handle_global_key_with_series(app, key, contextual_series_id)
+                        || !budget_key_allowed(app, key)
+                    {
                     } else {
                         handle_envelope_detail_key(app, key)?;
                     }
@@ -874,10 +926,12 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             series::draw_detail_screen(f, app, &view, detail);
                             draw_modal(f, app);
                         })?;
-                        if let Some(key) = read_key(IDLE_TICK)? {
+                        if let Some(key) = read_key(sync_tick(app))? {
                             if app.modal.is_some() {
                                 handle_modal_key(app, key)?;
-                            } else if handle_global_key(app, key) {
+                            } else if handle_global_key(app, key)
+                                || !budget_key_allowed(app, key)
+                            {
                             } else {
                                 series::handle_detail_key(app, key, detail, today)?;
                             }
@@ -895,14 +949,16 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             series::draw(f, app, &view);
                             draw_modal(f, app);
                         })?;
-                        if let Some(key) = read_key(IDLE_TICK)? {
+                        if let Some(key) = read_key(sync_tick(app))? {
                             if app.modal.is_some() {
                                 handle_modal_key(app, key)?;
                             } else if app.series_search_active {
                                 // Search is a text-entry mode: it must own every key (including
                                 // would-be global jump/quit keys) so they remain literal input.
                                 series::handle_key(app, key, &view, today)?;
-                            } else if handle_global_key(app, key) {
+                            } else if handle_global_key(app, key)
+                                || !budget_key_allowed(app, key)
+                            {
                             } else {
                                 series::handle_key(app, key, &view, today)?;
                             }
@@ -918,10 +974,10 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     plans::draw_list(f, app, &summaries);
                     draw_modal(f, app);
                 })?;
-                if let Some(key) = read_key(IDLE_TICK)? {
+                if let Some(key) = read_key(sync_tick(app))? {
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
-                    } else if handle_global_key(app, key) {
+                    } else if handle_global_key(app, key) || !budget_key_allowed(app, key) {
                     } else {
                         plans::handle_list_key(app, key, &summaries)?;
                     }
@@ -967,13 +1023,31 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     plans::draw_editor(f, app, &plan, &entries);
                     draw_modal(f, app);
                 })?;
-                if let Some(key) = read_key(IDLE_TICK)? {
+                if let Some(key) = read_key(sync_tick(app))? {
                     let contextual_series_id = plans::selected_series_id(app, &entries);
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
-                    } else if handle_global_key_with_series(app, key, contextual_series_id) {
+                    } else if handle_global_key_with_series(app, key, contextual_series_id)
+                        || !budget_key_allowed(app, key)
+                    {
                     } else {
                         plans::handle_editor_key(app, key, &plan, &entries)?;
+                    }
+                }
+            }
+
+            Screen::StorageSync { origin } => {
+                let origin = origin.clone();
+                terminal.draw(|frame| {
+                    draw_storage_sync(frame, app);
+                    draw_modal(frame, app);
+                })?;
+                if let Some(key) = read_key(sync_tick(app))? {
+                    if app.modal.is_some() {
+                        handle_modal_key(app, key)?;
+                    } else if handle_global_key(app, key) {
+                    } else {
+                        handle_storage_sync_key(app, key, origin)?;
                     }
                 }
             }
@@ -988,6 +1062,50 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 /// updates within a minute of midnight, at negligible idle cost.
 const IDLE_TICK: Duration = Duration::from_secs(60);
 const FRAME_TICK: Duration = Duration::from_millis(33);
+const SYNC_TICK: Duration = Duration::from_millis(250);
+
+fn sync_tick(app: &App) -> Duration {
+    if app
+        .sync
+        .as_ref()
+        .is_some_and(|runtime| runtime.config.mode == StorageMode::FolderSync)
+    {
+        SYNC_TICK
+    } else {
+        IDLE_TICK
+    }
+}
+
+fn budget_key_allowed(app: &mut App, key: KeyEvent) -> bool {
+    let can_edit = app
+        .sync
+        .as_ref()
+        .is_none_or(sync::Runtime::can_edit);
+    if can_edit {
+        return true;
+    }
+    let navigation = matches!(
+        key.code,
+        KeyCode::Esc
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Char('j')
+            | KeyCode::Char('k')
+            | KeyCode::Char('/')
+            | KeyCode::Char('f')
+            | KeyCode::Char('t')
+    );
+    if !navigation {
+        app.status = Some("Read-only while sync needs attention — open Storage & Sync with ,".into());
+    }
+    navigation
+}
 
 /// Read one key *press*. Returns `None` for releases, resizes, mouse, or an idle timeout —
 /// anything we don't act on (the next frame redraws regardless). `event::poll` returns as
@@ -1001,6 +1119,180 @@ fn read_key(timeout: Duration) -> Result<Option<KeyEvent>> {
         Event::Key(key) if key.kind == KeyEventKind::Press => Ok(Some(key)),
         _ => Ok(None),
     }
+}
+
+fn handle_storage_sync_key(app: &mut App, key: KeyEvent, origin: SeriesOrigin) -> Result<()> {
+    let mode = app
+        .sync
+        .as_ref()
+        .map(|runtime| runtime.config.mode.clone())
+        .unwrap_or(StorageMode::LocalOnly);
+    match key.code {
+        KeyCode::Esc => {
+            app.screen = origin.into_screen();
+            app.status = None;
+        }
+        KeyCode::Char('e') if mode == StorageMode::LocalOnly => app.open_text_with_help(
+            "Synchronized parent folder",
+            "~/",
+            vec![
+                "Choose the parent folder managed by Dropbox, iCloud Drive, OneDrive,".into(),
+                "Syncthing, or another file-sync service. Leeway creates Leeway/ inside it.".into(),
+            ],
+            PromptKind::EnableSyncPath,
+        ),
+        KeyCode::Char('d') if mode == StorageMode::FolderSync => app.open_confirm(
+            "Disable folder sync? Synchronized files will be left unchanged.",
+            ConfirmAction::DisableSync,
+        ),
+        KeyCode::Char('p') if mode == StorageMode::FolderSync => {
+            if let Some(runtime) = app.sync.as_mut() {
+                let result = runtime.publish_now();
+                report_sync_result(app, result, "Publication queued");
+            }
+        }
+        KeyCode::Char('t') if mode == StorageMode::FolderSync => app.open_confirm(
+            "Take over editing from the previous session?",
+            ConfirmAction::TakeOverSync,
+        ),
+        KeyCode::Char('u') if mode == StorageMode::FolderSync => app.open_confirm(
+            "Use the synchronized candidate? This computer's candidate will be kept in recovery.",
+            ConfirmAction::ResolveUseSynced,
+        ),
+        KeyCode::Char('l') if mode == StorageMode::FolderSync => app.open_confirm(
+            "Publish this computer's candidate? The synchronized candidate will remain protected.",
+            ConfirmAction::ResolveUseLocal,
+        ),
+        KeyCode::Char('k') if mode == StorageMode::FolderSync => {
+            app.status = Some("Both candidates kept; editing remains paused".into());
+        }
+        KeyCode::Char('i') => {
+            if let Some(path) = app.legacy_database.clone() {
+                app.open_confirm(
+                    format!("Import existing database from {}?", path.display()),
+                    ConfirmAction::ImportLegacy { path },
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn draw_storage_sync(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(" Storage & Sync")
+            .block(bordered_block())
+            .alignment(Alignment::Left),
+        header,
+    );
+
+    let mut lines = Vec::new();
+    if let Some(runtime) = app.sync.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled(" Status  ", Style::default().fg(theme::MAUVE)),
+            Span::raw(runtime.status.label()),
+        ]));
+        match &runtime.status {
+            SyncStatus::Published { revision_id } => lines.push(Line::raw(format!(
+                " Revision  {}",
+                revision_id
+            ))),
+            SyncStatus::SavedLocally { message } | SyncStatus::Attention { message } => {
+                lines.push(Line::raw(format!(" Detail  {message}")))
+            }
+            SyncStatus::ReadOnly { owner } => {
+                lines.push(Line::raw(format!(" Owner  {owner}")))
+            }
+            SyncStatus::LocalOnly | SyncStatus::Publishing => {}
+        }
+        lines.push(Line::raw(format!(
+            " Local database  {}",
+            runtime.paths().database.display()
+        )));
+        lines.push(Line::raw(format!(
+            " Device  {}",
+            runtime.device.label
+        )));
+        if let Some(parent) = runtime.config.sync_parent.as_ref() {
+            lines.push(Line::raw(format!(" Sync parent  {}", parent.display())));
+            lines.push(Line::raw(format!(
+                " Leeway folder  {}",
+                parent.join(sync::SYNC_DIR_NAME).display()
+            )));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(match runtime.config.mode {
+            StorageMode::LocalOnly => {
+                " Folder sync is off. Your budget remains in the managed local database."
+            }
+            StorageMode::FolderSync => {
+                " Leeway publishes validated snapshots; provider upload completion is not observable."
+            }
+        }));
+    }
+    if let Some(path) = app.legacy_database.as_ref() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(" Existing database found  ", Style::default().fg(Color::Yellow)),
+            Span::raw(path.display().to_string()),
+        ]));
+        lines.push(Line::raw(
+            " It has not been modified. Importing creates a recovery backup first.",
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines).block(titled_block(" Storage ")), body);
+
+    let mode = app
+        .sync
+        .as_ref()
+        .map(|runtime| runtime.config.mode.clone())
+        .unwrap_or(StorageMode::LocalOnly);
+    let mut actions = Vec::new();
+    if app.legacy_database.is_some() {
+        actions.extend([modal_key(" i "), Span::raw(" import legacy  ")]);
+    }
+    match mode {
+        StorageMode::LocalOnly => actions.extend([modal_key(" e "), Span::raw(" enable sync")]),
+        StorageMode::FolderSync => actions.extend([
+            modal_key(" p "),
+            Span::raw(" publish  "),
+            modal_key(" t "),
+            Span::raw(" take over  "),
+            modal_key(" d "),
+            Span::raw(" disable"),
+        ]),
+    }
+    if app
+        .sync
+        .as_ref()
+        .is_some_and(|runtime| matches!(runtime.status, SyncStatus::Attention { .. }))
+    {
+        actions.extend([
+            Span::raw("  "),
+            modal_key(" u "),
+            Span::raw(" use synced  "),
+            modal_key(" l "),
+            Span::raw(" use local  "),
+            modal_key(" k "),
+            Span::raw(" keep both"),
+        ]);
+    }
+    let nav = Line::from(vec![
+        modal_key(" Esc "),
+        Span::raw(" back  "),
+        modal_key(" q "),
+        Span::raw(" quit"),
+    ]);
+    let status = footer_status(app);
+    draw_split_status_footer(frame, footer, Line::from(actions), nav, status.as_deref());
 }
 
 /// Keys that mean the same thing on *every* page, checked ahead of the page's own handler.
@@ -1052,6 +1344,15 @@ fn handle_global_key_with_series(
         KeyCode::Char('h') => {
             app.open_help();
             return true;
+        }
+        KeyCode::Char(',') => {
+            if matches!(app.screen, Screen::StorageSync { .. }) {
+                return true;
+            }
+            let Some(origin) = SeriesOrigin::from_screen(&app.screen) else {
+                return true;
+            };
+            Screen::StorageSync { origin }
         }
         KeyCode::Char('q') => {
             app.should_quit = true;
@@ -1498,6 +1799,45 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
                 PromptKind::NewSeries { block },
             );
         }
+        ModalAction::EnableNewSync { parent } => {
+            let result = (|| {
+                let runtime = app.sync.as_mut().context("sync runtime is unavailable")?;
+                runtime.enable_new(&parent)?;
+                runtime.publish_now()
+            })();
+            report_sync_result(
+                app,
+                result,
+                "Folder sync enabled — publishing initial snapshot",
+            );
+        }
+        ModalAction::AdoptSyncedBudget { parent } => {
+            let result = app
+                .sync
+                .as_mut()
+                .context("sync runtime is unavailable")
+                .and_then(|runtime| runtime.enable_existing(&parent, &mut app.conn));
+            if result.is_ok() {
+                reset_dashboard_selections(app);
+            }
+            report_sync_result(
+                app,
+                result,
+                "Using synchronized budget; prior local data was archived",
+            );
+        }
+        ModalAction::ReplaceSyncedBudget { parent } => {
+            let result = (|| {
+                let runtime = app.sync.as_mut().context("sync runtime is unavailable")?;
+                runtime.replace_existing(&parent)?;
+                runtime.publish_now()
+            })();
+            report_sync_result(
+                app,
+                result,
+                "Publishing this computer's budget as the selected version",
+            );
+        }
     }
     Ok(())
 }
@@ -1506,6 +1846,13 @@ fn finish_restamp(app: &mut App, message: &str) {
     reset_dashboard_selections(app);
     app.screen = Screen::Dashboard;
     app.status = Some(message.to_string());
+}
+
+fn report_sync_result(app: &mut App, result: Result<()>, success: &str) {
+    app.status = Some(match result {
+        Ok(()) => success.into(),
+        Err(error) => format!("Sync: {error:#}"),
+    });
 }
 
 fn restore_envelope_detail_screen(app: &mut App, detail: Option<EnvelopeDetail>) {
@@ -1988,6 +2335,55 @@ fn submit_text(app: &mut App) -> Result<()> {
                 );
             }
         },
+        PromptKind::EnableSyncPath => {
+            if text.is_empty() {
+                app.status = Some("Enter a synchronized parent folder".into());
+            } else {
+                let inspection = sync::expand_home(PathBuf::from(&text).as_path())
+                    .and_then(|parent| sync::inspect_parent(&parent).map(|inspection| (parent, inspection)));
+                match inspection {
+                    Ok((parent, Inspection::Empty { .. })) => {
+                        run_modal_action(app, ModalAction::EnableNewSync { parent })?
+                    }
+                    Ok((parent, Inspection::Existing { revision, .. })) => app.open_choice(
+                            format!(
+                                "Synced revision {} from {} is valid. Which budget should win?",
+                                revision.revision_id, revision.device_label
+                            ),
+                            vec![
+                                ChoiceOption {
+                                    key: 'u',
+                                    label: "Use synced budget (recommended)".into(),
+                                    action: Some(ModalAction::AdoptSyncedBudget {
+                                        parent: parent.clone(),
+                                    }),
+                                },
+                                ChoiceOption {
+                                    key: 'r',
+                                    label: "Replace synced budget with this computer".into(),
+                                    action: Some(ModalAction::ReplaceSyncedBudget { parent }),
+                                },
+                                ChoiceOption {
+                                    key: 'c',
+                                    label: "Cancel".into(),
+                                    action: None,
+                                },
+                            ],
+                        ),
+                    Err(error) => {
+                        app.status = Some(format!("Sync: {error:#}"));
+                        app.open_text_prompt(
+                            "Synchronized parent folder",
+                            text,
+                            Vec::new(),
+                            false,
+                            PromptKind::EnableSyncPath,
+                            None,
+                        );
+                    }
+                }
+            }
+        }
     }
     if app.modal.is_none() {
         restore_envelope_detail_screen(app, return_to_envelope_detail);
@@ -2034,6 +2430,81 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         } else {
                             app.status = Some("Account is used by transactions".into());
                         }
+                    }
+                    ConfirmAction::DisableSync => {
+                        let result = app.sync
+                            .as_mut()
+                            .context("sync runtime is unavailable")
+                            .and_then(sync::Runtime::disable);
+                        report_sync_result(
+                            app,
+                            result,
+                            "Folder sync disabled; synchronized files were kept",
+                        );
+                    }
+                    ConfirmAction::TakeOverSync => {
+                        let result = app.sync
+                            .as_mut()
+                            .context("sync runtime is unavailable")
+                            .and_then(sync::Runtime::takeover);
+                        report_sync_result(
+                            app,
+                            result,
+                            "Editing ownership taken over on this computer",
+                        );
+                    }
+                    ConfirmAction::ImportLegacy { path } => {
+                        let result = app
+                            .sync
+                            .as_ref()
+                            .context("sync runtime is unavailable")
+                            .map(|runtime| runtime.paths().recovery.clone())
+                            .and_then(|recovery| {
+                                sync::import_legacy(&mut app.conn, &path, &recovery)
+                            })
+                            .and_then(|()| {
+                                if let Some(runtime) = app.sync.as_mut() {
+                                    runtime.note_changes(&app.conn)?;
+                                }
+                                Ok(())
+                            });
+                        if result.is_ok() {
+                            app.legacy_database = None;
+                            reset_dashboard_selections(app);
+                        }
+                        report_sync_result(
+                            app,
+                            result,
+                            &format!(
+                                "Imported {}; the original file was preserved",
+                                path.display()
+                            ),
+                        );
+                    }
+                    ConfirmAction::ResolveUseSynced => {
+                        let result = app.sync
+                            .as_mut()
+                            .context("sync runtime is unavailable")
+                            .and_then(|runtime| runtime.resolve_conflict(&mut app.conn, false));
+                        if result.is_ok() {
+                            reset_dashboard_selections(app);
+                        }
+                        report_sync_result(
+                            app,
+                            result,
+                            "Synchronized version selected; both candidates were preserved",
+                        );
+                    }
+                    ConfirmAction::ResolveUseLocal => {
+                        let result = app.sync
+                            .as_mut()
+                            .context("sync runtime is unavailable")
+                            .and_then(|runtime| runtime.resolve_conflict(&mut app.conn, true));
+                        report_sync_result(
+                            app,
+                            result,
+                            "This computer's version selected; both candidates were preserved",
+                        );
                     }
                 }
                 if deletes_parent_envelope && return_to.is_some() {
@@ -2265,7 +2736,7 @@ fn draw_help_modal(frame: &mut Frame, state: &help::HelpState) {
     } else {
         Line::raw("")
     };
-    draw_split_status_footer(frame, footer_area, footer, more, &None);
+    draw_split_status_footer(frame, footer_area, footer, more, None);
 }
 
 fn draw_envelope_detail_screen(frame: &mut Frame, app: &App, detail: &EnvelopeDetail) {
@@ -2318,12 +2789,13 @@ fn draw_envelope_detail_screen(frame: &mut Frame, app: &App, detail: &EnvelopeDe
         EnvelopeDetailFocus::Details => details_footer_line(),
         EnvelopeDetailFocus::Transactions => transactions_footer_line(),
     };
+    let status = footer_status(app);
     crate::draw_split_status_footer(
         frame,
         footer_area,
         focused_commands,
         envelope_detail_navigation_line(),
-        &app.status,
+        status.as_deref(),
     );
 }
 
@@ -2380,6 +2852,8 @@ fn envelope_detail_navigation_line() -> Line<'static> {
         Span::styled(" plans  ", Style::default().fg(Color::Gray)),
         modal_key(" S "),
         Span::styled(" series  ", Style::default().fg(Color::Gray)),
+        modal_key(" , "),
+        Span::styled(" sync  ", Style::default().fg(Color::Gray)),
         modal_key(" q "),
         Span::styled(" quit", Style::default().fg(Color::Gray)),
     ])
@@ -2606,7 +3080,7 @@ pub(crate) fn draw_split_status_footer(
     area: Rect,
     left_hints: Line,
     right_hints: Line,
-    status: &Option<String>,
+    status: Option<&str>,
 ) {
     let right_line = match status {
         Some(s) => Line::from(Span::styled(
@@ -2635,6 +3109,14 @@ pub(crate) fn draw_split_status_footer(
         let p = Paragraph::new(right_line).alignment(Alignment::Right);
         frame.render_widget(p, right_area);
     }
+}
+
+pub(crate) fn footer_status(app: &App) -> Option<String> {
+    app.status.clone().or_else(|| {
+        app.sync.as_ref().and_then(|runtime| {
+            (runtime.config.mode == StorageMode::FolderSync).then(|| runtime.status.label())
+        })
+    })
 }
 
 /// Truncate a label to `max` chars with an ellipsis so columns don't overflow.
@@ -2731,6 +3213,8 @@ mod tests {
             frame_now: Instant::now(),
             modal: None,
             status: None,
+            sync: None,
+            legacy_database: None,
         };
 
         (app, detail, envelope.id)
@@ -2754,6 +3238,31 @@ mod tests {
             .unwrap()
             .series_id
             .unwrap()
+    }
+
+    #[test]
+    fn comma_opens_storage_and_sync_from_the_current_screen() {
+        let (mut app, detail, _) = app_with_envelope_detail();
+        assert!(handle_global_key(&mut app, key(KeyCode::Char(','))));
+        match &app.screen {
+            Screen::StorageSync {
+                origin: SeriesOrigin::EnvelopeDetail { detail: origin },
+            } => assert_eq!(origin.envelope_id, detail.envelope_id),
+            _ => panic!("expected Storage & Sync with the detail return address"),
+        }
+    }
+
+    #[test]
+    fn invalid_sync_path_stays_in_the_prompt_instead_of_quitting() {
+        let (mut app, _, _) = app_with_envelope_detail();
+        app.open_text(
+            "Synchronized parent folder",
+            format!("/definitely-missing-leeway-{}", Uuid::new_v4()),
+            PromptKind::EnableSyncPath,
+        );
+        submit_text(&mut app).unwrap();
+        assert!(matches!(app.modal, Some(Modal::Text(_))));
+        assert!(app.status.as_deref().is_some_and(|status| status.starts_with("Sync:")));
     }
 
     #[test]

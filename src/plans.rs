@@ -149,10 +149,13 @@ pub fn draw_list(frame: &mut Frame, app: &App, summaries: &[PlanSummary]) {
         Span::raw(" series  "),
         key(" Esc "),
         Span::raw(" back  "),
+        key(" , "),
+        Span::raw(" sync  "),
         key(" q "),
         Span::raw(" quit"),
     ]);
-    crate::draw_split_status_footer(frame, footer, hints, nav_hints, &app.status);
+    let status = crate::footer_status(app);
+    crate::draw_split_status_footer(frame, footer, hints, nav_hints, status.as_deref());
 }
 
 // --- Plan editor ---------------------------------------------------------------
@@ -361,10 +364,13 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
         Span::raw(" series  "),
         key(" Esc "),
         Span::raw(" back  "),
+        key(" , "),
+        Span::raw(" sync  "),
         key(" q "),
         Span::raw(" quit"),
     ]);
-    crate::draw_split_status_footer(frame, footer, hints, nav_hints, &app.status);
+    let status = crate::footer_status(app);
+    crate::draw_split_status_footer(frame, footer, hints, nav_hints, status.as_deref());
 }
 
 /// Render the reusable plan's cash-flow scenario without any live account terms.
@@ -582,6 +588,8 @@ mod tests {
             frame_now: std::time::Instant::now(),
             modal: None,
             status: None,
+            sync: None,
+            legacy_database: None,
         };
 
         (app, plan, entries, rent_series_id)
