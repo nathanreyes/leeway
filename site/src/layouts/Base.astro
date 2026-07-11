@@ -14,6 +14,11 @@ const {
   title = "Leeway — a local-first terminal budget",
   description = "Leeway is a local-first terminal budgeting app focused on one question: what's left? A forecasting tool, not a ledger.",
 } = Astro.props;
+
+// Absolute URL for this page, derived from `site` in astro.config.mjs.
+const canonical = Astro.site
+  ? new URL(Astro.url.pathname, Astro.site).href
+  : undefined;
 ---
 
 <!doctype html>
@@ -25,11 +30,15 @@ const {
 
     <title>{title}</title>
     <meta name="description" content={description} />
+    {canonical && <link rel="canonical" href={canonical} />}
 
     <!-- Social preview -->
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Leeway" />
+    {canonical && <meta property="og:url" content={canonical} />}
+    <meta name="twitter:card" content="summary" />
     <meta name="theme-color" content="#121218" />
 
     <!-- Fonts: IBM Plex Mono (UI) + Instrument Serif (the "what's left?" hook) -->

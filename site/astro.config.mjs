@@ -2,4 +2,8 @@
 import { defineConfig } from 'astro/config';
 
 // https://astro.build/config
-export default defineConfig({});
+export default defineConfig({
+  // Production URL of the deployed site. Used to build absolute canonical and
+  // Open Graph URLs. Update this if the site moves to a custom domain.
+  site: "https://get-leeway.netlify.app",
+});
