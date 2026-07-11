@@ -535,19 +535,29 @@ fn draw_month_body(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
         Constraint::Length(7),
     ])
     .areas(area);
-    let [left_items, env_area] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(body);
-    let [income_area, expense_area] = Layout::vertical([
-        Constraint::Length(crate::income_block_height(txn_count(view, Direction::In))),
+    // Mirror the summary's relative positioning: income and expenses share the top row
+    // side-by-side, and envelopes sit in a shorter full-width box beneath them.
+    let [items_area, env_area] = Layout::vertical([
         Constraint::Min(0),
+        Constraint::Length(envelope_block_height(view.envelopes.len())),
     ])
-    .areas(left_items);
+    .areas(body);
+    let [income_area, expense_area] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .areas(items_area);
 
     draw_accounts(frame, acct_area, app, view);
     draw_transactions(frame, income_area, app, view, Direction::In);
     draw_transactions(frame, expense_area, app, view, Direction::Out);
     draw_envelopes(frame, env_area, app, view);
     draw_whats_left(frame, summary_area, view, &app.summary_anims, app.frame_now);
+}
+
+/// The full-width envelopes box sits beneath the income/expenses row, so it takes a fixed
+/// height sized to its rows (plus the border) and cedes the rest of the body to the panels
+/// above. Capped so a long envelope list can't crowd out income/expenses.
+fn envelope_block_height(row_count: usize) -> u16 {
+    row_count.saturating_add(2).clamp(3, 9) as u16
 }
 
 /// One row per account plus the bordered block, capped so a large account list does not
@@ -670,7 +680,7 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                 Style::default().fg(Color::Gray),
             )),
             Line::from(Span::styled(
-                " This month uses plan snapshot math: income - bills - envelopes.",
+                " This month uses plan snapshot math: income - expenses - envelopes.",
                 Style::default().fg(Color::Gray),
             )),
         ];
@@ -895,7 +905,7 @@ fn draw_whats_left(
     row.extend(summary_term(
         SummaryTerm::BillsLeft,
         Money(display_cents(SummaryTerm::BillsLeft, wl)),
-        "bills left",
+        "expenses left",
         Color::Red,
         anims,
         now,
@@ -974,7 +984,7 @@ fn draw_transactions(
             };
             let line = Line::from(vec![
                 Span::raw(format!("{} ", check)),
-                Span::raw(format!("{:<18}", crate::truncate(&t.label, 18))),
+                Span::raw(format!("{:<28}", crate::truncate(&t.label, 28))),
                 Span::styled(format!("{:>10}", amount), style),
             ]);
             ListItem::new(line).style(style)
@@ -993,6 +1003,7 @@ fn draw_transactions(
             app.dash_expense_sel,
         ),
     };
+    let item_count = items.len();
     let mut state = ListState::default();
     if focused && !items.is_empty() {
         state.select(Some(selected));
@@ -1000,6 +1011,7 @@ fn draw_transactions(
 
     let list = crate::selectable_list(items).block(crate::selectable_block(title, focused));
     frame.render_stateful_widget(list, area, &mut state);
+    crate::render_list_scrollbar(frame, area, item_count, state.offset(), focused);
 }
 
 fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
@@ -1023,7 +1035,7 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
             // `▮` cells (the glyph carries its own side gaps) split into a mauve
             // fill and a lighter slate track. Two spans so each gets its own
             // colour; both render over the selection band unchanged.
-            const METER_WIDTH: usize = 8;
+            const METER_WIDTH: usize = 20;
             let filled = meter_fill(e.consumed, e.envelope.amount, METER_WIDTH);
             let meter_fill_span =
                 Span::styled("▮".repeat(filled), Style::default().fg(crate::theme::MAUVE));
@@ -1032,13 +1044,13 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                 Style::default().fg(crate::theme::METER_TRACK),
             );
 
-            // Left portion: name (12) · cadence (8) · meter (8) · "$X left".
+            // Left portion: name (20) · cadence (8) · meter (20) · "$X left".
             // The cadence token is padded as a whole ("auto/mo"=7, "man/mo"=6)
             // to a fixed 8 cols, so `mode`'s length no longer shifts the meter —
             // every meter now starts at the same column.
             let cadence = format!("{mode}/{period}");
             let left_spans = vec![
-                Span::raw(format!("{:<12}", crate::truncate(&e.envelope.label, 12))),
+                Span::raw(format!("{:<20}", crate::truncate(&e.envelope.label, 20))),
                 Span::styled(format!("{cadence:<8}"), Style::default().fg(Color::DarkGray)),
                 meter_fill_span,
                 meter_track_span,
@@ -1068,6 +1080,7 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
         .collect();
 
     let focused = app.dash_focus == DashFocus::Envelopes;
+    let item_count = items.len();
     let mut state = ListState::default();
     if focused && !view.envelopes.is_empty() {
         state.select(Some(app.dash_env_sel));
@@ -1075,6 +1088,7 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
 
     let list = crate::selectable_list(items).block(crate::selectable_block(" Envelopes ", focused));
     frame.render_stateful_widget(list, area, &mut state);
+    crate::render_list_scrollbar(frame, area, item_count, state.offset(), focused);
 }
 
 /// Number of filled cells in a `width`-wide meter showing `consumed / total`.
