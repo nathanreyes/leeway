@@ -2,6 +2,14 @@
 name = "leeway"
 version = "0.1.0"
 edition = "2024"
+description = "A local-first terminal budgeting app focused on what's left."
+repository = "https://github.com/nathanreyes/leeway"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+# Keep the published crate to the buildable app. docs/help/*.md are embedded
+# via include_str! and MUST stay; the marketing site, knowledge base, and
+# design docs are not needed to build leeway.
+exclude = ["site/", "knowledge/", "docs/plans/", "netlify.toml"]
 
 [dependencies]
 anyhow = "1.0.103"
@@ -12,3 +20,8 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 rusqlite_migration = "2.6.0"
 thiserror = "2.0.18"
 uuid = { version = "1.23.4", features = ["v4"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -27,42 +27,42 @@ onboarding flow will change as the project matures.
 
 ## Installation
 
-Leeway currently ships from source. You need a Rust toolchain installed; the
-standard route is [rustup](https://rustup.rs/).
+### Prebuilt binary (recommended)
+
+Leeway ships self-contained binaries for macOS, Linux, and Windows from
+[GitHub Releases](https://github.com/nathanreyes/leeway/releases). The install
+script downloads the right build for your platform and puts `leeway` on your
+`PATH`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nathanreyes/leeway/releases/latest/download/leeway-installer.sh | sh
+```
+
+You can also grab an archive for your platform directly from the
+[latest release](https://github.com/nathanreyes/leeway/releases/latest) and
+extract the `leeway` binary yourself. Each archive ships with a `.sha256`
+checksum.
+
+### From crates.io
+
+If you have a [Rust toolchain](https://rustup.rs/) installed:
+
+```sh
+cargo install leeway
+```
+
+### From source
 
 ```sh
 git clone https://github.com/nathanreyes/leeway.git
 cd leeway
-cargo run
-```
-
-To install the local checkout as a command:
-
-```sh
-cargo install --path .
-leeway
+cargo run          # run in place
+cargo install --path .   # or install the checkout as a command
 ```
 
 On first run, Leeway creates `leeway.db` in the current working directory,
 applies the database schema, seeds starter data if the database is empty, and
 opens the dashboard for the current month.
-
-## Future Distribution
-
-The long-term goal is for users not to need a source checkout.
-
-- Rust users should be able to install from crates.io with
-  `cargo install leeway`.
-- Most users should be able to download prebuilt macOS, Linux, and Windows
-  binaries from GitHub Releases.
-- Package-manager installs, such as Homebrew, can come after the release process
-  is stable.
-
-Tools like [`cargo install`](https://doc.rust-lang.org/cargo/commands/cargo-install.html),
-[crates.io publishing](https://doc.rust-lang.org/cargo/reference/publishing.html),
-and [`cargo-dist`](https://axodotdev.github.io/cargo-dist/) are the likely path:
-publish the crate for Rust-native installs, then automate release artifacts and
-installers from tagged versions.
 
 ## Basic Usage
 
