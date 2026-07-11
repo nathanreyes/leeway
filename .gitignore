@@ -31,3 +31,6 @@ site/.astro/
 *.swp
 *.swo
 *~
+
+# Local Netlify folder
+.netlify
