@@ -14,6 +14,7 @@
 
 mod anim;
 mod dashboard;
+mod help;
 mod plans;
 mod series;
 mod theme;
@@ -97,6 +98,8 @@ pub enum Modal {
     SeriesSearch(SeriesSearch),
     Confirm(Confirm),
     Choice(Choice),
+    /// Contextual help for the focused box. Opened with `h` on any screen; see `help`.
+    Help(help::HelpState),
 }
 
 /// A shared budget block vocabulary for add flows that work in both the dashboard and
@@ -549,6 +552,13 @@ impl App {
             options,
         }));
     }
+
+    /// Open contextual help for whatever box is currently focused. Resolves the
+    /// topic and sibling ring from the current screen and focus (see `help`).
+    fn open_help(&mut self) {
+        let state = help::HelpState::new(self);
+        self.modal = Some(Modal::Help(state));
+    }
 }
 
 fn main() -> Result<()> {
@@ -861,6 +871,12 @@ fn handle_global_key(app: &mut App, key: KeyEvent) -> bool {
     let screen = match key.code {
         KeyCode::Char('P') => Screen::Plans,
         KeyCode::Char('S') => Screen::Series,
+        // Universal contextual help for the focused box. Runs after the modal/search
+        // short-circuits, so `h` typed into a prompt stays literal (see the doc comment).
+        KeyCode::Char('h') => {
+            app.open_help();
+            return true;
+        }
         KeyCode::Char('q') => {
             app.should_quit = true;
             return true;
@@ -1012,8 +1028,33 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
         Some(Modal::SeriesSearch(_)) => handle_series_search_key(app, key),
         Some(Modal::Confirm(_)) => handle_confirm_key(app, key),
         Some(Modal::Choice(_)) => handle_choice_key(app, key),
+        Some(Modal::Help(_)) => handle_help_key(app, key),
         None => Ok(()),
     }
+}
+
+/// Keys while the help overlay is open. `h`/`Esc`/`q` close it; `Tab`/`o` navigate
+/// topics; `j`/`k` and the arrows/pages scroll, clamped to the last-rendered extent.
+fn handle_help_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let Some(Modal::Help(state)) = app.modal.as_mut() else {
+        return Ok(());
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('q') => app.modal = None,
+        KeyCode::Tab => state.cycle(true),
+        KeyCode::BackTab => state.cycle(false),
+        KeyCode::Char('o') => state.show_overview(),
+        KeyCode::Char('j') | KeyCode::Down => {
+            state.scroll = (state.scroll + 1).min(state.max_scroll.get());
+        }
+        KeyCode::Char('k') | KeyCode::Up => state.scroll = state.scroll.saturating_sub(1),
+        KeyCode::PageDown => {
+            state.scroll = state.scroll.saturating_add(10).min(state.max_scroll.get());
+        }
+        KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(10),
+        _ => {}
+    }
+    Ok(())
 }
 
 fn handle_envelope_detail_key(app: &mut App, key: KeyEvent) -> Result<()> {
@@ -1987,7 +2028,57 @@ fn draw_modal(frame: &mut Frame, _app: &App) {
             }
             frame.render_widget(Paragraph::new(body).block(block), area);
         }
+        Modal::Help(state) => draw_help_modal(frame, state),
     }
+}
+
+/// Draw the contextual help overlay: a large centered box over the current screen
+/// with the focused box's help, scrollable, plus an in-modal nav footer.
+fn draw_help_modal(frame: &mut Frame, state: &help::HelpState) {
+    let content = help::content(state.current);
+    let area = centered_rect(80, 80, frame.area());
+    frame.render_widget(Clear, area); // opaque over whatever's behind it
+    let block = titled_block(format!(" Help · {} ", content.title))
+        .border_style(Style::default().fg(theme::MAUVE));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Body fills the box; a single-line footer sits at the bottom.
+    let [body_area, footer_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+
+    // Lines are pre-wrapped to the body width, so their count is the exact content
+    // height — clamp scrolling to what actually overflows and stash it for the key
+    // handler (which has no frame dimensions of its own).
+    let lines = help::lines(&content, body_area.width);
+    let max_scroll = (lines.len() as u16).saturating_sub(body_area.height);
+    state.max_scroll.set(max_scroll);
+    let scroll = state.scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((scroll, 0)),
+        body_area,
+    );
+
+    // Footer: topic/scroll/close hints on the left, a "more below" cue on the right.
+    let footer = Line::from(vec![
+        modal_key(" h "),
+        Span::styled(" close  ", Style::default().fg(Color::Gray)),
+        modal_key(" Tab "),
+        Span::styled(" topic  ", Style::default().fg(Color::Gray)),
+        modal_key(" o "),
+        Span::styled(" overview  ", Style::default().fg(Color::Gray)),
+        modal_key(" j/k "),
+        Span::styled(" scroll", Style::default().fg(Color::Gray)),
+    ]);
+    let more = if scroll < max_scroll {
+        Line::from(Span::styled(
+            "more ↓ ",
+            Style::default().fg(theme::CYAN),
+        ))
+    } else {
+        Line::raw("")
+    };
+    draw_split_status_footer(frame, footer_area, footer, more, &None);
 }
 
 fn draw_envelope_detail_screen(frame: &mut Frame, app: &App, detail: &EnvelopeDetail) {
@@ -2096,6 +2187,8 @@ fn envelope_detail_navigation_line() -> Line<'static> {
     Line::from(vec![
         modal_key(" Tab "),
         Span::styled(" section  ", Style::default().fg(Color::Gray)),
+        modal_key(" h "),
+        Span::styled(" help  ", Style::default().fg(Color::Gray)),
         modal_key(" Esc "),
         Span::styled(" back  ", Style::default().fg(Color::Gray)),
         modal_key(" P "),
@@ -2665,5 +2758,101 @@ mod tests {
         assert_eq!(transactions.len(), 1);
         assert_eq!(transactions[0].label, "Coffee");
         assert_eq!(transactions[0].amount, Money::from_dollars(12.5));
+    }
+
+    // --- Contextual help -------------------------------------------------------
+
+    /// Flatten a rendered TestBackend buffer into a single string for substring checks.
+    fn buffer_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn h_opens_help_for_the_focused_box() {
+        let (mut app, _, _) = app_with_envelope_detail();
+        // Focus is on the Details section of the envelope drill-in.
+        assert_eq!(help::topic_for(&app), help::HelpTopic::EnvDetails);
+
+        assert!(handle_global_key(&mut app, key(KeyCode::Char('h'))));
+        match &app.modal {
+            Some(Modal::Help(state)) => assert_eq!(state.current, help::HelpTopic::EnvDetails),
+            _ => panic!("expected help modal"),
+        }
+    }
+
+    #[test]
+    fn help_cycles_siblings_and_opens_overview_then_closes() {
+        let (mut app, _, _) = app_with_envelope_detail();
+        handle_global_key(&mut app, key(KeyCode::Char('h')));
+
+        // Tab walks the two-topic envelope-detail ring and wraps back.
+        handle_modal_key(&mut app, key(KeyCode::Tab)).unwrap();
+        match &app.modal {
+            Some(Modal::Help(s)) => assert_eq!(s.current, help::HelpTopic::EnvTransactions),
+            _ => panic!("expected help modal"),
+        }
+        handle_modal_key(&mut app, key(KeyCode::Tab)).unwrap();
+        match &app.modal {
+            Some(Modal::Help(s)) => assert_eq!(s.current, help::HelpTopic::EnvDetails),
+            _ => panic!("expected help modal"),
+        }
+
+        // `o` jumps to the app overview; `h` closes the overlay.
+        handle_modal_key(&mut app, key(KeyCode::Char('o'))).unwrap();
+        match &app.modal {
+            Some(Modal::Help(s)) => assert_eq!(s.current, help::HelpTopic::Overview),
+            _ => panic!("expected help modal"),
+        }
+        handle_modal_key(&mut app, key(KeyCode::Char('h'))).unwrap();
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn help_modal_renders_topic_content() {
+        let (mut app, _, _) = app_with_envelope_detail();
+        handle_global_key(&mut app, key(KeyCode::Char('h')));
+
+        let backend = ratatui::backend::TestBackend::new(80, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_modal(f, &app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Help"), "title bar should name the help modal");
+        assert!(text.contains("Details"), "should render the focused topic");
+        assert!(text.contains("How it fits"), "should render authored sections");
+    }
+
+    #[test]
+    fn h_is_literal_inside_a_text_prompt() {
+        // With a text modal open, `h` is typed into the buffer, not swallowed as help.
+        // (The event loop consults the modal before the global `h` handler.)
+        let (mut app, _, _) = app_with_envelope_detail();
+        handle_envelope_detail_key(&mut app, key(KeyCode::Char('l'))).unwrap();
+
+        handle_modal_key(&mut app, key(KeyCode::Char('h'))).unwrap();
+        match &app.modal {
+            Some(Modal::Text(prompt)) => assert_eq!(prompt.buffer, "h"),
+            _ => panic!("typing h should stay in the text prompt, not open help"),
+        }
+    }
+
+    #[test]
+    fn help_modal_survives_a_tiny_frame() {
+        // Clamping math must not panic when the box is smaller than its content.
+        let (mut app, _, _) = app_with_envelope_detail();
+        handle_global_key(&mut app, key(KeyCode::Char('h')));
+
+        let backend = ratatui::backend::TestBackend::new(12, 6);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_modal(f, &app)).unwrap();
     }
 }

@@ -648,6 +648,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
         ]),
     };
     let nav_hints = Line::from(vec![
+        key(" h "),
+        Span::raw(" help  "),
         key(" P "),
         Span::raw(" plans  "),
         key(" S "),

@@ -142,6 +142,8 @@ pub fn draw_list(frame: &mut Frame, app: &App, summaries: &[PlanSummary]) {
         Span::raw(" delete"),
     ]);
     let nav_hints = Line::from(vec![
+        key(" h "),
+        Span::raw(" help  "),
         key(" S "),
         Span::raw(" series  "),
         key(" Esc "),
@@ -343,6 +345,8 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
         Span::raw(" remove"),
     ]);
     let nav_hints = Line::from(vec![
+        key(" h "),
+        Span::raw(" help  "),
         key(" S "),
         Span::raw(" series  "),
         key(" Esc "),
