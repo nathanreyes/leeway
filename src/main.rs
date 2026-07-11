@@ -27,11 +27,12 @@ use leeway::view::SeriesTimeRange;
 use leeway::{calc, db, ops, queries};
 use chrono::{Datelike, Local, NaiveDate};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Flex, Layout, Margin, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph,
+    Block, Borders, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState,
 };
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
@@ -169,6 +170,62 @@ pub(crate) fn selectable_list_content_width(area: Rect) -> usize {
                 + LIST_HIGHLIGHT_SYMBOL_WIDTH,
         )
         .into()
+}
+
+/// Draw a vertical scrollbar over a bordered list block's right edge, but only when
+/// the content actually overflows the viewport — so panels that fit stay clean. Call
+/// this *after* rendering the list, passing the post-render `ListState::offset()` (the
+/// index of the top visible row).
+///
+/// This behaves like a web viewport scrollbar: the thumb tracks the *scroll window*,
+/// not the cursor, so it stays put while you move the selection among already-visible
+/// rows and only travels when the list actually scrolls. Getting that out of ratatui's
+/// `Scrollbar` takes a bit of input massaging. It sizes/places the thumb against
+/// `M = content_length - 1 + viewport_content_length`. Feeding it the raw item count as
+/// `content_length` makes `M` overshoot, so the thumb is undersized and never reaches
+/// the bottom (the offset tops out at `item_count - viewport`, well short of `M`).
+/// Setting `content_length = item_count - viewport + 1` collapses `M` to exactly
+/// `item_count`, which yields a thumb sized to the visible fraction (`viewport /
+/// item_count`) and positioned at `offset / item_count` — anchored to the bottom at the
+/// maximum offset.
+///
+/// `area` is the full block area (border included). The scrollbar occupies the
+/// rightmost column between the top and bottom borders, clear of the list's content
+/// which sits inside the block padding.
+pub(crate) fn render_list_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    item_count: usize,
+    offset: usize,
+    focused: bool,
+) {
+    // Inner rows available for content = block height minus the top/bottom borders.
+    let viewport = area.height.saturating_sub(2) as usize;
+    if item_count <= viewport {
+        return;
+    }
+    // Number of distinct scroll positions; see the doc comment for why this, not the
+    // raw item count, is the `content_length` we hand ratatui.
+    let scroll_stops = item_count - viewport + 1;
+    let mut state = ScrollbarState::new(scroll_stops)
+        .viewport_content_length(viewport)
+        .position(offset);
+    let thumb = if focused { theme::MAUVE } else { Color::Gray };
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .thumb_style(Style::default().fg(thumb))
+        .track_style(Style::default().fg(theme::METER_TRACK));
+    // Vertical margin of 1 keeps the track between the borders; horizontal 0 leaves
+    // it in the block's rightmost column (over the vertical border segment).
+    frame.render_stateful_widget(
+        scrollbar,
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut state,
+    );
 }
 
 #[derive(Clone)]

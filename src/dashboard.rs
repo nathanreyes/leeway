@@ -1003,6 +1003,7 @@ fn draw_transactions(
             app.dash_expense_sel,
         ),
     };
+    let item_count = items.len();
     let mut state = ListState::default();
     if focused && !items.is_empty() {
         state.select(Some(selected));
@@ -1010,6 +1011,7 @@ fn draw_transactions(
 
     let list = crate::selectable_list(items).block(crate::selectable_block(title, focused));
     frame.render_stateful_widget(list, area, &mut state);
+    crate::render_list_scrollbar(frame, area, item_count, state.offset(), focused);
 }
 
 fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
@@ -1078,6 +1080,7 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
         .collect();
 
     let focused = app.dash_focus == DashFocus::Envelopes;
+    let item_count = items.len();
     let mut state = ListState::default();
     if focused && !view.envelopes.is_empty() {
         state.select(Some(app.dash_env_sel));
@@ -1085,6 +1088,7 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
 
     let list = crate::selectable_list(items).block(crate::selectable_block(" Envelopes ", focused));
     frame.render_stateful_widget(list, area, &mut state);
+    crate::render_list_scrollbar(frame, area, item_count, state.offset(), focused);
 }
 
 /// Number of filled cells in a `width`-wide meter showing `consumed / total`.
