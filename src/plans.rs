@@ -254,6 +254,11 @@ fn selected_entry<'e>(app: &App, entries: &'e [PlanEntry]) -> Option<&'e PlanEnt
         .nth(current_plan_selection(app))
 }
 
+/// The durable series behind the focused plan row, used by the contextual global `S` jump.
+pub fn selected_series_id(app: &App, entries: &[PlanEntry]) -> Option<String> {
+    selected_entry(app, entries).map(|entry| entry.series.id.clone())
+}
+
 fn current_plan_selection(app: &App) -> usize {
     match app.plan_focus {
         PlanFocus::Income => app.editor_income_sel,
@@ -665,5 +670,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(refreshed.direction, Some(Direction::Out));
+    }
+
+    #[test]
+    fn contextual_series_id_comes_from_the_focused_plan_row() {
+        let (app, _, entries, rent_series_id) = app_with_transaction_plan();
+
+        assert_eq!(selected_series_id(&app, &entries), Some(rent_series_id));
     }
 }

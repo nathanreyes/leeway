@@ -235,6 +235,17 @@ fn selected_env<'v>(app: &App, view: &'v MonthView) -> Option<&'v EnvelopeRow> {
         .flatten()
 }
 
+/// The durable series behind the focused budget row, for the global contextual `S` jump.
+/// Header/accounts and legacy seriesless month rows intentionally return `None`, which makes
+/// the jump fall back to the complete Series list.
+pub fn selected_series_id(app: &App, view: &MonthView) -> Option<String> {
+    match app.dash_focus {
+        DashFocus::Income | DashFocus::Expenses => selected_txn(app, view)?.series_id.clone(),
+        DashFocus::Envelopes => selected_env(app, view)?.envelope.series_id.clone(),
+        DashFocus::Header | DashFocus::Accounts => None,
+    }
+}
+
 /// Start a reusable-series add flow for whichever budget block is focused. Nothing is
 /// inserted until the user selects/creates a series and confirms an amount.
 fn add_adhoc(app: &mut App, view: &MonthView) -> Result<()> {
@@ -1326,6 +1337,31 @@ mod tests {
             .find(|txn| txn.id == rent_id)
             .unwrap();
         assert_eq!(rent.direction, Direction::Out);
+    }
+
+    #[test]
+    fn contextual_series_id_tracks_the_focused_budget_row() {
+        let mut app = app_with_stamped_month();
+        let view = month_view(&app);
+
+        app.dash_focus = DashFocus::Expenses;
+        let rent_series = selected_series_id(&app, &view).expect("rent has a series");
+        assert_eq!(
+            view.standalone
+                .iter()
+                .find(|txn| txn.label == "Rent")
+                .and_then(|txn| txn.series_id.as_deref()),
+            Some(rent_series.as_str())
+        );
+
+        app.dash_focus = DashFocus::Envelopes;
+        assert_eq!(
+            selected_series_id(&app, &view).as_deref(),
+            view.envelopes[0].envelope.series_id.as_deref()
+        );
+
+        app.dash_focus = DashFocus::Header;
+        assert!(selected_series_id(&app, &view).is_none());
     }
 
     #[test]

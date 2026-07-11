@@ -119,7 +119,7 @@ pub fn topic_for(app: &App) -> HelpTopic {
             PlanFocus::Expenses => HelpTopic::PlanExpenses,
             PlanFocus::Envelopes => HelpTopic::PlanEnvelopes,
         },
-        Screen::Series => HelpTopic::Series,
+        Screen::Series { .. } => HelpTopic::Series,
         Screen::Plans => HelpTopic::PlansList,
     }
 }
@@ -152,7 +152,7 @@ pub fn screen_ring(app: &App) -> Vec<HelpTopic> {
             HelpTopic::PlanExpenses,
             HelpTopic::PlanEnvelopes,
         ],
-        Screen::Series => vec![HelpTopic::Series],
+        Screen::Series { .. } => vec![HelpTopic::Series],
         Screen::Plans => vec![HelpTopic::PlansList],
     }
 }

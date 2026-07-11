@@ -15,3 +15,12 @@ When you reuse an item in a plan or month, it points at a series. That's how Lee
 
   Rename here -> every month follows.
 ```
+
+## Getting around
+
+- `S` — from a selected dashboard or plan row, open that series; press again for all series
+- `Esc` — return to the dashboard or plan you came from
+- `l` — edit the shared label
+- `m` — toggle envelope mode
+- `p` — change envelope cadence
+- `t` — change the chart and summary time range

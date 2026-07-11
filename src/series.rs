@@ -1,22 +1,20 @@
 //! The Series screen: recurring-item management plus range-scoped trend stats.
 
-use crate::{
-    App, BudgetBlock, ChoiceOption, ConfirmAction, ModalAction, PromptKind, Screen, SeriesFilter,
-};
+use crate::{App, BudgetBlock, ChoiceOption, ConfirmAction, ModalAction, PromptKind, SeriesFilter};
 use anyhow::Result;
+use chrono::{Datelike, NaiveDate};
 use leeway::models::{Kind, Mode, PeriodType};
 use leeway::money::Money;
 use leeway::view::{
     SeriesDetailView, SeriesGroup, SeriesPageView, SeriesTimeRange, SeriesTrendPoint,
 };
 use leeway::{ops, queries};
-use chrono::{Datelike, NaiveDate};
-use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Bar, BarChart, ListItem, ListState, Paragraph};
+use ratatui::Frame;
 
 enum SidebarRow {
     Header(SeriesGroup),
@@ -40,9 +38,9 @@ pub fn handle_key(
     }
 
     match key.code {
-        // `q` (quit) and `P` (jump to Plans) are handled globally. `Esc` is the canonical way
-        // back to the Dashboard/month view.
-        KeyCode::Esc => app.screen = Screen::Dashboard,
+        // `q` (quit), `P` (jump to Plans), and `S` (expand Detail to List) are handled
+        // globally. `Esc` returns to whichever screen opened this Series workflow.
+        KeyCode::Esc => app.return_from_series(),
         KeyCode::Char('/') => app.series_search_active = true,
         KeyCode::Char('j') | KeyCode::Down => move_selection(app, view, 1),
         KeyCode::Char('k') | KeyCode::Up => move_selection(app, view, -1),
@@ -60,49 +58,80 @@ pub fn handle_key(
         KeyCode::Char('x') => delete_selected_series(app, view)?,
         KeyCode::Char('l') => {
             if let Some(detail) = selected_detail(app, view) {
-                let label = detail.series.label.clone();
-                let id = detail.series.id.clone();
-                app.open_text_replace_on_type(
-                    "Series label (shared across plans)",
-                    label,
-                    PromptKind::SeriesLabel { series_id: id },
-                );
+                open_label_edit(app, detail);
             }
         }
         KeyCode::Char('m') => {
             if let Some(detail) = selected_detail(app, view) {
-                if detail.series.kind == Kind::Envelope {
-                    let next = match detail.series.mode {
-                        Some(Mode::Manual) => Mode::Automatic,
-                        _ => Mode::Manual,
-                    };
-                    ops::set_series_mode(&app.conn, &detail.series.id, next)?;
-                    app.status = Some("Mode changed (affects all plans using this series)".into());
-                } else {
-                    app.status = Some("Mode applies to envelopes".into());
-                }
+                toggle_mode(app, detail)?;
             }
         }
         KeyCode::Char('p') => {
             if let Some(detail) = selected_detail(app, view) {
-                if detail.series.kind == Kind::Envelope {
-                    let next = match detail.series.period_type {
-                        Some(PeriodType::Daily) => PeriodType::Monthly,
-                        Some(PeriodType::Weekly) | Some(PeriodType::Monthly) | None => {
-                            PeriodType::Daily
-                        }
-                    };
-                    ops::set_series_period(&app.conn, &detail.series.id, next)?;
-                    app.status =
-                        Some("Period changed; plan amounts converted on a 30-day basis".into());
-                } else {
-                    app.status = Some("Period applies to envelopes".into());
-                }
+                cycle_period(app, detail)?;
             }
         }
         _ => {}
     }
 
+    Ok(())
+}
+
+/// Input for the focused single-series mode. Global `S`, `P`, help, and quit are handled by
+/// the event loop first; this handler owns only back, range, and shared-definition edits.
+pub fn handle_detail_key(
+    app: &mut App,
+    key: KeyEvent,
+    detail: &SeriesDetailView,
+    today: NaiveDate,
+) -> Result<()> {
+    app.status = None;
+    match key.code {
+        KeyCode::Esc => app.return_from_series(),
+        KeyCode::Char('t') => open_range_choice(app, today),
+        KeyCode::Char('l') => open_label_edit(app, detail),
+        KeyCode::Char('m') => toggle_mode(app, detail)?,
+        KeyCode::Char('p') => cycle_period(app, detail)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn open_label_edit(app: &mut App, detail: &SeriesDetailView) {
+    app.open_text_replace_on_type(
+        "Series label (shared across plans)",
+        detail.series.label.clone(),
+        PromptKind::SeriesLabel {
+            series_id: detail.series.id.clone(),
+        },
+    );
+}
+
+fn toggle_mode(app: &mut App, detail: &SeriesDetailView) -> Result<()> {
+    if detail.series.kind == Kind::Envelope {
+        let next = match detail.series.mode {
+            Some(Mode::Manual) => Mode::Automatic,
+            _ => Mode::Manual,
+        };
+        ops::set_series_mode(&app.conn, &detail.series.id, next)?;
+        app.status = Some("Mode changed (affects all plans using this series)".into());
+    } else {
+        app.status = Some("Mode applies to envelopes".into());
+    }
+    Ok(())
+}
+
+fn cycle_period(app: &mut App, detail: &SeriesDetailView) -> Result<()> {
+    if detail.series.kind == Kind::Envelope {
+        let next = match detail.series.period_type {
+            Some(PeriodType::Daily) => PeriodType::Monthly,
+            Some(PeriodType::Weekly) | Some(PeriodType::Monthly) | None => PeriodType::Daily,
+        };
+        ops::set_series_period(&app.conn, &detail.series.id, next)?;
+        app.status = Some("Period changed; plan amounts converted on a 30-day basis".into());
+    } else {
+        app.status = Some("Period applies to envelopes".into());
+    }
     Ok(())
 }
 
@@ -256,6 +285,33 @@ pub fn select_series_by_id(app: &mut App, view: &SeriesPageView, series_id: &str
     }
 }
 
+/// Make a requested series visible before selecting it. This is used when Detail expands to
+/// List: stale list state should not make the contextual target appear to have been lost.
+pub fn reveal_series_by_id(app: &mut App, view: &SeriesPageView, series_id: &str) {
+    let Some(detail) = detail_by_id(view, series_id) else {
+        return;
+    };
+    let needle = app.series_search.trim().to_lowercase();
+    if !needle.is_empty() && !detail.series.label.to_lowercase().contains(&needle) {
+        app.series_search.clear();
+    }
+    let hidden_by_filter = match app.series_filter {
+        SeriesFilter::Both => false,
+        SeriesFilter::Plans => detail.plan_names.is_empty(),
+        SeriesFilter::AdHoc => !detail.plan_names.is_empty(),
+    };
+    if hidden_by_filter {
+        app.series_filter = SeriesFilter::Both;
+    }
+    select_series_by_id(app, view, series_id);
+}
+
+pub fn detail_by_id<'v>(view: &'v SeriesPageView, series_id: &str) -> Option<&'v SeriesDetailView> {
+    view.details
+        .iter()
+        .find(|detail| detail.series.id == series_id)
+}
+
 pub fn draw(frame: &mut Frame, app: &App, view: &SeriesPageView) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
@@ -267,6 +323,38 @@ pub fn draw(frame: &mut Frame, app: &App, view: &SeriesPageView) {
     draw_header(frame, header, app, view);
     draw_body(frame, body, app, view);
     draw_footer(frame, footer, app, view);
+}
+
+pub fn draw_detail_screen(
+    frame: &mut Frame,
+    app: &App,
+    view: &SeriesPageView,
+    detail: &SeriesDetailView,
+) {
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+
+    let kind = match detail.group {
+        SeriesGroup::Income => "income",
+        SeriesGroup::Expenses => "expense",
+        SeriesGroup::Envelopes => "envelope",
+    };
+    let title = format!(
+        " {} - {kind} series - {} ",
+        detail.series.label, view.range_label
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(title.bold()))
+            .alignment(Alignment::Center)
+            .block(crate::bordered_block()),
+        header,
+    );
+    draw_detail_content(frame, body, detail, &view.range_label);
+    draw_detail_footer(frame, footer, app, detail);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) {
@@ -469,6 +557,15 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
         return;
     };
 
+    draw_detail_content(frame, area, detail, &view.range_label);
+}
+
+fn draw_detail_content(
+    frame: &mut Frame,
+    area: Rect,
+    detail: &SeriesDetailView,
+    range_label: &str,
+) {
     let [chart_area, mid_area, current_area] = Layout::vertical([
         Constraint::Min(8),
         Constraint::Length(10),
@@ -482,10 +579,35 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
         Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
             .areas(mid_area);
 
-    draw_chart(frame, chart_area, detail, &view.range_label);
+    draw_chart(frame, chart_area, detail, range_label);
     draw_summary(frame, summary_area, detail);
     draw_plans_used(frame, plans_area, detail);
     draw_current(frame, current_area, detail);
+}
+
+fn draw_detail_footer(frame: &mut Frame, area: Rect, app: &App, detail: &SeriesDetailView) {
+    let mut actions = vec![
+        key(" l "),
+        Span::raw(" label  "),
+        key(" t "),
+        Span::raw(" range"),
+    ];
+    if detail.series.kind == Kind::Envelope {
+        actions.extend([Span::raw("  "), key(" m/p "), Span::raw(" mode/period")]);
+    }
+    let nav = Line::from(vec![
+        key(" S "),
+        Span::raw(" all series  "),
+        key(" h "),
+        Span::raw(" help  "),
+        key(" P "),
+        Span::raw(" plans  "),
+        key(" Esc "),
+        Span::raw(" back  "),
+        key(" q "),
+        Span::raw(" quit"),
+    ]);
+    crate::draw_split_status_footer(frame, area, Line::from(actions), nav, &app.status);
 }
 
 fn draw_summary(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {

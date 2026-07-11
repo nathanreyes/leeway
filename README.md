@@ -86,7 +86,7 @@ Common dashboard keys:
 - `a`: edit an amount.
 - `s`: record a transaction in the selected envelope.
 - `P`: open Plans.
-- `S`: open Series and trends.
+- `S`: open the selected series and trends; press again for the full Series list.
 - `q` / `Esc`: quit.
 
 Plans are reusable templates. Stamp a plan into a month to create an independent

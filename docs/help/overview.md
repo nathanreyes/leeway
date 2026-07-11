@@ -22,5 +22,5 @@ Accounts hold your real balance today. Income and Expenses are dated money you t
 - `Tab` — move between panels
 - `h` — help for the focused panel
 - `P` — plans (reusable templates)
-- `S` — series (recurring identities)
+- `S` — selected series, then all series
 - `q` — quit

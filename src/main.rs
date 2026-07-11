@@ -40,13 +40,62 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Which screen is showing. `PlanEditor` carries the id of the plan being edited —
-/// that's how the loop knows which plan's items to load.
+/// that's how the loop knows which plan's items to load. Series carries its own compact
+/// navigation state so a contextual detail drill-in can return to its exact origin.
 pub enum Screen {
     Dashboard,
     EnvelopeDetail { detail: EnvelopeDetail },
-    Series,
+    Series { state: SeriesScreen },
     Plans,
     PlanEditor { plan_id: String },
+}
+
+#[derive(Clone)]
+pub struct SeriesScreen {
+    pub mode: SeriesMode,
+    pub origin: SeriesOrigin,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SeriesMode {
+    Detail { series_id: String },
+    List,
+}
+
+/// A deliberately shallow return address for the Series workflow. This is not intended to
+/// grow into navigation history; if another workflow needs nested back-stack behavior, that
+/// should become a shared navigation abstraction instead.
+#[derive(Clone)]
+pub enum SeriesOrigin {
+    Dashboard,
+    EnvelopeDetail { detail: EnvelopeDetail },
+    Plans,
+    PlanEditor { plan_id: String },
+}
+
+impl SeriesOrigin {
+    fn from_screen(screen: &Screen) -> Option<Self> {
+        match screen {
+            Screen::Dashboard => Some(Self::Dashboard),
+            Screen::EnvelopeDetail { detail } => Some(Self::EnvelopeDetail {
+                detail: detail.clone(),
+            }),
+            Screen::Plans => Some(Self::Plans),
+            Screen::PlanEditor { plan_id } => Some(Self::PlanEditor {
+                plan_id: plan_id.clone(),
+            }),
+            Screen::Series { .. } => None,
+        }
+    }
+
+    fn into_screen(self) -> Screen {
+        match self {
+            Self::Dashboard => Screen::Dashboard,
+            Self::EnvelopeDetail { detail } => Screen::EnvelopeDetail { detail },
+            Self::Plans => Screen::Plans,
+            Self::PlanEditor { plan_id } => Screen::PlanEditor { plan_id },
+        }
+    }
 }
 
 /// Which control the dashboard's keys act on. The month header owns month navigation; the
@@ -503,6 +552,17 @@ pub struct App {
 }
 
 impl App {
+    fn return_from_series(&mut self) {
+        let origin = match &self.screen {
+            Screen::Series { state } => Some(state.origin.clone()),
+            _ => None,
+        };
+        if let Some(origin) = origin {
+            self.screen = origin.into_screen();
+            self.series_search_active = false;
+        }
+    }
+
     fn open_text_prompt(
         &mut self,
         title: impl Into<String>,
@@ -761,9 +821,12 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     IDLE_TICK
                 };
                 if let Some(key) = read_key(tick)? {
+                    let contextual_series_id = view
+                        .as_ref()
+                        .and_then(|view| dashboard::selected_series_id(app, view));
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
-                    } else if handle_global_key(app, key) {
+                    } else if handle_global_key_with_series(app, key, contextual_series_id) {
                     } else {
                         dashboard::handle_key(app, key, &view)?;
                     }
@@ -774,49 +837,74 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                 let detail = detail.clone();
                 // The envelope may have been deleted from a confirmation dialog. Return to the
                 // dashboard rather than rendering a stale drill-in screen.
-                if load_detail_envelope(app, &detail)?.is_none() {
+                let Some(envelope) = load_detail_envelope(app, &detail)? else {
                     app.screen = Screen::Dashboard;
                     app.status = Some("Envelope no longer exists".into());
                     continue;
-                }
+                };
 
                 terminal.draw(|f| {
                     draw_envelope_detail_screen(f, app, &detail);
                     draw_modal(f, app);
                 })?;
                 if let Some(key) = read_key(IDLE_TICK)? {
+                    let contextual_series_id = envelope.series_id.clone();
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
-                    } else if handle_global_key(app, key) {
+                    } else if handle_global_key_with_series(app, key, contextual_series_id) {
                     } else {
                         handle_envelope_detail_key(app, key)?;
                     }
                 }
             }
 
-            Screen::Series => {
-                let view =
-                    leeway::view::SeriesPageView::build(&app.conn, today, app.series_range)?;
-                // Resolve "select the series I just created" now that the list is loaded.
-                if let Some(target) = app.pending_series_select.take() {
-                    series::select_series_by_id(app, &view, &target);
-                }
-                let visible_count = series::visible_count(app, &view);
-                clamp(&mut app.series_sel, visible_count);
-                terminal.draw(|f| {
-                    series::draw(f, app, &view);
-                    draw_modal(f, app);
-                })?;
-                if let Some(key) = read_key(IDLE_TICK)? {
-                    if app.modal.is_some() {
-                        handle_modal_key(app, key)?;
-                    } else if app.series_search_active {
-                        // Search is a text-entry mode: it must own every key (including the
-                        // would-be global jump/quit keys) so you can type them into the query.
-                        series::handle_key(app, key, &view, today)?;
-                    } else if handle_global_key(app, key) {
-                    } else {
-                        series::handle_key(app, key, &view, today)?;
+            Screen::Series { state } => {
+                let state = state.clone();
+                let view = leeway::view::SeriesPageView::build(&app.conn, today, app.series_range)?;
+                match state.mode {
+                    SeriesMode::Detail { series_id } => {
+                        let Some(detail) = series::detail_by_id(&view, &series_id) else {
+                            app.return_from_series();
+                            app.status = Some("Series no longer exists".into());
+                            continue;
+                        };
+                        terminal.draw(|f| {
+                            series::draw_detail_screen(f, app, &view, detail);
+                            draw_modal(f, app);
+                        })?;
+                        if let Some(key) = read_key(IDLE_TICK)? {
+                            if app.modal.is_some() {
+                                handle_modal_key(app, key)?;
+                            } else if handle_global_key(app, key) {
+                            } else {
+                                series::handle_detail_key(app, key, detail, today)?;
+                            }
+                        }
+                    }
+                    SeriesMode::List => {
+                        // Resolve creation and detail-to-list promotion now that the sorted,
+                        // filtered list is loaded.
+                        if let Some(target) = app.pending_series_select.take() {
+                            series::reveal_series_by_id(app, &view, &target);
+                        }
+                        let visible_count = series::visible_count(app, &view);
+                        clamp(&mut app.series_sel, visible_count);
+                        terminal.draw(|f| {
+                            series::draw(f, app, &view);
+                            draw_modal(f, app);
+                        })?;
+                        if let Some(key) = read_key(IDLE_TICK)? {
+                            if app.modal.is_some() {
+                                handle_modal_key(app, key)?;
+                            } else if app.series_search_active {
+                                // Search is a text-entry mode: it must own every key (including
+                                // would-be global jump/quit keys) so they remain literal input.
+                                series::handle_key(app, key, &view, today)?;
+                            } else if handle_global_key(app, key) {
+                            } else {
+                                series::handle_key(app, key, &view, today)?;
+                            }
+                        }
                     }
                 }
             }
@@ -878,9 +966,10 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     draw_modal(f, app);
                 })?;
                 if let Some(key) = read_key(IDLE_TICK)? {
+                    let contextual_series_id = plans::selected_series_id(app, &entries);
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
-                    } else if handle_global_key(app, key) {
+                    } else if handle_global_key_with_series(app, key, contextual_series_id) {
                     } else {
                         plans::handle_editor_key(app, key, &plan, &entries)?;
                     }
@@ -925,9 +1014,37 @@ fn read_key(timeout: Duration) -> Result<Option<KeyEvent>> {
 /// text-entry mode still receives these characters as literal input rather than losing them to
 /// navigation. Lowercase `p`/`s`/`d` are left free for pages to use as their own verbs.
 fn handle_global_key(app: &mut App, key: KeyEvent) -> bool {
+    handle_global_key_with_series(app, key, None)
+}
+
+fn handle_global_key_with_series(
+    app: &mut App,
+    key: KeyEvent,
+    contextual_series_id: Option<String>,
+) -> bool {
     let screen = match key.code {
         KeyCode::Char('P') => Screen::Plans,
-        KeyCode::Char('S') => Screen::Series,
+        KeyCode::Char('S') => {
+            if let Screen::Series { state } = &mut app.screen {
+                if let SeriesMode::Detail { series_id } = &state.mode {
+                    app.pending_series_select = Some(series_id.clone());
+                    state.mode = SeriesMode::List;
+                }
+                app.series_search_active = false;
+                app.status = None;
+                return true;
+            }
+
+            let Some(origin) = SeriesOrigin::from_screen(&app.screen) else {
+                return true;
+            };
+            let mode = contextual_series_id
+                .map(|series_id| SeriesMode::Detail { series_id })
+                .unwrap_or(SeriesMode::List);
+            Screen::Series {
+                state: SeriesScreen { mode, origin },
+            }
+        }
         // Universal contextual help for the focused box. Runs after the modal/search
         // short-circuits, so `h` typed into a prompt stays literal (see the doc comment).
         KeyCode::Char('h') => {
@@ -2614,6 +2731,140 @@ mod tests {
             }
             _ => panic!("expected envelope detail screen"),
         }
+    }
+
+    fn series_id_for_detail(app: &App, detail: &EnvelopeDetail) -> String {
+        load_detail_envelope(app, detail)
+            .unwrap()
+            .unwrap()
+            .series_id
+            .unwrap()
+    }
+
+    #[test]
+    fn contextual_s_opens_detail_and_remembers_its_origin() {
+        let (mut app, envelope_detail, _) = app_with_envelope_detail();
+        let series_id = series_id_for_detail(&app, &envelope_detail);
+
+        assert!(handle_global_key_with_series(
+            &mut app,
+            key(KeyCode::Char('S')),
+            Some(series_id.clone()),
+        ));
+
+        match &app.screen {
+            Screen::Series { state } => {
+                assert_eq!(
+                    state.mode,
+                    SeriesMode::Detail {
+                        series_id: series_id.clone()
+                    }
+                );
+                match &state.origin {
+                    SeriesOrigin::EnvelopeDetail { detail } => {
+                        assert_eq!(detail.envelope_id, envelope_detail.envelope_id)
+                    }
+                    _ => panic!("expected envelope-detail origin"),
+                }
+            }
+            _ => panic!("expected contextual Series detail"),
+        }
+
+        assert!(handle_global_key(&mut app, key(KeyCode::Char('S'))));
+        match &app.screen {
+            Screen::Series { state } => assert_eq!(state.mode, SeriesMode::List),
+            _ => panic!("expected Series list"),
+        }
+        assert_eq!(
+            app.pending_series_select.as_deref(),
+            Some(series_id.as_str())
+        );
+
+        app.return_from_series();
+        assert_envelope_detail_screen(&app, &envelope_detail);
+    }
+
+    #[test]
+    fn direct_series_list_remembers_the_plans_origin() {
+        let (mut app, _, _) = app_with_envelope_detail();
+        app.screen = Screen::Plans;
+
+        assert!(handle_global_key(&mut app, key(KeyCode::Char('S'))));
+        match &app.screen {
+            Screen::Series { state } => {
+                assert_eq!(state.mode, SeriesMode::List);
+                assert!(matches!(state.origin, SeriesOrigin::Plans));
+            }
+            _ => panic!("expected Series list"),
+        }
+
+        app.return_from_series();
+        assert!(matches!(app.screen, Screen::Plans));
+    }
+
+    #[test]
+    fn contextual_series_returns_to_the_originating_plan_editor() {
+        let (mut app, envelope_detail, _) = app_with_envelope_detail();
+        let series_id = series_id_for_detail(&app, &envelope_detail);
+        let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
+        app.screen = Screen::PlanEditor {
+            plan_id: plan_id.clone(),
+        };
+
+        handle_global_key_with_series(&mut app, key(KeyCode::Char('S')), Some(series_id));
+        app.return_from_series();
+
+        match &app.screen {
+            Screen::PlanEditor { plan_id: actual } => assert_eq!(actual, &plan_id),
+            _ => panic!("expected the originating plan editor"),
+        }
+    }
+
+    #[test]
+    fn contextual_series_detail_renders_and_edits_then_returns() {
+        let (mut app, envelope_detail, _) = app_with_envelope_detail();
+        let series_id = series_id_for_detail(&app, &envelope_detail);
+        handle_global_key_with_series(&mut app, key(KeyCode::Char('S')), Some(series_id.clone()));
+        let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let view =
+            leeway::view::SeriesPageView::build(&app.conn, today, SeriesTimeRange::Last12Stamped)
+                .unwrap();
+        let detail = series::detail_by_id(&view, &series_id).unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(100, 32);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| series::draw_detail_screen(frame, &app, &view, detail))
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Dining - envelope series"));
+        assert!(text.contains("Summary"));
+        assert!(text.contains("all series"));
+
+        series::handle_detail_key(&mut app, key(KeyCode::Char('m')), detail, today).unwrap();
+        let changed = queries::get_series(&app.conn, &series_id).unwrap().unwrap();
+        assert_eq!(changed.mode, Some(Mode::Automatic));
+
+        series::handle_detail_key(&mut app, key(KeyCode::Esc), detail, today).unwrap();
+        assert_envelope_detail_screen(&app, &envelope_detail);
+    }
+
+    #[test]
+    fn detail_promotion_relaxes_only_conflicting_list_state() {
+        let (mut app, envelope_detail, _) = app_with_envelope_detail();
+        let series_id = series_id_for_detail(&app, &envelope_detail);
+        let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+        let view =
+            leeway::view::SeriesPageView::build(&app.conn, today, SeriesTimeRange::Last12Stamped)
+                .unwrap();
+        app.series_filter = SeriesFilter::AdHoc;
+        app.series_search = "not dining".into();
+
+        series::reveal_series_by_id(&mut app, &view, &series_id);
+
+        assert!(app.series_filter == SeriesFilter::Both);
+        assert!(app.series_search.is_empty());
+        assert_eq!(app.series_sel, 0);
     }
 
     #[test]
