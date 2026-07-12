@@ -1,6 +1,6 @@
 [package]
 name = "leeway"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "A local-first terminal budgeting app focused on what's left."
 repository = "https://github.com/nathanreyes/leeway"
