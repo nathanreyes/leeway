@@ -1125,6 +1125,33 @@ mod tests {
     }
 
     #[test]
+    fn unknown_currency_code_is_preserved_not_overwritten() {
+        use queries::CurrencySetting;
+        let conn = db::open_in_memory().unwrap();
+        // A newer app version stored a code this build doesn't recognize.
+        conn.execute(
+            "INSERT INTO setting (key, value) VALUES ('currency', 'XTS')",
+            [],
+        )
+        .unwrap();
+
+        // The three-state reader surfaces it as Unknown (not Unset), so startup knows
+        // not to clobber it — while the convenience getter still reports None.
+        assert_eq!(
+            queries::currency_setting(&conn).unwrap(),
+            CurrencySetting::Unknown("XTS".into())
+        );
+        assert_eq!(queries::currency(&conn).unwrap(), None);
+
+        // No row exists at all -> Unset, the only case safe to auto-populate.
+        let fresh = db::open_in_memory().unwrap();
+        assert_eq!(
+            queries::currency_setting(&fresh).unwrap(),
+            CurrencySetting::Unset
+        );
+    }
+
+    #[test]
     fn stamp_copies_items_and_freezes_amounts() {
         let mut conn = db::open_in_memory().unwrap();
         seed_starter(&mut conn).unwrap();

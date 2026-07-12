@@ -730,13 +730,17 @@ fn main() -> Result<()> {
     // table; a brand-new budget has no row yet, so we detect from the OS locale and
     // persist that choice. Setting it here means starter seeding lands in the right
     // currency and the first frame renders localized.
-    let currency = match queries::currency(&conn)? {
-        Some(chosen) => chosen,
-        None => {
+    let currency = match queries::currency_setting(&conn)? {
+        queries::CurrencySetting::Known(chosen) => chosen,
+        queries::CurrencySetting::Unset => {
             let detected = leeway::currency::detect_from_locale();
             ops::set_currency(&conn, detected)?;
             detected
         }
+        // A newer app version stored a currency this build doesn't recognize. Leave the
+        // row untouched — overwriting it would destroy the user's choice on downgrade —
+        // and just pick a locale default for this session's display.
+        queries::CurrencySetting::Unknown(_) => leeway::currency::detect_from_locale(),
     };
     leeway::currency::set_active(currency);
     // On a fresh database this stamps the current calendar month, satisfying "if no month

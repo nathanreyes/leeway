@@ -63,14 +63,16 @@ impl Money {
     /// "1.234,56 €"; for JPY "1,234" (no decimals). Returns `None` on anything
     /// unparseable, so the UI can reject bad input instead of storing garbage.
     pub fn parse_in(input: &str, currency: Currency) -> Option<Money> {
-        // Strip the characters humans add for readability (symbol, grouping,
-        // whitespace), then parse the decimal text directly. Going through f64 would
-        // accept NaN/scientific overflow and can lose a minor unit before we store
-        // the value as an integer. The decimal separator is preserved for the split.
+        // Strip the symbol and the whitespace humans add for readability, then parse
+        // the decimal text directly. Going through f64 would accept NaN/scientific
+        // overflow and can lose a minor unit before we store the value as an integer.
+        // Grouping separators are *validated* rather than blindly stripped (see
+        // `ungroup`), so malformed grouping — e.g. EUR "12.34", where '.' is the
+        // grouping separator — is rejected instead of being silently read as 1234.
         let without_symbol = input.replace(currency.symbol, "");
         let cleaned: String = without_symbol
             .chars()
-            .filter(|c| *c != currency.group_sep && !c.is_whitespace())
+            .filter(|c| !c.is_whitespace())
             .collect();
         if cleaned.is_empty() {
             return None;
@@ -84,12 +86,12 @@ impl Money {
         let mut parts = unsigned.split(currency.decimal_sep);
         let whole = parts.next()?;
         let fraction = parts.next();
-        if parts.next().is_some()
-            || (whole.is_empty() && fraction.is_none())
-            || !whole.chars().all(|c| c.is_ascii_digit())
-        {
+        if parts.next().is_some() || (whole.is_empty() && fraction.is_none()) {
             return None;
         }
+        // Grouping separators are only meaningful in the whole part; the fraction is
+        // validated to be bare digits below, which already rejects a stray separator.
+        let whole = ungroup(whole, currency.group_sep)?;
 
         let scale = currency.scale() as u64;
         let whole_minor = if whole.is_empty() {
@@ -197,6 +199,33 @@ impl Money {
 impl fmt::Display for Money {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.format_in(currency::active()))
+    }
+}
+
+/// Validate an integer string's grouping and return it with any separators removed.
+/// A separator-free run of digits is always accepted — users needn't type grouping —
+/// but when the `sep` is present it must delimit a valid pattern (a 1-3 digit lead
+/// group, then groups of exactly three), mirroring what [`group_digits`] emits. This
+/// rejects malformed grouping like EUR "12.34" (a 2-digit trailing group) instead of
+/// silently reinterpreting it. An empty string is accepted (a leading-decimal input
+/// like ".5"). Kept private to this module.
+fn ungroup(whole: &str, sep: char) -> Option<String> {
+    if sep != '\0' && whole.contains(sep) {
+        let mut segments = whole.split(sep);
+        let lead = segments.next()?;
+        if lead.is_empty() || lead.len() > 3 || !lead.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        for seg in segments {
+            if seg.len() != 3 || !seg.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+        }
+        Some(whole.chars().filter(|c| *c != sep).collect())
+    } else if whole.bytes().all(|b| b.is_ascii_digit()) {
+        Some(whole.to_string())
+    } else {
+        None
     }
 }
 
@@ -324,6 +353,22 @@ mod tests {
 
         assert_eq!(Money::parse_in("1.234,56\u{00a0}€", cur("EUR")), Some(Money(123456)));
         assert_eq!(Money::parse_in("-5,00 €", cur("EUR")), Some(Money(-500)));
+    }
+
+    #[test]
+    fn rejects_malformed_grouping() {
+        // In EUR '.' groups and ',' is the decimal. "12.34" looks like a USD decimal
+        // but is malformed EUR grouping (a 2-digit trailing group), so it must be
+        // rejected rather than silently read as 1.234,00.
+        assert_eq!(Money::parse_in("12.34", cur("EUR")), None);
+        // Bad groupings in any locale: wrong-width or empty trailing groups.
+        assert_eq!(Money::parse_in("1,2345", cur("USD")), None);
+        assert_eq!(Money::parse_in("1,23,456", cur("USD")), None);
+        assert_eq!(Money::parse_in("1,", cur("USD")), None);
+        assert_eq!(Money::parse_in("1.23.456,78", cur("EUR")), None);
+        // Well-formed grouping still parses, and bare (ungrouped) digits always do.
+        assert_eq!(Money::parse_in("1,234,567.89", cur("USD")), Some(Money(123456789)));
+        assert_eq!(Money::parse_in("1234567", cur("USD")), Some(Money(123456700)));
     }
 
     #[test]

@@ -28,12 +28,26 @@ pub fn default_mode(conn: &Connection) -> Result<Mode> {
     })
 }
 
-/// The app-wide display currency (from the `setting` table's `currency` key).
-/// Returns `None` when the key is absent (a fresh budget that hasn't chosen one
-/// yet) or names a code we don't recognize, so the caller can fall back to
-/// locale detection. The value travels with the database, so a synced budget
-/// carries its currency to every device.
-pub fn currency(conn: &Connection) -> Result<Option<Currency>> {
+/// The stored state of the `currency` setting. Distinguishes a fresh budget with
+/// no row (safe to detect + persist a default) from one whose row names a code
+/// this build doesn't recognize — e.g. written by a newer app version. The latter
+/// must be preserved verbatim, never overwritten, or a downgrade would silently
+/// destroy the user's original choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurrencySetting {
+    /// No `currency` row yet — a brand-new budget that hasn't chosen one.
+    Unset,
+    /// A row naming a currency this build recognizes.
+    Known(Currency),
+    /// A row present but naming a code we don't recognize; preserved verbatim.
+    Unknown(String),
+}
+
+/// Read the `currency` setting as a three-state value (from the `setting` table's
+/// `currency` key). The value travels with the database, so a synced budget carries
+/// its currency to every device. Callers that only need the recognized currency and
+/// can fall back on anything else should use [`currency`] instead.
+pub fn currency_setting(conn: &Connection) -> Result<CurrencySetting> {
     let value: Option<String> = conn
         .query_row(
             "SELECT value FROM setting WHERE key = 'currency'",
@@ -42,7 +56,25 @@ pub fn currency(conn: &Connection) -> Result<Option<Currency>> {
         )
         .optional()
         .context("reading currency setting")?;
-    Ok(value.as_deref().and_then(currency::by_code))
+    Ok(match value {
+        None => CurrencySetting::Unset,
+        Some(code) => match currency::by_code(&code) {
+            Some(chosen) => CurrencySetting::Known(chosen),
+            None => CurrencySetting::Unknown(code),
+        },
+    })
+}
+
+/// The app-wide display currency (from the `setting` table's `currency` key).
+/// Returns `None` when the key is absent (a fresh budget that hasn't chosen one
+/// yet) or names a code we don't recognize, so the caller can fall back to
+/// locale detection. The value travels with the database, so a synced budget
+/// carries its currency to every device.
+pub fn currency(conn: &Connection) -> Result<Option<Currency>> {
+    Ok(match currency_setting(conn)? {
+        CurrencySetting::Known(chosen) => Some(chosen),
+        CurrencySetting::Unset | CurrencySetting::Unknown(_) => None,
+    })
 }
 
 /// Re-apply the app-wide active currency from the database. Called after a sync
