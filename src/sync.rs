@@ -189,6 +189,10 @@ pub enum LeaseDecision {
     TakeoverRequired { owner: String, expires_at_ms: i64 },
 }
 
+const SAME_DEVICE_OWNER: &str = "Another Leeway session on this computer";
+const GENERIC_DEVICE_LABEL: &str = "This computer";
+const UNNAMED_DEVICE_LABEL: &str = "Unnamed device";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncStatus {
     LocalOnly,
@@ -858,7 +862,10 @@ impl Runtime {
                 }
             } else {
                 self.status = SyncStatus::Attention {
-                    message: format!("Editing ownership changed to {}", lease.device_label),
+                    message: format!(
+                        "Editing ownership changed to {}",
+                        lease_owner_label(&lease, &self.device.device_id)
+                    ),
                 };
             }
         }
@@ -1004,15 +1011,26 @@ pub fn decide_lease(
     if lease.released {
         return LeaseDecision::Acquire;
     }
+    let owner = lease_owner_label(lease, device_id);
     if lease.active_at(now_ms) {
         return LeaseDecision::ReadOnly {
-            owner: lease.device_label.clone(),
+            owner,
             expires_at_ms: lease.expires_at_ms,
         };
     }
     LeaseDecision::TakeoverRequired {
-        owner: lease.device_label.clone(),
+        owner,
         expires_at_ms: lease.expires_at_ms,
+    }
+}
+
+fn lease_owner_label(lease: &Lease, local_device_id: &str) -> String {
+    if lease.device_id == local_device_id {
+        SAME_DEVICE_OWNER.into()
+    } else if lease.device_label.trim().is_empty() || lease.device_label == GENERIC_DEVICE_LABEL {
+        UNNAMED_DEVICE_LABEL.into()
+    } else {
+        lease.device_label.clone()
     }
 }
 
@@ -1313,17 +1331,36 @@ fn verify_sqlite(path: &Path, expected_schema: u32) -> Result<()> {
 
 fn load_or_create_device(path: &Path) -> Result<Device> {
     if path.exists() {
-        return read_json(path);
+        let mut device: Device = read_json(path)?;
+        if device.label.trim().is_empty()
+            || device.label == GENERIC_DEVICE_LABEL
+            || device.label == UNNAMED_DEVICE_LABEL
+        {
+            let resolved = system_device_label();
+            if resolved != device.label {
+                device.label = resolved;
+                atomic_json(path, &device)?;
+            }
+        }
+        return Ok(device);
     }
-    let label = env::var("HOSTNAME")
-        .or_else(|_| env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "This computer".into());
     let device = Device {
         device_id: Uuid::new_v4().to_string(),
-        label,
+        label: system_device_label(),
     };
     atomic_json(path, &device)?;
     Ok(device)
+}
+
+fn system_device_label() -> String {
+    normalize_device_label(hostname::get().ok())
+}
+
+fn normalize_device_label(name: Option<std::ffi::OsString>) -> String {
+    name.and_then(|name| name.into_string().ok())
+        .map(|name| name.trim().trim_end_matches(".local").to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| UNNAMED_DEVICE_LABEL.into())
 }
 
 fn load_or_default<T>(path: &Path) -> Result<T>
@@ -1506,10 +1543,69 @@ mod tests {
             decide_lease(Some(&lease), "b", "two", 20),
             LeaseDecision::ReadOnly { .. }
         ));
+        assert_eq!(
+            decide_lease(Some(&lease), "a", "two", 20),
+            LeaseDecision::ReadOnly {
+                owner: SAME_DEVICE_OWNER.into(),
+                expires_at_ms: 100,
+            }
+        );
         assert!(matches!(
             decide_lease(Some(&lease), "b", "two", 101),
             LeaseDecision::TakeoverRequired { .. }
         ));
+    }
+
+    #[test]
+    fn device_labels_use_hostname_and_safe_fallbacks() {
+        assert_eq!(
+            normalize_device_label(Some("Nathans-MacBook-Pro.local".into())),
+            "Nathans-MacBook-Pro"
+        );
+        assert_eq!(
+            normalize_device_label(Some("  ".into())),
+            UNNAMED_DEVICE_LABEL
+        );
+        assert_eq!(normalize_device_label(None), UNNAMED_DEVICE_LABEL);
+    }
+
+    #[test]
+    fn generic_device_label_is_upgraded_without_changing_identity() {
+        let path = temp_dir("device-upgrade").join("device.json");
+        atomic_json(
+            &path,
+            &Device {
+                device_id: "stable-id".into(),
+                label: GENERIC_DEVICE_LABEL.into(),
+            },
+        )
+        .unwrap();
+
+        let device = load_or_create_device(&path).unwrap();
+        assert_eq!(device.device_id, "stable-id");
+        assert_ne!(device.label, GENERIC_DEVICE_LABEL);
+        assert_eq!(read_json::<Device>(&path).unwrap(), device);
+    }
+
+    #[test]
+    fn generic_label_from_a_different_identity_is_not_called_this_computer() {
+        let lease = Lease {
+            device_id: "other".into(),
+            device_label: GENERIC_DEVICE_LABEL.into(),
+            session_id: "session".into(),
+            base_revision: None,
+            acquired_at_ms: 1,
+            heartbeat_at_ms: 1,
+            expires_at_ms: 100,
+            released: false,
+        };
+        assert_eq!(
+            decide_lease(Some(&lease), "local", "new-session", 20),
+            LeaseDecision::ReadOnly {
+                owner: UNNAMED_DEVICE_LABEL.into(),
+                expires_at_ms: 100,
+            }
+        );
     }
 
     #[test]

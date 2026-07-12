@@ -33,7 +33,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph, Scrollbar,
-    ScrollbarOrientation, ScrollbarState,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
@@ -1196,37 +1196,38 @@ fn draw_storage_sync(frame: &mut Frame, app: &App) {
 
     let mut lines = Vec::new();
     if let Some(runtime) = app.sync.as_ref() {
-        lines.push(Line::from(vec![
-            Span::styled(" Status  ", Style::default().fg(theme::MAUVE)),
-            Span::raw(runtime.status.label()),
-        ]));
+        lines.push(storage_detail_line(
+            "Status",
+            runtime.status.label(),
+            sync_status_color(&runtime.status),
+        ));
         match &runtime.status {
-            SyncStatus::Published { revision_id } => lines.push(Line::raw(format!(
-                " Revision  {}",
-                revision_id
-            ))),
+            SyncStatus::Published { revision_id } => lines.push(storage_detail_line(
+                "Revision",
+                revision_id,
+                Color::White,
+            )),
             SyncStatus::SavedLocally { message } | SyncStatus::Attention { message } => {
-                lines.push(Line::raw(format!(" Detail  {message}")))
+                lines.push(storage_detail_line("Detail", message, Color::White))
             }
-            SyncStatus::ReadOnly { owner } => {
-                lines.push(Line::raw(format!(" Owner  {owner}")))
-            }
-            SyncStatus::LocalOnly | SyncStatus::Publishing => {}
+            SyncStatus::LocalOnly | SyncStatus::Publishing | SyncStatus::ReadOnly { .. } => {}
         }
-        lines.push(Line::raw(format!(
-            " Local database  {}",
-            runtime.paths().database.display()
-        )));
-        lines.push(Line::raw(format!(
-            " Device  {}",
-            runtime.device.label
-        )));
+        lines.push(storage_detail_line(
+            "Device",
+            &runtime.device.label,
+            Color::White,
+        ));
+        lines.push(storage_detail_line(
+            "Local database",
+            runtime.paths().database.display().to_string(),
+            Color::White,
+        ));
         if let Some(parent) = runtime.config.sync_parent.as_ref() {
-            lines.push(Line::raw(format!(" Sync parent  {}", parent.display())));
-            lines.push(Line::raw(format!(
-                " Leeway folder  {}",
-                parent.join(sync::SYNC_DIR_NAME).display()
-            )));
+            lines.push(storage_detail_line(
+                "Leeway folder",
+                parent.join(sync::SYNC_DIR_NAME).display().to_string(),
+                Color::White,
+            ));
         }
         lines.push(Line::raw(""));
         lines.push(Line::raw(match runtime.config.mode {
@@ -1240,15 +1241,25 @@ fn draw_storage_sync(frame: &mut Frame, app: &App) {
     }
     if let Some(path) = app.legacy_database.as_ref() {
         lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled(" Existing database found  ", Style::default().fg(Color::Yellow)),
-            Span::raw(path.display().to_string()),
-        ]));
+        lines.push(Line::from(Span::styled(
+            " Legacy database",
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(storage_detail_line(
+            "Path",
+            path.display().to_string(),
+            Color::White,
+        ));
         lines.push(Line::raw(
-            " It has not been modified. Importing creates a recovery backup first.",
+            " Importing creates a recovery backup and leaves the original unchanged.",
         ));
     }
-    frame.render_widget(Paragraph::new(lines).block(titled_block(" Storage ")), body);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(titled_block(" Storage ")),
+        body,
+    );
 
     let mode = app
         .sync
@@ -1291,8 +1302,39 @@ fn draw_storage_sync(frame: &mut Frame, app: &App) {
         modal_key(" q "),
         Span::raw(" quit"),
     ]);
-    let status = footer_status(app);
-    draw_split_status_footer(frame, footer, Line::from(actions), nav, status.as_deref());
+    draw_split_status_footer(
+        frame,
+        footer,
+        Line::from(actions),
+        nav,
+        app.status.as_deref(),
+    );
+}
+
+const STORAGE_LABEL_WIDTH: usize = 17;
+
+fn storage_detail_line(
+    label: &str,
+    value: impl Into<String>,
+    value_color: Color,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(" {label:<STORAGE_LABEL_WIDTH$}"),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled(value.into(), Style::default().fg(value_color)),
+    ])
+}
+
+fn sync_status_color(status: &SyncStatus) -> Color {
+    match status {
+        SyncStatus::Published { .. } => theme::GREEN,
+        SyncStatus::Publishing => theme::CYAN,
+        SyncStatus::LocalOnly => Color::Gray,
+        SyncStatus::SavedLocally { .. } | SyncStatus::ReadOnly { .. } => Color::Yellow,
+        SyncStatus::Attention { .. } => Color::Red,
+    }
 }
 
 /// Keys that mean the same thing on *every* page, checked ahead of the page's own handler.
@@ -3603,6 +3645,53 @@ mod tests {
         assert_eq!(transactions.len(), 1);
         assert_eq!(transactions[0].label, "Coffee");
         assert_eq!(transactions[0].amount, Money::from_dollars(12.5));
+    }
+
+    fn app_with_sync_screen() -> App {
+        let (mut app, _, _) = app_with_envelope_detail();
+        let data_dir = std::env::temp_dir().join(format!("leeway-storage-ui-{}", Uuid::new_v4()));
+        let paths = sync::AppPaths::in_dir(data_dir);
+        let mut runtime = sync::Runtime::load(paths, &app.conn).unwrap();
+        runtime.device.label = "Nathans-MacBook-Pro".into();
+        runtime.config.mode = StorageMode::FolderSync;
+        runtime.config.sync_parent = Some(PathBuf::from("/Users/nathan/dropbox"));
+        runtime.status = SyncStatus::ReadOnly {
+            owner: "Other-MacBook".into(),
+        };
+        app.screen = Screen::StorageSync {
+            origin: SeriesOrigin::Dashboard,
+        };
+        app.status = None;
+        app.sync = Some(runtime);
+        app.legacy_database = Some(PathBuf::from("/old/leeway.db"));
+        app
+    }
+
+    #[test]
+    fn storage_sync_details_are_aligned_without_duplicate_rows_or_status() {
+        let app = app_with_sync_screen();
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_storage_sync(frame, &app)).unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains(" Status           Read-only — Other-MacBook is editing"));
+        assert!(text.contains(" Device           Nathans-MacBook-Pro"));
+        assert!(text.contains(" Local database   "));
+        assert!(text.contains(" Leeway folder    /Users/nathan/dropbox/Leeway"));
+        assert!(text.contains(" Legacy database"));
+        assert!(text.contains(" Path             /old/leeway.db"));
+        assert!(!text.contains(" Owner "));
+        assert!(!text.contains(" Sync parent"));
+        assert_eq!(text.matches("Read-only — Other-MacBook is editing").count(), 1);
+    }
+
+    #[test]
+    fn storage_sync_screen_survives_a_narrow_frame() {
+        let app = app_with_sync_screen();
+        let backend = ratatui::backend::TestBackend::new(32, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_storage_sync(frame, &app)).unwrap();
     }
 
     // --- Contextual help -------------------------------------------------------
