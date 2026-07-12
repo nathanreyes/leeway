@@ -338,15 +338,7 @@ pub fn draw_detail_screen(
     ])
     .areas(frame.area());
 
-    let kind = match detail.group {
-        SeriesGroup::Income => "income",
-        SeriesGroup::Expenses => "expense",
-        SeriesGroup::Envelopes => "envelope",
-    };
-    let title = format!(
-        " {} - {kind} series - {} ",
-        detail.series.label, view.range_label
-    );
+    let title = format!(" {} - {} ", detail.series.label, view.range_label);
     frame.render_widget(
         Paragraph::new(Line::from(title.bold()))
             .alignment(Alignment::Center)
@@ -573,14 +565,18 @@ fn draw_detail_content(
     ])
     .areas(area);
 
-    // Summary and "Used in plans" sit side by side: the stats read as an aligned single
-    // column on the left, and plan membership gets its own list on the right.
-    let [summary_area, plans_area] =
-        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .areas(mid_area);
+    // Three panels across the mid row: series metadata (type, and mode/period for envelopes)
+    // on the left, the aligned stat column in the middle, and plan membership on the right.
+    let [details_area, stats_area, plans_area] = Layout::horizontal([
+        Constraint::Percentage(28),
+        Constraint::Percentage(32),
+        Constraint::Percentage(40),
+    ])
+    .areas(mid_area);
 
     draw_chart(frame, chart_area, detail, range_label);
-    draw_summary(frame, summary_area, detail);
+    draw_details(frame, details_area, detail);
+    draw_stats(frame, stats_area, detail);
     draw_plans_used(frame, plans_area, detail);
     draw_current(frame, current_area, detail);
 }
@@ -613,12 +609,36 @@ fn draw_detail_footer(frame: &mut Frame, area: Rect, app: &App, detail: &SeriesD
     crate::draw_split_status_footer(frame, area, Line::from(actions), nav, status.as_deref());
 }
 
-fn draw_summary(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
-    let kind = match detail.group {
-        SeriesGroup::Income => "income",
-        SeriesGroup::Expenses => "expense",
-        SeriesGroup::Envelopes => "envelope",
+/// Series metadata: the type, plus mode and period for envelopes. This is the authoritative
+/// place to read a series' mode/period, so toggling them (m/p) shows up here immediately.
+fn draw_details(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
+    let type_label = match detail.group {
+        SeriesGroup::Income => "Income",
+        SeriesGroup::Expenses => "Expense",
+        SeriesGroup::Envelopes => "Envelope",
     };
+    let mut lines = vec![stat_row("type", type_label.to_string())];
+    if detail.series.kind == Kind::Envelope {
+        // Envelope series always carry a concrete mode/period; None is unreachable here but
+        // falls back to the calculation defaults for safety.
+        let mode = match detail.series.mode {
+            Some(Mode::Manual) => "manual",
+            _ => "automatic",
+        };
+        let period = match detail.series.period_type {
+            Some(PeriodType::Daily) => "daily",
+            _ => "monthly",
+        };
+        lines.push(stat_row("mode", mode.to_string()));
+        lines.push(stat_row("period", period.to_string()));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(crate::titled_block(" Details ")),
+        area,
+    );
+}
+
+fn draw_stats(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
     let stats = &detail.stats;
     let delta = stats
         .avg_delta
@@ -628,13 +648,6 @@ fn draw_summary(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
     // A single aligned column: fixed-width labels, values starting at the same x. This reads
     // cleanly at any panel width and lines up regardless of amount magnitude.
     let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                format!(" {}", crate::truncate(&detail.series.label, 24)),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("  {kind}"), Style::default().fg(Color::DarkGray)),
-        ]),
         stat_row("latest", format_money_opt(stats.latest)),
         stat_row("avg", format_money_opt(stats.avg)),
         stat_row("min", format_money_opt(stats.min)),
@@ -644,7 +657,7 @@ fn draw_summary(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
     ];
 
     frame.render_widget(
-        Paragraph::new(lines).block(crate::titled_block(" Summary ")),
+        Paragraph::new(lines).block(crate::titled_block(" Stats ")),
         area,
     );
 }
@@ -958,17 +971,21 @@ fn month_name_from_number(month: &str) -> &str {
 }
 
 fn compact_money(value: Money) -> String {
+    let currency = leeway::currency::active();
     let sign = if value.cents() < 0 { "-" } else { "" };
-    let abs_cents = value.cents().unsigned_abs();
-    if abs_cents >= 100_000_000 {
-        format!("{sign}${:.1}m", abs_cents as f64 / 100_000_000.0)
-    } else if abs_cents >= 1_000_000 {
-        format!("{sign}${:.0}k", abs_cents as f64 / 100_000.0)
-    } else if abs_cents >= 100_000 {
-        format!("{sign}${:.1}k", abs_cents as f64 / 100_000.0)
+    // Work in whole major units (dollars/yen/...) so the k/m thresholds hold across
+    // currencies regardless of how many minor-unit digits they carry.
+    let major = value.cents().unsigned_abs() as f64 / currency.scale() as f64;
+    let body = if major >= 1_000_000.0 {
+        format!("{:.1}m", major / 1_000_000.0)
+    } else if major >= 10_000.0 {
+        format!("{:.0}k", major / 1_000.0)
+    } else if major >= 1_000.0 {
+        format!("{:.1}k", major / 1_000.0)
     } else {
-        format!("{sign}${}", abs_cents / 100)
-    }
+        format!("{}", major as u64)
+    };
+    currency.wrap(sign, &body)
 }
 
 fn format_money_opt(value: Option<Money>) -> String {

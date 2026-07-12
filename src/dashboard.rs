@@ -341,8 +341,8 @@ fn edit_account_carry(app: &mut App, view: &MonthView) {
         let help = match acct.account_type {
             AccountType::Checking => vec![
                 "Buffer is cash you want to keep parked in this account.".into(),
-                "It is subtracted from what's left, so a $500 buffer".into(),
-                "makes $500 unavailable to spend.".into(),
+                "It is subtracted from what's left, so the buffer amount".into(),
+                "you set is made unavailable to spend.".into(),
                 "Use it for minimum balance, cushion, or money you".into(),
                 "do not want counted.".into(),
             ],

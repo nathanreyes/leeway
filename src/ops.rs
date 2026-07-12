@@ -4,6 +4,7 @@
 //! operations run inside a transaction so a failure can't leave a half-stamped month.
 
 use crate::calc;
+use crate::currency::Currency;
 use crate::models::*;
 use crate::money::Money;
 use crate::queries;
@@ -17,6 +18,21 @@ use uuid::Uuid;
 /// future multi-device sync merge without primary-key collisions.
 fn new_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+/// Persist the app-wide display currency into the `setting` table (upsert). This is
+/// the first runtime writer of that table — `default_envelope_mode` is only ever
+/// seeded. Because the row lives in the database, the choice syncs with the budget.
+/// The caller is responsible for updating the in-process active currency
+/// (`currency::set_active`).
+pub fn set_currency(conn: &Connection, currency: Currency) -> Result<()> {
+    conn.execute(
+        "INSERT INTO setting (key, value) VALUES ('currency', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![currency.code],
+    )
+    .context("saving currency setting")?;
+    Ok(())
 }
 
 // --- Stamping (§5) -------------------------------------------------------------
@@ -1004,7 +1020,10 @@ pub fn seed_starter(conn: &mut Connection) -> Result<()> {
     }
 
     // Accounts. A checking account starting empty, and a fresh credit card with its full
-    // limit available (owed = 5000 − 5000 = 0).
+    // limit available (owed = 5000 − 5000 = 0). The card's placeholder limit is expressed
+    // in the active currency so a non-dollar budget seeds a sensible round number.
+    let currency = crate::currency::active();
+    let card_limit = Money::from_major(5000.0, currency);
     let checking = new_id();
     let card = new_id();
     conn.execute(
@@ -1013,7 +1032,7 @@ pub fn seed_starter(conn: &mut Connection) -> Result<()> {
             checking,
             "Checking",
             AccountType::Checking.as_str(),
-            Money::from_dollars(0.0)
+            Money::ZERO
         ],
     )?;
     conn.execute(
@@ -1023,8 +1042,8 @@ pub fn seed_starter(conn: &mut Connection) -> Result<()> {
             card,
             "Credit Card",
             AccountType::CreditCard.as_str(),
-            Money::from_dollars(5000.0),
-            Money::from_dollars(5000.0)
+            card_limit,
+            card_limit
         ],
     )?;
 
@@ -1080,7 +1099,57 @@ pub fn seed_starter(conn: &mut Connection) -> Result<()> {
 mod tests {
     use super::*;
     use crate::calc;
+    use crate::currency;
     use crate::db;
+
+    #[test]
+    fn currency_setting_round_trips_and_upserts() {
+        let conn = db::open_in_memory().unwrap();
+        // Fresh database: no currency chosen yet.
+        assert_eq!(queries::currency(&conn).unwrap(), None);
+
+        let eur = currency::by_code("EUR").unwrap();
+        set_currency(&conn, eur).unwrap();
+        assert_eq!(queries::currency(&conn).unwrap(), Some(eur));
+
+        // Changing it upserts in place rather than inserting a second row.
+        let jpy = currency::by_code("JPY").unwrap();
+        set_currency(&conn, jpy).unwrap();
+        assert_eq!(queries::currency(&conn).unwrap(), Some(jpy));
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM setting WHERE key='currency'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn unknown_currency_code_is_preserved_not_overwritten() {
+        use queries::CurrencySetting;
+        let conn = db::open_in_memory().unwrap();
+        // A newer app version stored a code this build doesn't recognize.
+        conn.execute(
+            "INSERT INTO setting (key, value) VALUES ('currency', 'XTS')",
+            [],
+        )
+        .unwrap();
+
+        // The three-state reader surfaces it as Unknown (not Unset), so startup knows
+        // not to clobber it — while the convenience getter still reports None.
+        assert_eq!(
+            queries::currency_setting(&conn).unwrap(),
+            CurrencySetting::Unknown("XTS".into())
+        );
+        assert_eq!(queries::currency(&conn).unwrap(), None);
+
+        // No row exists at all -> Unset, the only case safe to auto-populate.
+        let fresh = db::open_in_memory().unwrap();
+        assert_eq!(
+            queries::currency_setting(&fresh).unwrap(),
+            CurrencySetting::Unset
+        );
+    }
 
     #[test]
     fn stamp_copies_items_and_freezes_amounts() {

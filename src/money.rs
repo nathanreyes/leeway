@@ -7,6 +7,7 @@
 //!   2. Behavior in one place — formatting ("$1,234.56"), parsing, and rounding live
 //!      here, so the rest of the app never hand-rolls `/ 100.0`.
 
+use crate::currency::{self, Currency};
 use std::fmt;
 use std::ops::{Add, Sub};
 
@@ -28,11 +29,22 @@ impl Money {
     /// the signed-cent range prevents a valid input from overflowing when it is monthlyized.
     const MAX_INPUT_CENTS: u64 = i64::MAX as u64 / 31;
 
-    /// Build from a whole-and-fractional dollar figure, e.g. `Money::from_dollars(12.34)`.
-    /// Rounds to the nearest cent. Used when seeding demo data or accepting typed input.
+    /// Build from a whole-and-fractional figure at a fixed 2-decimal scale, e.g.
+    /// `Money::from_dollars(12.34) == Money(1234)`. Currency-neutral: it always uses
+    /// a ×100 scale, which is exactly what the test suite relies on when it compares
+    /// two `from_dollars` values. For currency-aware seeding of real data use
+    /// [`Money::from_major`] instead.
     pub fn from_dollars(dollars: f64) -> Money {
         // `.round()` gives banker-free nearest rounding; `as i64` truncates the now-integral float.
         Money((dollars * 100.0).round() as i64)
+    }
+
+    /// Build from a whole-and-fractional figure in `currency`'s major units,
+    /// scaling by its minor-unit count: `from_major(50.0, JPY) == Money(50)`,
+    /// `from_major(50.0, USD) == Money(5000)`, `from_major(50.0, BHD) == Money(50000)`.
+    /// Used to seed starter data in the active currency.
+    pub fn from_major(major: f64, currency: Currency) -> Money {
+        Money((major * currency.scale() as f64).round() as i64)
     }
 
     /// The raw cents. Named method (rather than `.0` everywhere) reads better at call sites.
@@ -40,16 +52,27 @@ impl Money {
         self.0
     }
 
-    /// Parse user-typed dollars into `Money`, tolerating `$` and thousands commas:
-    /// "70", "$1,234.56", "-12.5" all work. Returns `None` on anything unparseable, so
-    /// the UI can reject bad input instead of silently storing garbage.
+    /// Parse user-typed input in the **active** currency. Convenience wrapper over
+    /// [`Money::parse_in`]; keeps the historic name that call sites and tests use.
     pub fn parse_dollars(input: &str) -> Option<Money> {
-        // Strip the characters humans add for readability, then parse the decimal text
-        // directly. Going through f64 would accept NaN/scientific overflow and can lose a
-        // cent before we ever store the value as an integer.
-        let cleaned: String = input
+        Self::parse_in(input, currency::active())
+    }
+
+    /// Parse user-typed input in a given `currency`, tolerating its symbol and
+    /// grouping separator: for USD "70", "$1,234.56", "-12.5" all work; for EUR
+    /// "1.234,56 €"; for JPY "1,234" (no decimals). Returns `None` on anything
+    /// unparseable, so the UI can reject bad input instead of storing garbage.
+    pub fn parse_in(input: &str, currency: Currency) -> Option<Money> {
+        // Strip the symbol and the whitespace humans add for readability, then parse
+        // the decimal text directly. Going through f64 would accept NaN/scientific
+        // overflow and can lose a minor unit before we store the value as an integer.
+        // Grouping separators are *validated* rather than blindly stripped (see
+        // `ungroup`), so malformed grouping — e.g. EUR "12.34", where '.' is the
+        // grouping separator — is rejected instead of being silently read as 1234.
+        let without_symbol = input.replace(currency.symbol, "");
+        let cleaned: String = without_symbol
             .chars()
-            .filter(|c| *c != '$' && *c != ',' && !c.is_whitespace())
+            .filter(|c| !c.is_whitespace())
             .collect();
         if cleaned.is_empty() {
             return None;
@@ -60,42 +83,44 @@ impl Money {
             Some(b'+') => (false, &cleaned[1..]),
             _ => (false, cleaned.as_str()),
         };
-        let mut parts = unsigned.split('.');
+        let mut parts = unsigned.split(currency.decimal_sep);
         let whole = parts.next()?;
         let fraction = parts.next();
-        if parts.next().is_some()
-            || (whole.is_empty() && fraction.is_none())
-            || !whole.chars().all(|c| c.is_ascii_digit())
-        {
+        if parts.next().is_some() || (whole.is_empty() && fraction.is_none()) {
             return None;
         }
+        // Grouping separators are only meaningful in the whole part; the fraction is
+        // validated to be bare digits below, which already rejects a stray separator.
+        let whole = ungroup(whole, currency.group_sep)?;
 
-        let whole_cents = if whole.is_empty() {
+        let scale = currency.scale() as u64;
+        let whole_minor = if whole.is_empty() {
             0
         } else {
-            whole.parse::<u64>().ok()?.checked_mul(100)?
+            whole.parse::<u64>().ok()?.checked_mul(scale)?
         };
-        let fractional_cents = match fraction {
+        // Accept up to `minor_units` fractional digits, scaling a short fraction up
+        // to the full minor-unit width (USD "5" -> 50 cents). Zero-decimal currencies
+        // (JPY) accept no fractional part at all.
+        let minor_units = currency.minor_units as usize;
+        let fractional_minor = match fraction {
             None | Some("") => 0,
-            Some(digits) if digits.len() == 1 && digits.chars().all(|c| c.is_ascii_digit()) => {
-                digits.parse::<u64>().ok()? * 10
-            }
-            Some(digits) if digits.len() == 2 && digits.chars().all(|c| c.is_ascii_digit()) => {
-                digits.parse::<u64>().ok()?
+            Some(digits)
+                if digits.len() <= minor_units
+                    && !digits.is_empty()
+                    && digits.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                digits.parse::<u64>().ok()? * 10u64.pow((minor_units - digits.len()) as u32)
             }
             Some(_) => return None,
         };
-        let cents = whole_cents.checked_add(fractional_cents)?;
-        if cents > Self::MAX_INPUT_CENTS {
+        let minor = whole_minor.checked_add(fractional_minor)?;
+        if minor > Self::MAX_INPUT_CENTS {
             return None;
         }
 
-        let cents = i64::try_from(cents).ok()?;
-        Some(if negative {
-            Money(-cents)
-        } else {
-            Money(cents)
-        })
+        let minor = i64::try_from(minor).ok()?;
+        Some(if negative { Money(-minor) } else { Money(minor) })
     }
 
     /// Scale by a fraction in [0.0, 1.0] and round to the nearest cent.
@@ -139,39 +164,85 @@ impl std::iter::Sum for Money {
 
 // --- Display -------------------------------------------------------------------
 // Implementing `Display` is what makes `format!("{}", money)` and `.to_string()`
-// produce "$1,234.56". This is the single place dollars-and-cents formatting lives.
+// produce "$1,234.56". This is the single place amount formatting lives; it reads
+// the app-wide active currency so the ~20 UI sites that print `Money` all localize
+// at once.
 
-impl fmt::Display for Money {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let negative = self.0 < 0;
+impl Money {
+    /// Format this amount in a given `currency`. `Display` calls this with the
+    /// active currency; tests call it with an explicit one so they never touch the
+    /// shared global.
+    pub fn format_in(self, currency: Currency) -> String {
+        let sign = if self.0 < 0 { "-" } else { "" };
         let abs = self.0.unsigned_abs();
-        let dollars = abs / 100;
-        let cents = abs % 100;
+        let scale = currency.scale() as u64;
+        let major = abs / scale;
+        let minor = abs % scale;
 
-        // Group the dollar part with thousands separators: 1234567 -> "1,234,567".
-        let dollar_str = group_thousands(dollars);
+        // Group the whole part with the currency's separator: 1234567 -> "1,234,567".
+        let major_str = group_digits(major, currency.group_sep);
 
-        // `{:02}` zero-pads cents to two digits (so 5 cents prints as "05").
-        write!(
-            f,
-            "{}${}.{:02}",
-            if negative { "-" } else { "" },
-            dollar_str,
-            cents
-        )
+        // Zero-decimal currencies (JPY) print no fractional part at all.
+        let body = if currency.minor_units == 0 {
+            major_str
+        } else {
+            format!(
+                "{major_str}{}{minor:0width$}",
+                currency.decimal_sep,
+                width = currency.minor_units as usize
+            )
+        };
+        currency.wrap(sign, &body)
     }
 }
 
-/// Insert commas every three digits from the right. Kept private to this module.
-fn group_thousands(n: u64) -> String {
+impl fmt::Display for Money {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.format_in(currency::active()))
+    }
+}
+
+/// Validate an integer string's grouping and return it with any separators removed.
+/// A separator-free run of digits is always accepted — users needn't type grouping —
+/// but when the `sep` is present it must delimit a valid pattern (a 1-3 digit lead
+/// group, then groups of exactly three), mirroring what [`group_digits`] emits. This
+/// rejects malformed grouping like EUR "12.34" (a 2-digit trailing group) instead of
+/// silently reinterpreting it. An empty string is accepted (a leading-decimal input
+/// like ".5"). Kept private to this module.
+fn ungroup(whole: &str, sep: char) -> Option<String> {
+    if sep != '\0' && whole.contains(sep) {
+        let mut segments = whole.split(sep);
+        let lead = segments.next()?;
+        if lead.is_empty() || lead.len() > 3 || !lead.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        for seg in segments {
+            if seg.len() != 3 || !seg.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+        }
+        Some(whole.chars().filter(|c| *c != sep).collect())
+    } else if whole.bytes().all(|b| b.is_ascii_digit()) {
+        Some(whole.to_string())
+    } else {
+        None
+    }
+}
+
+/// Insert `sep` every three digits from the right: 1234567 -> "1,234,567". A `'\0'`
+/// separator disables grouping. Kept private to this module.
+fn group_digits(n: u64, sep: char) -> String {
     let digits = n.to_string();
+    if sep == '\0' {
+        return digits;
+    }
     let mut out = String::new();
-    // Count from the left, inserting a comma before every group of three that
+    // Count from the left, inserting a separator before every group of three that
     // remains on the right.
     let len = digits.len();
     for (i, ch) in digits.chars().enumerate() {
         if i > 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
+            out.push(sep);
         }
         out.push(ch);
     }
@@ -234,5 +305,87 @@ mod tests {
         // $2,000 at 17/30 of the month -> ~$1,133.33
         let consumed = Money::from_dollars(2000.0).scale(17.0 / 30.0);
         assert_eq!(consumed.to_string(), "$1,133.33");
+    }
+
+    // --- Multi-currency formatting/parsing --------------------------------------
+    // These exercise `format_in`/`parse_in` with explicit currencies, so they never
+    // mutate the shared active-currency global and stay order-independent.
+
+    fn cur(code: &str) -> Currency {
+        currency::by_code(code).unwrap()
+    }
+
+    #[test]
+    fn formats_zero_decimal_currency() {
+        // JPY: no fractional part; the stored integer IS the whole amount.
+        let jpy = cur("JPY");
+        assert_eq!(Money(1234).format_in(jpy), "¥1,234");
+        assert_eq!(Money(0).format_in(jpy), "¥0");
+        assert_eq!(Money(-50).format_in(jpy), "-¥50");
+    }
+
+    #[test]
+    fn formats_three_decimal_currency() {
+        // BHD: three fractional digits, symbol "BD".
+        let bhd = cur("BHD");
+        assert_eq!(Money(1234).format_in(bhd), "BD1.234");
+        assert_eq!(Money(5).format_in(bhd), "BD0.005");
+        assert_eq!(Money(1_234_567).format_in(bhd), "BD1,234.567");
+    }
+
+    #[test]
+    fn formats_suffix_currency_with_swapped_separators() {
+        // EUR: symbol after the number, '.' grouping and ',' decimal.
+        let eur = cur("EUR");
+        assert_eq!(Money(123456).format_in(eur), "1.234,56\u{00a0}€");
+        assert_eq!(Money(-500).format_in(eur), "-5,00\u{00a0}€");
+    }
+
+    #[test]
+    fn parses_in_each_currency() {
+        assert_eq!(Money::parse_in("1234", cur("JPY")), Some(Money(1234)));
+        assert_eq!(Money::parse_in("¥1,234", cur("JPY")), Some(Money(1234)));
+        // Zero-decimal currencies reject a fractional part.
+        assert_eq!(Money::parse_in("12.5", cur("JPY")), None);
+
+        assert_eq!(Money::parse_in("1.234", cur("BHD")), Some(Money(1234)));
+        assert_eq!(Money::parse_in("BD0.005", cur("BHD")), Some(Money(5)));
+
+        assert_eq!(Money::parse_in("1.234,56\u{00a0}€", cur("EUR")), Some(Money(123456)));
+        assert_eq!(Money::parse_in("-5,00 €", cur("EUR")), Some(Money(-500)));
+    }
+
+    #[test]
+    fn rejects_malformed_grouping() {
+        // In EUR '.' groups and ',' is the decimal. "12.34" looks like a USD decimal
+        // but is malformed EUR grouping (a 2-digit trailing group), so it must be
+        // rejected rather than silently read as 1.234,00.
+        assert_eq!(Money::parse_in("12.34", cur("EUR")), None);
+        // Bad groupings in any locale: wrong-width or empty trailing groups.
+        assert_eq!(Money::parse_in("1,2345", cur("USD")), None);
+        assert_eq!(Money::parse_in("1,23,456", cur("USD")), None);
+        assert_eq!(Money::parse_in("1,", cur("USD")), None);
+        assert_eq!(Money::parse_in("1.23.456,78", cur("EUR")), None);
+        // Well-formed grouping still parses, and bare (ungrouped) digits always do.
+        assert_eq!(Money::parse_in("1,234,567.89", cur("USD")), Some(Money(123456789)));
+        assert_eq!(Money::parse_in("1234567", cur("USD")), Some(Money(123456700)));
+    }
+
+    #[test]
+    fn format_then_parse_round_trips() {
+        for code in ["USD", "EUR", "JPY", "BHD", "GBP", "CHF"] {
+            let c = cur(code);
+            for m in [Money(0), Money(5), Money(1234), Money(-1_234_567), Money(999)] {
+                let printed = m.format_in(c);
+                assert_eq!(Money::parse_in(&printed, c), Some(m), "{code}: {printed}");
+            }
+        }
+    }
+
+    #[test]
+    fn from_major_scales_by_minor_units() {
+        assert_eq!(Money::from_major(50.0, cur("JPY")), Money(50));
+        assert_eq!(Money::from_major(50.0, currency::USD), Money(5000));
+        assert_eq!(Money::from_major(50.0, cur("BHD")), Money(50000));
     }
 }

@@ -154,6 +154,7 @@ pub enum Modal {
     SeriesSearch(SeriesSearch),
     Confirm(Confirm),
     Choice(Choice),
+    CurrencyPicker(CurrencyPicker),
     /// Contextual help for the focused box. Opened with `h` on any screen; see `help`.
     Help(help::HelpState),
 }
@@ -333,6 +334,12 @@ pub struct ChoiceOption {
     pub key: char,
     pub label: String,
     pub action: Option<ModalAction>,
+}
+
+/// A scrollable chooser for the app-wide display currency. `selected` indexes into
+/// `currency::CURRENCIES`; on confirm we persist the choice and set it active.
+pub struct CurrencyPicker {
+    pub selected: usize,
 }
 
 /// The deferred effect a chosen option runs. Carries the ids it needs so the action is
@@ -690,6 +697,16 @@ impl App {
         }));
     }
 
+    /// Open the currency chooser, pre-selecting the currency that's currently active.
+    fn open_currency_picker(&mut self) {
+        let active = leeway::currency::active();
+        let selected = leeway::currency::CURRENCIES
+            .iter()
+            .position(|c| c.code == active.code)
+            .unwrap_or(0);
+        self.modal = Some(Modal::CurrencyPicker(CurrencyPicker { selected }));
+    }
+
     /// Open contextual help for whatever box is currently focused. Resolves the
     /// topic and sibling ring from the current screen and focus (see `help`).
     fn open_help(&mut self) {
@@ -708,6 +725,24 @@ fn main() -> Result<()> {
         .then_some(legacy_path)
         .filter(|path| path != &paths.database);
     let mut conn = db::open(&paths.database)?;
+    // Resolve the app-wide currency before anything reads or seeds money. A budget that
+    // already chose one (its own, or one adopted via sync) carries it in the `setting`
+    // table; a brand-new budget has no row yet, so we detect from the OS locale and
+    // persist that choice. Setting it here means starter seeding lands in the right
+    // currency and the first frame renders localized.
+    let currency = match queries::currency_setting(&conn)? {
+        queries::CurrencySetting::Known(chosen) => chosen,
+        queries::CurrencySetting::Unset => {
+            let detected = leeway::currency::detect_from_locale();
+            ops::set_currency(&conn, detected)?;
+            detected
+        }
+        // A newer app version stored a currency this build doesn't recognize. Leave the
+        // row untouched — overwriting it would destroy the user's choice on downgrade —
+        // and just pick a locale default for this session's display.
+        queries::CurrencySetting::Unknown(_) => leeway::currency::detect_from_locale(),
+    };
+    leeway::currency::set_active(currency);
     // On a fresh database this stamps the current calendar month, satisfying "if no month
     // exists, create one" for a first-ever launch.
     ops::seed_starter(&mut conn)?;
@@ -1174,6 +1209,7 @@ fn handle_storage_sync_key(app: &mut App, key: KeyEvent, origin: SeriesOrigin) -
                 );
             }
         }
+        KeyCode::Char('c') => app.open_currency_picker(),
         _ => {}
     }
     Ok(())
@@ -1215,6 +1251,12 @@ fn draw_storage_sync(frame: &mut Frame, app: &App) {
         lines.push(storage_detail_line(
             "Device",
             &runtime.device.label,
+            Color::White,
+        ));
+        let currency = leeway::currency::active();
+        lines.push(storage_detail_line(
+            "Currency",
+            format!("{} ({})", currency.code, currency.symbol),
             Color::White,
         ));
         lines.push(storage_detail_line(
@@ -1281,6 +1323,11 @@ fn draw_storage_sync(frame: &mut Frame, app: &App) {
             Span::raw(" disable"),
         ]),
     }
+    actions.extend([
+        Span::raw("  "),
+        modal_key(" c "),
+        Span::raw(" currency"),
+    ]);
     if app
         .sync
         .as_ref()
@@ -1547,9 +1594,43 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
         Some(Modal::SeriesSearch(_)) => handle_series_search_key(app, key),
         Some(Modal::Confirm(_)) => handle_confirm_key(app, key),
         Some(Modal::Choice(_)) => handle_choice_key(app, key),
+        Some(Modal::CurrencyPicker(_)) => handle_currency_picker_key(app, key),
         Some(Modal::Help(_)) => handle_help_key(app, key),
         None => Ok(()),
     }
+}
+
+/// Keys while the currency chooser is open: ↑/↓ (or j/k) move, Enter selects and
+/// persists, Esc cancels. Selecting writes the choice to the `setting` table (so it
+/// syncs) and updates the active currency, which every amount reads on the next frame.
+fn handle_currency_picker_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let count = leeway::currency::CURRENCIES.len();
+    match key.code {
+        KeyCode::Esc => app.modal = None,
+        KeyCode::Enter => {
+            if let Some(Modal::CurrencyPicker(picker)) = &app.modal {
+                let chosen = leeway::currency::CURRENCIES[picker.selected.min(count - 1)];
+                ops::set_currency(&app.conn, chosen)?;
+                leeway::currency::set_active(chosen);
+                app.modal = None;
+                app.status = Some(format!("Currency set to {} ({})", chosen.code, chosen.symbol));
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let Some(Modal::CurrencyPicker(picker)) = &mut app.modal
+                && picker.selected + 1 < count
+            {
+                picker.selected += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let Some(Modal::CurrencyPicker(picker)) = &mut app.modal {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Keys while the help overlay is open. `h`/`Esc`/`q` close it; `Tab`/`o` navigate
@@ -2691,6 +2772,7 @@ fn draw_modal(frame: &mut Frame, _app: &App) {
             frame.render_widget(Paragraph::new(body).block(block), area);
         }
         Modal::SeriesSearch(prompt) => draw_series_search_modal(frame, prompt),
+        Modal::CurrencyPicker(picker) => draw_currency_picker(frame, picker),
         Modal::Confirm(confirm) => {
             let area = centered_rect(60, 20, frame.area());
             frame.render_widget(Clear, area);
@@ -3101,6 +3183,61 @@ fn draw_series_search_modal(frame: &mut Frame, prompt: &SeriesSearch) {
     frame.render_widget(Paragraph::new(body).block(block), area);
 }
 
+/// The currency chooser: a scrollable list of `currency::CURRENCIES`, each shown with
+/// its code and a sample amount formatted in that currency so the effect is visible
+/// before choosing. Mirrors the series-search modal's selection styling.
+fn draw_currency_picker(frame: &mut Frame, picker: &CurrencyPicker) {
+    let area = centered_rect(60, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block =
+        titled_block(" Select currency ").border_style(Style::default().fg(theme::CYAN));
+
+    let currencies = leeway::currency::CURRENCIES;
+    let selected = picker.selected.min(currencies.len().saturating_sub(1));
+    // Keep the selection in view by scrolling a fixed-height window.
+    let window = 9;
+    let start = selected.saturating_sub(window - 1);
+
+    let mut body = vec![Line::raw("")];
+    if start > 0 {
+        body.push(Line::from(Span::styled(
+            format!("   {start} more above"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for (idx, currency) in currencies.iter().enumerate().skip(start).take(window) {
+        let is_selected = idx == selected;
+        let marker = if is_selected { "▌" } else { " " };
+        let style = if is_selected {
+            selection_style()
+        } else {
+            Style::default()
+        };
+        // A representative amount so the symbol/separator/decimals are all visible.
+        let sample = Money(1_234_567).format_in(*currency);
+        body.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme::CYAN)),
+            Span::styled(format!(" {:<4} {}", currency.code, sample), style),
+        ]));
+    }
+    let remaining = currencies.len().saturating_sub(start + window);
+    if remaining > 0 {
+        body.push(Line::from(Span::styled(
+            format!("   {remaining} more"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    body.push(Line::raw(""));
+    body.push(Line::from(Span::styled(
+        " Enter to select · ↑/↓ to choose · Esc to cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(body).block(block), area);
+}
+
 /// Compute a centered rectangle `percent_x` × `percent_y` of `area`. `Flex::Center` does
 /// the centering along each axis.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -3172,9 +3309,25 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Format a `Money` as an editable plain number ("1500.00") to prefill the amount prompt.
+/// Format a `Money` as an editable plain number ("1500.00") to prefill the amount
+/// prompt: no symbol or grouping (so it round-trips through `Money::parse_dollars`),
+/// but honoring the active currency's minor-unit digits and decimal separator.
 pub(crate) fn amount_edit_string(m: Money) -> String {
-    format!("{:.2}", m.cents() as f64 / 100.0)
+    let currency = leeway::currency::active();
+    let sign = if m.cents() < 0 { "-" } else { "" };
+    let abs = m.cents().unsigned_abs() as i64;
+    let scale = currency.scale();
+    let major = abs / scale;
+    let minor = abs % scale;
+    if currency.minor_units == 0 {
+        format!("{sign}{major}")
+    } else {
+        format!(
+            "{sign}{major}{}{minor:0width$}",
+            currency.decimal_sep,
+            width = currency.minor_units as usize
+        )
+    }
 }
 
 #[cfg(test)]
@@ -3403,8 +3556,8 @@ mod tests {
             .draw(|frame| series::draw_detail_screen(frame, &app, &view, detail))
             .unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("Dining - envelope series"));
-        assert!(text.contains("Summary"));
+        assert!(text.contains("Dining - Last 12 stamped months"));
+        assert!(text.contains("Stats"));
         assert!(text.contains("all series"));
 
         series::handle_detail_key(&mut app, key(KeyCode::Char('m')), detail, today).unwrap();
@@ -3692,6 +3845,23 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(32, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw_storage_sync(frame, &app)).unwrap();
+    }
+
+    #[test]
+    fn currency_picker_lists_currencies_with_samples() {
+        // Render-only: opening + drawing the picker reads the active currency but
+        // never mutates the shared global, so this stays safe under parallel tests.
+        let mut app = app_with_sync_screen();
+        app.open_currency_picker();
+        let backend = ratatui::backend::TestBackend::new(80, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Select currency"));
+        assert!(text.contains("USD"));
+        assert!(text.contains("EUR"));
+        // The sample amount is rendered in each currency (EUR uses a trailing symbol).
+        assert!(text.contains("€"));
     }
 
     // --- Contextual help -------------------------------------------------------
