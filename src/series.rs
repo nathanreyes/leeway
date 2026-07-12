@@ -9,12 +9,12 @@ use leeway::view::{
     SeriesDetailView, SeriesGroup, SeriesPageView, SeriesTimeRange, SeriesTrendPoint,
 };
 use leeway::{ops, queries};
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Bar, BarChart, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
 enum SidebarRow {
     Header(SeriesGroup),
@@ -316,7 +316,7 @@ pub fn draw(frame: &mut Frame, app: &App, view: &SeriesPageView) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(frame.area());
 
@@ -334,7 +334,7 @@ pub fn draw_detail_screen(
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(frame.area());
 
@@ -601,12 +601,12 @@ fn draw_detail_footer(frame: &mut Frame, area: Rect, app: &App, detail: &SeriesD
         key(" Esc "),
         Span::raw(" back  "),
         key(" , "),
-        Span::raw(" sync  "),
+        Span::raw(" settings  "),
         key(" q "),
         Span::raw(" quit"),
     ]);
     let status = crate::footer_status(app);
-    crate::draw_split_status_footer(frame, area, Line::from(actions), nav, status.as_deref());
+    crate::draw_screen_footer(frame, area, Line::from(actions), nav, status.as_deref());
 }
 
 /// Series metadata: the type, plus mode and period for envelopes. This is the authoritative
@@ -819,12 +819,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
         key(" Esc "),
         Span::raw(" back  "),
         key(" , "),
-        Span::raw(" sync  "),
+        Span::raw(" settings  "),
         key(" q "),
         Span::raw(" quit"),
     ]);
     let status = crate::footer_status(app);
-    crate::draw_split_status_footer(frame, area, left, right, status.as_deref());
+    crate::draw_screen_footer(frame, area, left, right, status.as_deref());
 }
 
 fn key(label: &str) -> Span<'static> {

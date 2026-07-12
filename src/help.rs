@@ -121,7 +121,7 @@ pub fn topic_for(app: &App) -> HelpTopic {
         },
         Screen::Series { .. } => HelpTopic::Series,
         Screen::Plans => HelpTopic::PlansList,
-        Screen::StorageSync { .. } => HelpTopic::Overview,
+        Screen::Settings { .. } => HelpTopic::Overview,
     }
 }
 
@@ -155,7 +155,7 @@ pub fn screen_ring(app: &App) -> Vec<HelpTopic> {
         ],
         Screen::Series { .. } => vec![HelpTopic::Series],
         Screen::Plans => vec![HelpTopic::PlansList],
-        Screen::StorageSync { .. } => vec![HelpTopic::Overview],
+        Screen::Settings { .. } => vec![HelpTopic::Overview],
     }
 }
 
@@ -415,9 +415,13 @@ mod tests {
         assert_eq!(content.title, "Envelopes");
 
         // Order: intro Para, "Example" Heading, Example block, "Keys" Heading, Keys.
-        assert!(matches!(&content.sections[0], HelpSection::Para(p) if p == "Intro line one and line two."));
+        assert!(
+            matches!(&content.sections[0], HelpSection::Para(p) if p == "Intro line one and line two.")
+        );
         assert!(matches!(&content.sections[1], HelpSection::Heading(h) if h == "Example"));
-        assert!(matches!(&content.sections[2], HelpSection::Example(rows) if rows == &["Groceries 600"]));
+        assert!(
+            matches!(&content.sections[2], HelpSection::Example(rows) if rows == &["Groceries 600"])
+        );
         assert!(matches!(&content.sections[3], HelpSection::Heading(h) if h == "Keys"));
         match &content.sections[4] {
             HelpSection::Keys(rows) => {

@@ -75,16 +75,86 @@ pub const USD: Currency = Currency {
 /// placement conventions are explicit and reviewable.
 pub const CURRENCIES: &[Currency] = &[
     USD,
-    Currency { code: "EUR", symbol: "€", minor_units: 2, decimal_sep: ',', group_sep: '.', symbol_prefix: false },
-    Currency { code: "GBP", symbol: "£", minor_units: 2, decimal_sep: '.', group_sep: ',', symbol_prefix: true },
-    Currency { code: "JPY", symbol: "¥", minor_units: 0, decimal_sep: '.', group_sep: ',', symbol_prefix: true },
-    Currency { code: "CNY", symbol: "¥", minor_units: 2, decimal_sep: '.', group_sep: ',', symbol_prefix: true },
-    Currency { code: "INR", symbol: "₹", minor_units: 2, decimal_sep: '.', group_sep: ',', symbol_prefix: true },
-    Currency { code: "CHF", symbol: "CHF", minor_units: 2, decimal_sep: '.', group_sep: '\'', symbol_prefix: true },
-    Currency { code: "CAD", symbol: "$", minor_units: 2, decimal_sep: '.', group_sep: ',', symbol_prefix: true },
-    Currency { code: "AUD", symbol: "$", minor_units: 2, decimal_sep: '.', group_sep: ',', symbol_prefix: true },
-    Currency { code: "BHD", symbol: "BD", minor_units: 3, decimal_sep: '.', group_sep: ',', symbol_prefix: true },
-    Currency { code: "KWD", symbol: "KD", minor_units: 3, decimal_sep: '.', group_sep: ',', symbol_prefix: true },
+    Currency {
+        code: "EUR",
+        symbol: "€",
+        minor_units: 2,
+        decimal_sep: ',',
+        group_sep: '.',
+        symbol_prefix: false,
+    },
+    Currency {
+        code: "GBP",
+        symbol: "£",
+        minor_units: 2,
+        decimal_sep: '.',
+        group_sep: ',',
+        symbol_prefix: true,
+    },
+    Currency {
+        code: "JPY",
+        symbol: "¥",
+        minor_units: 0,
+        decimal_sep: '.',
+        group_sep: ',',
+        symbol_prefix: true,
+    },
+    Currency {
+        code: "CNY",
+        symbol: "¥",
+        minor_units: 2,
+        decimal_sep: '.',
+        group_sep: ',',
+        symbol_prefix: true,
+    },
+    Currency {
+        code: "INR",
+        symbol: "₹",
+        minor_units: 2,
+        decimal_sep: '.',
+        group_sep: ',',
+        symbol_prefix: true,
+    },
+    Currency {
+        code: "CHF",
+        symbol: "CHF",
+        minor_units: 2,
+        decimal_sep: '.',
+        group_sep: '\'',
+        symbol_prefix: true,
+    },
+    Currency {
+        code: "CAD",
+        symbol: "$",
+        minor_units: 2,
+        decimal_sep: '.',
+        group_sep: ',',
+        symbol_prefix: true,
+    },
+    Currency {
+        code: "AUD",
+        symbol: "$",
+        minor_units: 2,
+        decimal_sep: '.',
+        group_sep: ',',
+        symbol_prefix: true,
+    },
+    Currency {
+        code: "BHD",
+        symbol: "BD",
+        minor_units: 3,
+        decimal_sep: '.',
+        group_sep: ',',
+        symbol_prefix: true,
+    },
+    Currency {
+        code: "KWD",
+        symbol: "KD",
+        minor_units: 3,
+        decimal_sep: '.',
+        group_sep: ',',
+        symbol_prefix: true,
+    },
 ];
 
 /// Look up a currency by its ISO code. Returns `None` for codes not in the table.
@@ -124,10 +194,7 @@ pub fn detect_from_locale() -> Currency {
 /// language, e.g. "US" from "en-US", "en_US.UTF-8", or "en-Latn-US".
 fn region_of(locale: &str) -> Option<String> {
     // Drop any POSIX charset/modifier suffix (".UTF-8", "@euro").
-    let base = locale
-        .split(['.', '@'])
-        .next()
-        .unwrap_or(locale);
+    let base = locale.split(['.', '@']).next().unwrap_or(locale);
     // Split language[-script]-REGION on '-' or '_' and take the first 2-letter,
     // uppercased subtag after the first component.
     base.split(['-', '_'])
@@ -151,8 +218,8 @@ fn currency_for_region(region: String) -> Option<Currency> {
         "BH" => "BHD",
         "KW" => "KWD",
         // Euro-area members we can reasonably default to EUR.
-        "IE" | "DE" | "FR" | "ES" | "IT" | "NL" | "AT" | "BE" | "PT" | "FI" | "GR"
-        | "SK" | "SI" | "LT" | "LV" | "EE" | "LU" | "CY" | "MT" => "EUR",
+        "IE" | "DE" | "FR" | "ES" | "IT" | "NL" | "AT" | "BE" | "PT" | "FI" | "GR" | "SK"
+        | "SI" | "LT" | "LV" | "EE" | "LU" | "CY" | "MT" => "EUR",
         _ => return None,
     };
     by_code(code)

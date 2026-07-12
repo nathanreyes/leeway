@@ -120,7 +120,11 @@ impl Money {
         }
 
         let minor = i64::try_from(minor).ok()?;
-        Some(if negative { Money(-minor) } else { Money(minor) })
+        Some(if negative {
+            Money(-minor)
+        } else {
+            Money(minor)
+        })
     }
 
     /// Scale by a fraction in [0.0, 1.0] and round to the nearest cent.
@@ -351,7 +355,10 @@ mod tests {
         assert_eq!(Money::parse_in("1.234", cur("BHD")), Some(Money(1234)));
         assert_eq!(Money::parse_in("BD0.005", cur("BHD")), Some(Money(5)));
 
-        assert_eq!(Money::parse_in("1.234,56\u{00a0}€", cur("EUR")), Some(Money(123456)));
+        assert_eq!(
+            Money::parse_in("1.234,56\u{00a0}€", cur("EUR")),
+            Some(Money(123456))
+        );
         assert_eq!(Money::parse_in("-5,00 €", cur("EUR")), Some(Money(-500)));
     }
 
@@ -367,15 +374,27 @@ mod tests {
         assert_eq!(Money::parse_in("1,", cur("USD")), None);
         assert_eq!(Money::parse_in("1.23.456,78", cur("EUR")), None);
         // Well-formed grouping still parses, and bare (ungrouped) digits always do.
-        assert_eq!(Money::parse_in("1,234,567.89", cur("USD")), Some(Money(123456789)));
-        assert_eq!(Money::parse_in("1234567", cur("USD")), Some(Money(123456700)));
+        assert_eq!(
+            Money::parse_in("1,234,567.89", cur("USD")),
+            Some(Money(123456789))
+        );
+        assert_eq!(
+            Money::parse_in("1234567", cur("USD")),
+            Some(Money(123456700))
+        );
     }
 
     #[test]
     fn format_then_parse_round_trips() {
         for code in ["USD", "EUR", "JPY", "BHD", "GBP", "CHF"] {
             let c = cur(code);
-            for m in [Money(0), Money(5), Money(1234), Money(-1_234_567), Money(999)] {
+            for m in [
+                Money(0),
+                Money(5),
+                Money(1234),
+                Money(-1_234_567),
+                Money(999),
+            ] {
                 let printed = m.format_in(c);
                 assert_eq!(Money::parse_in(&printed, c), Some(m), "{code}: {printed}");
             }

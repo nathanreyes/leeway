@@ -92,7 +92,7 @@ pub fn draw_list(frame: &mut Frame, app: &App, summaries: &[PlanSummary]) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(frame.area());
 
@@ -150,12 +150,12 @@ pub fn draw_list(frame: &mut Frame, app: &App, summaries: &[PlanSummary]) {
         key(" Esc "),
         Span::raw(" back  "),
         key(" , "),
-        Span::raw(" sync  "),
+        Span::raw(" settings  "),
         key(" q "),
         Span::raw(" quit"),
     ]);
     let status = crate::footer_status(app);
-    crate::draw_split_status_footer(frame, footer, hints, nav_hints, status.as_deref());
+    crate::draw_screen_footer(frame, footer, hints, nav_hints, status.as_deref());
 }
 
 // --- Plan editor ---------------------------------------------------------------
@@ -309,7 +309,7 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(frame.area());
 
@@ -365,12 +365,12 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
         key(" Esc "),
         Span::raw(" back  "),
         key(" , "),
-        Span::raw(" sync  "),
+        Span::raw(" settings  "),
         key(" q "),
         Span::raw(" quit"),
     ]);
     let status = crate::footer_status(app);
-    crate::draw_split_status_footer(frame, footer, hints, nav_hints, status.as_deref());
+    crate::draw_screen_footer(frame, footer, hints, nav_hints, status.as_deref());
 }
 
 /// Render the reusable plan's cash-flow scenario without any live account terms.
@@ -579,6 +579,7 @@ mod tests {
             editor_income_sel: 0,
             editor_expense_sel: 0,
             editor_env_sel: 0,
+            settings_general_sel: 0,
             pending_select: None,
             pending_dash_txn: None,
             pending_dash_env: None,

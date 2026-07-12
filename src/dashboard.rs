@@ -532,7 +532,7 @@ pub fn draw(frame: &mut Frame, app: &App, view: &Option<MonthView>) {
     let [header, middle, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(frame.area());
 
@@ -685,12 +685,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
         key(" S "),
         Span::raw(" series  "),
         key(" , "),
-        Span::raw(" sync  "),
+        Span::raw(" settings  "),
         key(" q "),
         Span::raw(" quit"),
     ]);
     let status = crate::footer_status(app);
-    crate::draw_split_status_footer(frame, area, left_hints, nav_hints, status.as_deref());
+    crate::draw_screen_footer(frame, area, left_hints, nav_hints, status.as_deref());
 }
 
 /// The accounts panel. Full-width rows keep the current balance/owed amount near the
@@ -1206,6 +1206,7 @@ mod tests {
             editor_income_sel: 0,
             editor_expense_sel: 0,
             editor_env_sel: 0,
+            settings_general_sel: 0,
             pending_select: None,
             pending_dash_txn: None,
             pending_dash_env: None,

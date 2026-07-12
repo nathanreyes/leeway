@@ -21,15 +21,15 @@ mod theme;
 
 use anim::SummaryAnimations;
 use anyhow::{Context, Result};
+use chrono::{Datelike, Local, NaiveDate};
 use leeway::models::{AccountType, Direction, Kind, Mode, PeriodType, Series, Txn};
 use leeway::money::Money;
+use leeway::sync::{self, Inspection, StorageMode, SyncStatus};
 use leeway::view::SeriesTimeRange;
 use leeway::{calc, db, ops, queries};
-use leeway::sync::{self, Inspection, StorageMode, SyncStatus};
-use chrono::{Datelike, Local, NaiveDate};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Margin, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, HighlightSpacing, List, ListItem, Padding, Paragraph, Scrollbar,
@@ -48,11 +48,64 @@ pub(crate) const SERIES_RENAME_GUIDANCE: &str = "Rename this item from its Serie
 /// navigation state so a contextual detail drill-in can return to its exact origin.
 pub enum Screen {
     Dashboard,
-    EnvelopeDetail { detail: EnvelopeDetail },
-    Series { state: SeriesScreen },
+    EnvelopeDetail {
+        detail: EnvelopeDetail,
+    },
+    Series {
+        state: SeriesScreen,
+    },
     Plans,
-    PlanEditor { plan_id: String },
-    StorageSync { origin: SeriesOrigin },
+    PlanEditor {
+        plan_id: String,
+    },
+    Settings {
+        tab: SettingsTab,
+        origin: SeriesOrigin,
+    },
+}
+
+/// The settings screen's tabs. General holds app-wide preferences (envelope-mode default,
+/// display currency); Storage holds the folder-sync controls and legacy-import affordance.
+/// `Tab`/`Shift+Tab` cycle between them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    General,
+    Storage,
+}
+
+impl SettingsTab {
+    pub const ALL: [SettingsTab; 2] = [SettingsTab::General, SettingsTab::Storage];
+
+    fn title(self) -> &'static str {
+        match self {
+            SettingsTab::General => "General",
+            SettingsTab::Storage => "Storage",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            SettingsTab::General => SettingsTab::Storage,
+            SettingsTab::Storage => SettingsTab::General,
+        }
+    }
+
+    fn prev(self) -> Self {
+        // Two tabs, so previous is the same cycle as next; kept distinct for when more land.
+        self.next()
+    }
+}
+
+/// The General tab's selectable rows, in display order. Each maps to one setting the
+/// user can act on with Enter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GeneralRow {
+    EnvelopeMode,
+    Currency,
+}
+
+impl GeneralRow {
+    const ALL: [GeneralRow; 2] = [GeneralRow::EnvelopeMode, GeneralRow::Currency];
 }
 
 #[derive(Clone)]
@@ -90,7 +143,7 @@ impl SeriesOrigin {
                 plan_id: plan_id.clone(),
             }),
             Screen::Series { .. } => None,
-            Screen::StorageSync { origin } => Some(origin.clone()),
+            Screen::Settings { origin, .. } => Some(origin.clone()),
         }
     }
 
@@ -372,9 +425,15 @@ pub enum ModalAction {
     BeginNewSeries {
         block: BudgetBlock,
     },
-    EnableNewSync { parent: PathBuf },
-    AdoptSyncedBudget { parent: PathBuf },
-    ReplaceSyncedBudget { parent: PathBuf },
+    EnableNewSync {
+        parent: PathBuf,
+    },
+    AdoptSyncedBudget {
+        parent: PathBuf,
+    },
+    ReplaceSyncedBudget {
+        parent: PathBuf,
+    },
 }
 
 /// A single-line text input. `kind` records what to do with the text on submit.
@@ -521,7 +580,9 @@ pub enum ConfirmAction {
     },
     DisableSync,
     TakeOverSync,
-    ImportLegacy { path: PathBuf },
+    ImportLegacy {
+        path: PathBuf,
+    },
     ResolveUseSynced,
     ResolveUseLocal,
 }
@@ -552,6 +613,8 @@ pub struct App {
     pub editor_income_sel: usize,
     pub editor_expense_sel: usize,
     pub editor_env_sel: usize,
+    /// Which row is highlighted on the settings General tab (`GeneralRow` index).
+    pub settings_general_sel: usize,
     /// After creating an item we want to jump the selection onto it, but its list
     /// position isn't known until the next reload (rows are sorted). We stash the id
     /// here and the loop resolves it to an index once the items are loaded.
@@ -756,7 +819,9 @@ fn main() -> Result<()> {
     let mut app = App {
         conn,
         screen: if !managed_existed && legacy_database.is_some() {
-            Screen::StorageSync {
+            // A legacy ./leeway.db is importable only from the Storage tab, so land there.
+            Screen::Settings {
+                tab: SettingsTab::Storage,
                 origin: SeriesOrigin::Dashboard,
             }
         } else {
@@ -781,6 +846,7 @@ fn main() -> Result<()> {
         editor_income_sel: 0,
         editor_expense_sel: 0,
         editor_env_sel: 0,
+        settings_general_sel: 0,
         pending_select: None,
         pending_dash_txn: None,
         pending_dash_env: None,
@@ -964,9 +1030,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                         if let Some(key) = read_key(sync_tick(app))? {
                             if app.modal.is_some() {
                                 handle_modal_key(app, key)?;
-                            } else if handle_global_key(app, key)
-                                || !budget_key_allowed(app, key)
-                            {
+                            } else if handle_global_key(app, key) || !budget_key_allowed(app, key) {
                             } else {
                                 series::handle_detail_key(app, key, detail, today)?;
                             }
@@ -991,9 +1055,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                                 // Search is a text-entry mode: it must own every key (including
                                 // would-be global jump/quit keys) so they remain literal input.
                                 series::handle_key(app, key, &view, today)?;
-                            } else if handle_global_key(app, key)
-                                || !budget_key_allowed(app, key)
-                            {
+                            } else if handle_global_key(app, key) || !budget_key_allowed(app, key) {
                             } else {
                                 series::handle_key(app, key, &view, today)?;
                             }
@@ -1071,10 +1133,11 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                 }
             }
 
-            Screen::StorageSync { origin } => {
+            Screen::Settings { tab, origin } => {
+                let tab = *tab;
                 let origin = origin.clone();
                 terminal.draw(|frame| {
-                    draw_storage_sync(frame, app);
+                    draw_settings(frame, app, tab);
                     draw_modal(frame, app);
                 })?;
                 if let Some(key) = read_key(sync_tick(app))? {
@@ -1082,7 +1145,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                         handle_modal_key(app, key)?;
                     } else if handle_global_key(app, key) {
                     } else {
-                        handle_storage_sync_key(app, key, origin)?;
+                        handle_settings_key(app, key, tab, origin)?;
                     }
                 }
             }
@@ -1112,10 +1175,7 @@ fn sync_tick(app: &App) -> Duration {
 }
 
 fn budget_key_allowed(app: &mut App, key: KeyEvent) -> bool {
-    let can_edit = app
-        .sync
-        .as_ref()
-        .is_none_or(sync::Runtime::can_edit);
+    let can_edit = app.sync.as_ref().is_none_or(sync::Runtime::can_edit);
     if can_edit {
         return true;
     }
@@ -1137,7 +1197,7 @@ fn budget_key_allowed(app: &mut App, key: KeyEvent) -> bool {
             | KeyCode::Char('t')
     );
     if !navigation {
-        app.status = Some("Read-only while sync needs attention — open Storage & Sync with ,".into());
+        app.status = Some("Read-only while sync needs attention — open Settings with ,".into());
     }
     navigation
 }
@@ -1156,17 +1216,83 @@ fn read_key(timeout: Duration) -> Result<Option<KeyEvent>> {
     }
 }
 
-fn handle_storage_sync_key(app: &mut App, key: KeyEvent, origin: SeriesOrigin) -> Result<()> {
+/// Settings dispatch: the tab-agnostic keys (leave, switch tab) live here; everything
+/// else routes to the active tab's handler.
+fn handle_settings_key(
+    app: &mut App,
+    key: KeyEvent,
+    tab: SettingsTab,
+    origin: SeriesOrigin,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => {
+            app.screen = origin.into_screen();
+            app.status = None;
+        }
+        KeyCode::Tab => {
+            app.screen = Screen::Settings {
+                tab: tab.next(),
+                origin,
+            };
+            app.status = None;
+        }
+        KeyCode::BackTab => {
+            app.screen = Screen::Settings {
+                tab: tab.prev(),
+                origin,
+            };
+            app.status = None;
+        }
+        _ => match tab {
+            SettingsTab::General => handle_general_tab_key(app, key)?,
+            SettingsTab::Storage => handle_storage_tab_key(app, key)?,
+        },
+    }
+    Ok(())
+}
+
+/// The General tab is a short selectable list: j/k move, Enter acts on the focused row
+/// (toggle the new-envelope default, or open the currency chooser).
+fn handle_general_tab_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let rows = GeneralRow::ALL.len();
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            if app.settings_general_sel + 1 < rows {
+                app.settings_general_sel += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.settings_general_sel = app.settings_general_sel.saturating_sub(1);
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            match GeneralRow::ALL[app.settings_general_sel.min(rows - 1)] {
+                GeneralRow::EnvelopeMode => {
+                    let next = match queries::default_mode(&app.conn)? {
+                        Mode::Automatic => Mode::Manual,
+                        Mode::Manual => Mode::Automatic,
+                    };
+                    ops::set_default_envelope_mode(&app.conn, next)?;
+                    let label = match next {
+                        Mode::Automatic => "automatic",
+                        Mode::Manual => "manual",
+                    };
+                    app.status = Some(format!("New envelopes now default to {label}"));
+                }
+                GeneralRow::Currency => app.open_currency_picker(),
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_storage_tab_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let mode = app
         .sync
         .as_ref()
         .map(|runtime| runtime.config.mode.clone())
         .unwrap_or(StorageMode::LocalOnly);
     match key.code {
-        KeyCode::Esc => {
-            app.screen = origin.into_screen();
-            app.status = None;
-        }
         KeyCode::Char('e') if mode == StorageMode::LocalOnly => app.open_text_with_help(
             "Synchronized parent folder",
             "~/",
@@ -1209,27 +1335,118 @@ fn handle_storage_sync_key(app: &mut App, key: KeyEvent, origin: SeriesOrigin) -
                 );
             }
         }
-        KeyCode::Char('c') => app.open_currency_picker(),
         _ => {}
     }
     Ok(())
 }
 
-fn draw_storage_sync(frame: &mut Frame, app: &App) {
+fn draw_settings(frame: &mut Frame, app: &App, tab: SettingsTab) {
     let area = frame.area();
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(area);
-    frame.render_widget(
-        Paragraph::new(" Storage & Sync")
-            .block(bordered_block())
-            .alignment(Alignment::Left),
-        header,
-    );
+    draw_settings_header(frame, header, tab);
 
+    let local_hints = match tab {
+        SettingsTab::General => {
+            draw_general_tab(frame, body, app);
+            general_tab_hints()
+        }
+        SettingsTab::Storage => {
+            draw_storage_tab(frame, body, app);
+            storage_tab_hints(app)
+        }
+    };
+    let global = Line::from(vec![
+        modal_key(" Tab "),
+        Span::raw(" switch tab  "),
+        modal_key(" Esc "),
+        Span::raw(" back  "),
+        modal_key(" q "),
+        Span::raw(" quit"),
+    ]);
+    draw_screen_footer(frame, footer, local_hints, global, app.status.as_deref());
+}
+
+/// The settings header doubles as the tab bar: the app title on the left, then one chip
+/// per tab with the active one highlighted.
+fn draw_settings_header(frame: &mut Frame, area: Rect, active: SettingsTab) {
+    let mut spans = vec![
+        Span::styled(" Settings", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("   "),
+    ];
+    for (idx, tab) in SettingsTab::ALL.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
+        let style = if *tab == active {
+            Style::default()
+                .fg(theme::MAUVE)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(format!(" {} ", tab.title()), style));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).block(bordered_block()),
+        area,
+    );
+}
+
+/// The General tab: a two-row selectable list of app-wide preferences.
+fn draw_general_tab(frame: &mut Frame, area: Rect, app: &App) {
+    let default_mode = queries::default_mode(&app.conn).unwrap_or(Mode::Automatic);
+    let mode_label = match default_mode {
+        Mode::Automatic => "automatic",
+        Mode::Manual => "manual",
+    };
+    let currency = leeway::currency::active();
+    let rows = [
+        ("New-envelope default", mode_label.to_string()),
+        (
+            "Display currency",
+            format!("{} ({})", currency.code, currency.symbol),
+        ),
+    ];
+    let sel = app.settings_general_sel.min(rows.len().saturating_sub(1));
+
+    let mut lines = vec![Line::raw("")];
+    for (idx, (label, value)) in rows.iter().enumerate() {
+        let selected = idx == sel;
+        let marker = if selected { "▌" } else { " " };
+        let base = if selected {
+            selection_style()
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(theme::MAUVE)),
+            Span::styled(
+                format!(" {label:<GENERAL_LABEL_WIDTH$}"),
+                base.fg(Color::Gray),
+            ),
+            Span::styled(value.clone(), base.fg(Color::White)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  The new-envelope default seeds envelopes you create later; existing envelopes keep their mode.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(titled_block(" General ")),
+        area,
+    );
+}
+
+/// The Storage tab: sync status detail and, when present, the importable legacy database.
+fn draw_storage_tab(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = Vec::new();
     if let Some(runtime) = app.sync.as_ref() {
         lines.push(storage_detail_line(
@@ -1238,11 +1455,9 @@ fn draw_storage_sync(frame: &mut Frame, app: &App) {
             sync_status_color(&runtime.status),
         ));
         match &runtime.status {
-            SyncStatus::Published { revision_id } => lines.push(storage_detail_line(
-                "Revision",
-                revision_id,
-                Color::White,
-            )),
+            SyncStatus::Published { revision_id } => {
+                lines.push(storage_detail_line("Revision", revision_id, Color::White))
+            }
             SyncStatus::SavedLocally { message } | SyncStatus::Attention { message } => {
                 lines.push(storage_detail_line("Detail", message, Color::White))
             }
@@ -1251,12 +1466,6 @@ fn draw_storage_sync(frame: &mut Frame, app: &App) {
         lines.push(storage_detail_line(
             "Device",
             &runtime.device.label,
-            Color::White,
-        ));
-        let currency = leeway::currency::active();
-        lines.push(storage_detail_line(
-            "Currency",
-            format!("{} ({})", currency.code, currency.symbol),
             Color::White,
         ));
         lines.push(storage_detail_line(
@@ -1300,9 +1509,20 @@ fn draw_storage_sync(frame: &mut Frame, app: &App) {
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(titled_block(" Storage ")),
-        body,
+        area,
     );
+}
 
+fn general_tab_hints() -> Line<'static> {
+    Line::from(vec![
+        modal_key(" j/k "),
+        Span::raw(" move  "),
+        modal_key(" Enter "),
+        Span::raw(" change"),
+    ])
+}
+
+fn storage_tab_hints(app: &App) -> Line<'static> {
     let mode = app
         .sync
         .as_ref()
@@ -1323,11 +1543,6 @@ fn draw_storage_sync(frame: &mut Frame, app: &App) {
             Span::raw(" disable"),
         ]),
     }
-    actions.extend([
-        Span::raw("  "),
-        modal_key(" c "),
-        Span::raw(" currency"),
-    ]);
     if app
         .sync
         .as_ref()
@@ -1343,28 +1558,13 @@ fn draw_storage_sync(frame: &mut Frame, app: &App) {
             Span::raw(" keep both"),
         ]);
     }
-    let nav = Line::from(vec![
-        modal_key(" Esc "),
-        Span::raw(" back  "),
-        modal_key(" q "),
-        Span::raw(" quit"),
-    ]);
-    draw_split_status_footer(
-        frame,
-        footer,
-        Line::from(actions),
-        nav,
-        app.status.as_deref(),
-    );
+    Line::from(actions)
 }
 
 const STORAGE_LABEL_WIDTH: usize = 17;
+const GENERAL_LABEL_WIDTH: usize = 22;
 
-fn storage_detail_line(
-    label: &str,
-    value: impl Into<String>,
-    value_color: Color,
-) -> Line<'static> {
+fn storage_detail_line(label: &str, value: impl Into<String>, value_color: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!(" {label:<STORAGE_LABEL_WIDTH$}"),
@@ -1435,13 +1635,16 @@ fn handle_global_key_with_series(
             return true;
         }
         KeyCode::Char(',') => {
-            if matches!(app.screen, Screen::StorageSync { .. }) {
+            if matches!(app.screen, Screen::Settings { .. }) {
                 return true;
             }
             let Some(origin) = SeriesOrigin::from_screen(&app.screen) else {
                 return true;
             };
-            Screen::StorageSync { origin }
+            Screen::Settings {
+                tab: SettingsTab::General,
+                origin,
+            }
         }
         KeyCode::Char('q') => {
             app.should_quit = true;
@@ -1613,7 +1816,10 @@ fn handle_currency_picker_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 ops::set_currency(&app.conn, chosen)?;
                 leeway::currency::set_active(chosen);
                 app.modal = None;
-                app.status = Some(format!("Currency set to {} ({})", chosen.code, chosen.symbol));
+                app.status = Some(format!(
+                    "Currency set to {} ({})",
+                    chosen.code, chosen.symbol
+                ));
             }
         }
         KeyCode::Char('j') | KeyCode::Down => {
@@ -2462,37 +2668,39 @@ fn submit_text(app: &mut App) -> Result<()> {
             if text.is_empty() {
                 app.status = Some("Enter a synchronized parent folder".into());
             } else {
-                let inspection = sync::expand_home(PathBuf::from(&text).as_path())
-                    .and_then(|parent| sync::inspect_parent(&parent).map(|inspection| (parent, inspection)));
+                let inspection =
+                    sync::expand_home(PathBuf::from(&text).as_path()).and_then(|parent| {
+                        sync::inspect_parent(&parent).map(|inspection| (parent, inspection))
+                    });
                 match inspection {
                     Ok((parent, Inspection::Empty { .. })) => {
                         run_modal_action(app, ModalAction::EnableNewSync { parent })?
                     }
                     Ok((parent, Inspection::Existing { revision, .. })) => app.open_choice(
-                            format!(
-                                "Synced revision {} from {} is valid. Which budget should win?",
-                                revision.revision_id, revision.device_label
-                            ),
-                            vec![
-                                ChoiceOption {
-                                    key: 'u',
-                                    label: "Use synced budget (recommended)".into(),
-                                    action: Some(ModalAction::AdoptSyncedBudget {
-                                        parent: parent.clone(),
-                                    }),
-                                },
-                                ChoiceOption {
-                                    key: 'r',
-                                    label: "Replace synced budget with this computer".into(),
-                                    action: Some(ModalAction::ReplaceSyncedBudget { parent }),
-                                },
-                                ChoiceOption {
-                                    key: 'c',
-                                    label: "Cancel".into(),
-                                    action: None,
-                                },
-                            ],
+                        format!(
+                            "Synced revision {} from {} is valid. Which budget should win?",
+                            revision.revision_id, revision.device_label
                         ),
+                        vec![
+                            ChoiceOption {
+                                key: 'u',
+                                label: "Use synced budget (recommended)".into(),
+                                action: Some(ModalAction::AdoptSyncedBudget {
+                                    parent: parent.clone(),
+                                }),
+                            },
+                            ChoiceOption {
+                                key: 'r',
+                                label: "Replace synced budget with this computer".into(),
+                                action: Some(ModalAction::ReplaceSyncedBudget { parent }),
+                            },
+                            ChoiceOption {
+                                key: 'c',
+                                label: "Cancel".into(),
+                                action: None,
+                            },
+                        ],
+                    ),
                     Err(error) => {
                         app.status = Some(format!("Sync: {error:#}"));
                         app.open_text_prompt(
@@ -2555,7 +2763,8 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         }
                     }
                     ConfirmAction::DisableSync => {
-                        let result = app.sync
+                        let result = app
+                            .sync
                             .as_mut()
                             .context("sync runtime is unavailable")
                             .and_then(sync::Runtime::disable);
@@ -2566,7 +2775,8 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         );
                     }
                     ConfirmAction::TakeOverSync => {
-                        let result = app.sync
+                        let result = app
+                            .sync
                             .as_mut()
                             .context("sync runtime is unavailable")
                             .and_then(sync::Runtime::takeover);
@@ -2605,7 +2815,8 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         );
                     }
                     ConfirmAction::ResolveUseSynced => {
-                        let result = app.sync
+                        let result = app
+                            .sync
                             .as_mut()
                             .context("sync runtime is unavailable")
                             .and_then(|runtime| runtime.resolve_conflict(&mut app.conn, false));
@@ -2619,7 +2830,8 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         );
                     }
                     ConfirmAction::ResolveUseLocal => {
-                        let result = app.sync
+                        let result = app
+                            .sync
                             .as_mut()
                             .context("sync runtime is unavailable")
                             .and_then(|runtime| runtime.resolve_conflict(&mut app.conn, true));
@@ -2836,10 +3048,7 @@ fn draw_help_modal(frame: &mut Frame, state: &help::HelpState) {
     let max_scroll = (lines.len() as u16).saturating_sub(body_area.height);
     state.max_scroll.set(max_scroll);
     let scroll = state.scroll.min(max_scroll);
-    frame.render_widget(
-        Paragraph::new(lines).scroll((scroll, 0)),
-        body_area,
-    );
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body_area);
 
     // Footer: topic/scroll/close hints on the left, a "more below" cue on the right.
     let footer = Line::from(vec![
@@ -2853,10 +3062,7 @@ fn draw_help_modal(frame: &mut Frame, state: &help::HelpState) {
         Span::styled(" scroll", Style::default().fg(Color::Gray)),
     ]);
     let more = if scroll < max_scroll {
-        Line::from(Span::styled(
-            "more ↓ ",
-            Style::default().fg(theme::CYAN),
-        ))
+        Line::from(Span::styled("more ↓ ", Style::default().fg(theme::CYAN)))
     } else {
         Line::raw("")
     };
@@ -2892,7 +3098,7 @@ fn draw_envelope_detail_screen(frame: &mut Frame, app: &App, detail: &EnvelopeDe
     let [details_area, transactions_area, footer_area] = Layout::vertical([
         Constraint::Length(8),
         Constraint::Min(7),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(inner);
     draw_envelope_detail_section(
@@ -2914,7 +3120,7 @@ fn draw_envelope_detail_screen(frame: &mut Frame, app: &App, detail: &EnvelopeDe
         EnvelopeDetailFocus::Transactions => transactions_footer_line(),
     };
     let status = footer_status(app);
-    crate::draw_split_status_footer(
+    crate::draw_screen_footer(
         frame,
         footer_area,
         focused_commands,
@@ -2977,7 +3183,7 @@ fn envelope_detail_navigation_line() -> Line<'static> {
         modal_key(" S "),
         Span::styled(" series  ", Style::default().fg(Color::Gray)),
         modal_key(" , "),
-        Span::styled(" sync  ", Style::default().fg(Color::Gray)),
+        Span::styled(" settings  ", Style::default().fg(Color::Gray)),
         modal_key(" q "),
         Span::styled(" quit", Style::default().fg(Color::Gray)),
     ])
@@ -3187,22 +3393,49 @@ fn draw_series_search_modal(frame: &mut Frame, prompt: &SeriesSearch) {
 /// its code and a sample amount formatted in that currency so the effect is visible
 /// before choosing. Mirrors the series-search modal's selection styling.
 fn draw_currency_picker(frame: &mut Frame, picker: &CurrencyPicker) {
-    let area = centered_rect(60, 60, frame.area());
+    let currencies = leeway::currency::CURRENCIES;
+    let n = currencies.len();
+    let selected = picker.selected.min(n.saturating_sub(1));
+
+    // The dialog sizes to its content: it shows the whole list when it fits, and only
+    // scrolls a window (with "N more" markers) when the terminal is too short to hold every
+    // row. Chrome inside the border is a leading blank plus a trailing blank + hint line.
+    const TOP_BLANK: usize = 1;
+    const HINT_BLOCK: usize = 2;
+    const BORDERS: usize = 2;
+    let screen = frame.area();
+    // Cap at ~80% of the screen height so it still reads as a floating dialog.
+    let max_body = (screen.height as usize) * 4 / 5;
+    let max_rows = max_body
+        .saturating_sub(BORDERS + TOP_BLANK + HINT_BLOCK)
+        .max(1);
+
+    let (start, window, more_above, more_below) = if n <= max_rows {
+        (0, n, 0, 0)
+    } else {
+        // Reserve up to two rows for the markers, then keep the selection inside the window.
+        let win = max_rows.saturating_sub(2).max(1);
+        let start = selected.saturating_sub(win - 1);
+        (start, win, start, n.saturating_sub(start + win))
+    };
+
+    let marker_lines = (more_above > 0) as usize + (more_below > 0) as usize;
+    let height = (BORDERS + TOP_BLANK + marker_lines + window + HINT_BLOCK) as u16;
+    // A fixed-height, 60%-wide dialog, centered on both axes.
+    let [row] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(screen);
+    let [area] = Layout::horizontal([Constraint::Percentage(60)])
+        .flex(Flex::Center)
+        .areas(row);
     frame.render_widget(Clear, area);
 
-    let block =
-        titled_block(" Select currency ").border_style(Style::default().fg(theme::CYAN));
-
-    let currencies = leeway::currency::CURRENCIES;
-    let selected = picker.selected.min(currencies.len().saturating_sub(1));
-    // Keep the selection in view by scrolling a fixed-height window.
-    let window = 9;
-    let start = selected.saturating_sub(window - 1);
+    let block = titled_block(" Select currency ").border_style(Style::default().fg(theme::CYAN));
 
     let mut body = vec![Line::raw("")];
-    if start > 0 {
+    if more_above > 0 {
         body.push(Line::from(Span::styled(
-            format!("   {start} more above"),
+            format!("   {more_above} more above"),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -3221,10 +3454,9 @@ fn draw_currency_picker(frame: &mut Frame, picker: &CurrencyPicker) {
             Span::styled(format!(" {:<4} {}", currency.code, sample), style),
         ]));
     }
-    let remaining = currencies.len().saturating_sub(start + window);
-    if remaining > 0 {
+    if more_below > 0 {
         body.push(Line::from(Span::styled(
-            format!("   {remaining} more"),
+            format!("   {more_below} more"),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -3251,6 +3483,29 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 // --- Shared display helpers (used by more than one screen) ---------------------
+
+/// The standard two-row screen footer: the focused control's own hints on the top row,
+/// and the always-present global legend on the bottom row with any transient status
+/// message right-aligned beside it. Splitting them onto two rows is what keeps the global
+/// legend visible even while a status message (e.g. the folder-sync status, which is shown
+/// continuously) occupies the status slot — previously the status clobbered the legend.
+///
+/// `area` must be at least two rows tall (screens reserve `Constraint::Length(2)`).
+pub(crate) fn draw_screen_footer(
+    frame: &mut Frame,
+    area: Rect,
+    local_hints: Line,
+    global_hints: Line,
+    status: Option<&str>,
+) {
+    let [local_row, global_row] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    frame.render_widget(Paragraph::new(local_hints), local_row);
+    // The global legend owns the left of the bottom row; status (when present) sits at the
+    // right. Passing an empty right-hints line means the legend keeps the full width when
+    // there's no status to show.
+    draw_split_status_footer(frame, global_row, global_hints, Line::default(), status);
+}
 
 /// A footer with context hints on the left and global navigation on the right. Status
 /// messages take the right side while present.
@@ -3399,6 +3654,7 @@ mod tests {
             editor_income_sel: 0,
             editor_expense_sel: 0,
             editor_env_sel: 0,
+            settings_general_sel: 0,
             pending_select: None,
             pending_dash_txn: None,
             pending_dash_env: None,
@@ -3436,14 +3692,15 @@ mod tests {
     }
 
     #[test]
-    fn comma_opens_storage_and_sync_from_the_current_screen() {
+    fn comma_opens_settings_from_the_current_screen() {
         let (mut app, detail, _) = app_with_envelope_detail();
         assert!(handle_global_key(&mut app, key(KeyCode::Char(','))));
         match &app.screen {
-            Screen::StorageSync {
+            Screen::Settings {
+                tab: SettingsTab::General,
                 origin: SeriesOrigin::EnvelopeDetail { detail: origin },
             } => assert_eq!(origin.envelope_id, detail.envelope_id),
-            _ => panic!("expected Storage & Sync with the detail return address"),
+            _ => panic!("expected Settings (General) with the detail return address"),
         }
     }
 
@@ -3457,7 +3714,11 @@ mod tests {
         );
         submit_text(&mut app).unwrap();
         assert!(matches!(app.modal, Some(Modal::Text(_))));
-        assert!(app.status.as_deref().is_some_and(|status| status.starts_with("Sync:")));
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("Sync:"))
+        );
     }
 
     #[test]
@@ -3811,7 +4072,8 @@ mod tests {
         runtime.status = SyncStatus::ReadOnly {
             owner: "Other-MacBook".into(),
         };
-        app.screen = Screen::StorageSync {
+        app.screen = Screen::Settings {
+            tab: SettingsTab::Storage,
             origin: SeriesOrigin::Dashboard,
         };
         app.status = None;
@@ -3825,7 +4087,9 @@ mod tests {
         let app = app_with_sync_screen();
         let backend = ratatui::backend::TestBackend::new(100, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_storage_sync(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| draw_settings(frame, &app, SettingsTab::Storage))
+            .unwrap();
 
         let text = buffer_text(&terminal);
         assert!(text.contains(" Status           Read-only — Other-MacBook is editing"));
@@ -3836,7 +4100,10 @@ mod tests {
         assert!(text.contains(" Path             /old/leeway.db"));
         assert!(!text.contains(" Owner "));
         assert!(!text.contains(" Sync parent"));
-        assert_eq!(text.matches("Read-only — Other-MacBook is editing").count(), 1);
+        assert_eq!(
+            text.matches("Read-only — Other-MacBook is editing").count(),
+            1
+        );
     }
 
     #[test]
@@ -3844,7 +4111,72 @@ mod tests {
         let app = app_with_sync_screen();
         let backend = ratatui::backend::TestBackend::new(32, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_storage_sync(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| draw_settings(frame, &app, SettingsTab::Storage))
+            .unwrap();
+    }
+
+    #[test]
+    fn tab_cycles_between_settings_tabs() {
+        let mut app = app_with_sync_screen();
+        app.screen = Screen::Settings {
+            tab: SettingsTab::General,
+            origin: SeriesOrigin::Dashboard,
+        };
+        handle_settings_key(
+            &mut app,
+            key(KeyCode::Tab),
+            SettingsTab::General,
+            SeriesOrigin::Dashboard,
+        )
+        .unwrap();
+        assert!(matches!(
+            app.screen,
+            Screen::Settings {
+                tab: SettingsTab::Storage,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn general_tab_shows_both_settings_and_keeps_the_global_legend() {
+        let app = app_with_sync_screen();
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_settings(frame, &app, SettingsTab::General))
+            .unwrap();
+        let text = buffer_text(&terminal);
+        // The tab bar names both tabs.
+        assert!(text.contains("General"));
+        assert!(text.contains("Storage"));
+        // Both General-tab settings render with their current values.
+        assert!(text.contains("New-envelope default"));
+        assert!(text.contains("Display currency"));
+        // The global legend stays visible even though this app is in FolderSync (whose
+        // continuous status would otherwise clobber a single-row footer's right side).
+        assert!(text.contains("switch tab"));
+        assert!(text.contains("quit"));
+    }
+
+    #[test]
+    fn general_tab_enter_toggles_the_default_envelope_mode() {
+        let mut app = app_with_sync_screen();
+        app.settings_general_sel = 0; // EnvelopeMode row
+        let before = queries::default_mode(&app.conn).unwrap();
+        handle_general_tab_key(&mut app, key(KeyCode::Enter)).unwrap();
+        let after = queries::default_mode(&app.conn).unwrap();
+        assert_ne!(before, after);
+        assert!(app.status.as_deref().unwrap().contains("default"));
+    }
+
+    #[test]
+    fn general_tab_enter_on_currency_row_opens_the_picker() {
+        let mut app = app_with_sync_screen();
+        app.settings_general_sel = 1; // Currency row
+        handle_general_tab_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.modal, Some(Modal::CurrencyPicker(_))));
     }
 
     #[test]
@@ -3862,6 +4194,25 @@ mod tests {
         assert!(text.contains("EUR"));
         // The sample amount is rendered in each currency (EUR uses a trailing symbol).
         assert!(text.contains("€"));
+        // A normal terminal is tall enough to show every currency at once, so the list is
+        // not artificially truncated: the last entry is visible and there's no "more" cue.
+        let last = leeway::currency::CURRENCIES.last().unwrap();
+        assert!(text.contains(last.code));
+        assert!(!text.contains("more"));
+    }
+
+    #[test]
+    fn currency_picker_scrolls_a_window_on_a_short_terminal() {
+        let mut app = app_with_sync_screen();
+        app.open_currency_picker();
+        // A terminal too short to hold the whole list falls back to a scrolling window with
+        // a "more" indicator, rather than overflowing the dialog.
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Select currency"));
+        assert!(text.contains("more"));
     }
 
     // --- Contextual help -------------------------------------------------------
@@ -3930,9 +4281,15 @@ mod tests {
         terminal.draw(|f| draw_modal(f, &app)).unwrap();
 
         let text = buffer_text(&terminal);
-        assert!(text.contains("Help"), "title bar should name the help modal");
+        assert!(
+            text.contains("Help"),
+            "title bar should name the help modal"
+        );
         assert!(text.contains("Details"), "should render the focused topic");
-        assert!(text.contains("How it fits"), "should render authored sections");
+        assert!(
+            text.contains("How it fits"),
+            "should render authored sections"
+        );
     }
 
     #[test]

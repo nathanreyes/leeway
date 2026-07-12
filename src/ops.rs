@@ -20,11 +20,9 @@ fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
 
-/// Persist the app-wide display currency into the `setting` table (upsert). This is
-/// the first runtime writer of that table — `default_envelope_mode` is only ever
-/// seeded. Because the row lives in the database, the choice syncs with the budget.
-/// The caller is responsible for updating the in-process active currency
-/// (`currency::set_active`).
+/// Persist the app-wide display currency into the `setting` table (upsert). Because
+/// the row lives in the database, the choice syncs with the budget. The caller is
+/// responsible for updating the in-process active currency (`currency::set_active`).
 pub fn set_currency(conn: &Connection, currency: Currency) -> Result<()> {
     conn.execute(
         "INSERT INTO setting (key, value) VALUES ('currency', ?1)
@@ -32,6 +30,24 @@ pub fn set_currency(conn: &Connection, currency: Currency) -> Result<()> {
         rusqlite::params![currency.code],
     )
     .context("saving currency setting")?;
+    Ok(())
+}
+
+/// Persist the global `default_envelope_mode` (upsert). This seeds the mode of
+/// envelope series created afterwards (see `queries::default_mode`); existing
+/// envelope instances keep whatever mode they were stamped with — flipping the
+/// default deliberately does not rewrite history.
+pub fn set_default_envelope_mode(conn: &Connection, mode: Mode) -> Result<()> {
+    let value = match mode {
+        Mode::Automatic => "automatic",
+        Mode::Manual => "manual",
+    };
+    conn.execute(
+        "INSERT INTO setting (key, value) VALUES ('default_envelope_mode', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![value],
+    )
+    .context("saving default envelope mode setting")?;
     Ok(())
 }
 
@@ -1071,19 +1087,89 @@ pub fn seed_starter(conn: &mut Connection) -> Result<()> {
     let zero = Money::from_dollars(0.0);
 
     // Income.
-    add(Kind::Transaction, "Paycheck", Some(Direction::In), zero, None, None)?;
+    add(
+        Kind::Transaction,
+        "Paycheck",
+        Some(Direction::In),
+        zero,
+        None,
+        None,
+    )?;
     // Recurring bills. Internet and Phone are separate lines.
-    add(Kind::Transaction, "Rent/Mortgage", Some(Direction::Out), zero, None, None)?;
-    add(Kind::Transaction, "Utilities", Some(Direction::Out), zero, None, None)?;
-    add(Kind::Transaction, "Internet", Some(Direction::Out), zero, None, None)?;
-    add(Kind::Transaction, "Phone", Some(Direction::Out), zero, None, None)?;
+    add(
+        Kind::Transaction,
+        "Rent/Mortgage",
+        Some(Direction::Out),
+        zero,
+        None,
+        None,
+    )?;
+    add(
+        Kind::Transaction,
+        "Utilities",
+        Some(Direction::Out),
+        zero,
+        None,
+        None,
+    )?;
+    add(
+        Kind::Transaction,
+        "Internet",
+        Some(Direction::Out),
+        zero,
+        None,
+        None,
+    )?;
+    add(
+        Kind::Transaction,
+        "Phone",
+        Some(Direction::Out),
+        zero,
+        None,
+        None,
+    )?;
     // A monthly set-aside for savings (modeled as an outflow — there's no transfer concept).
-    add(Kind::Transaction, "Savings", Some(Direction::Out), zero, None, None)?;
+    add(
+        Kind::Transaction,
+        "Savings",
+        Some(Direction::Out),
+        zero,
+        None,
+        None,
+    )?;
     // Everyday spending envelopes, mixing automatic/manual to show both modes.
-    add(Kind::Envelope, "Groceries", None, zero, Some(PeriodType::Monthly), Some(Mode::Automatic))?;
-    add(Kind::Envelope, "Dining Out", None, zero, Some(PeriodType::Monthly), Some(Mode::Manual))?;
-    add(Kind::Envelope, "Transportation", None, zero, Some(PeriodType::Monthly), Some(Mode::Automatic))?;
-    add(Kind::Envelope, "Personal", None, zero, Some(PeriodType::Monthly), Some(Mode::Manual))?;
+    add(
+        Kind::Envelope,
+        "Groceries",
+        None,
+        zero,
+        Some(PeriodType::Monthly),
+        Some(Mode::Automatic),
+    )?;
+    add(
+        Kind::Envelope,
+        "Dining Out",
+        None,
+        zero,
+        Some(PeriodType::Monthly),
+        Some(Mode::Manual),
+    )?;
+    add(
+        Kind::Envelope,
+        "Transportation",
+        None,
+        zero,
+        Some(PeriodType::Monthly),
+        Some(Mode::Automatic),
+    )?;
+    add(
+        Kind::Envelope,
+        "Personal",
+        None,
+        zero,
+        Some(PeriodType::Monthly),
+        Some(Mode::Manual),
+    )?;
 
     // Stamp it for the current calendar month.
     let today = Local::now().date_naive();
@@ -1117,9 +1203,11 @@ mod tests {
         set_currency(&conn, jpy).unwrap();
         assert_eq!(queries::currency(&conn).unwrap(), Some(jpy));
         let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM setting WHERE key='currency'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM setting WHERE key='currency'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(rows, 1);
     }
