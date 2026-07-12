@@ -4,6 +4,7 @@
 //! the enums implement `FromSql` (see models.rs), `row.get("amount_cents")` yields a
 //! `Money` and `row.get("direction")` yields a `Direction` directly — no manual parsing.
 
+use crate::currency::{self, Currency};
 use crate::models::*;
 use crate::money::Money;
 use anyhow::{Context, Result};
@@ -25,6 +26,35 @@ pub fn default_mode(conn: &Connection) -> Result<Mode> {
         Some("manual") => Mode::Manual,
         _ => Mode::Automatic,
     })
+}
+
+/// The app-wide display currency (from the `setting` table's `currency` key).
+/// Returns `None` when the key is absent (a fresh budget that hasn't chosen one
+/// yet) or names a code we don't recognize, so the caller can fall back to
+/// locale detection. The value travels with the database, so a synced budget
+/// carries its currency to every device.
+pub fn currency(conn: &Connection) -> Result<Option<Currency>> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM setting WHERE key = 'currency'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .context("reading currency setting")?;
+    Ok(value.as_deref().and_then(currency::by_code))
+}
+
+/// Re-apply the app-wide active currency from the database. Called after a sync
+/// operation swaps in a different budget's data, so the adopted budget's currency
+/// takes effect without a restart. A budget with no currency row leaves the current
+/// choice untouched — we don't re-detect from this device's locale for data that
+/// belongs to another device.
+pub fn apply_active_currency(conn: &Connection) -> Result<()> {
+    if let Some(chosen) = currency(conn)? {
+        currency::set_active(chosen);
+    }
+    Ok(())
 }
 
 pub fn load_accounts(conn: &Connection) -> Result<Vec<Account>> {

@@ -336,6 +336,7 @@ impl Runtime {
         conn.restore(MAIN_DB, &snapshot, None::<fn(rusqlite::backup::Progress)>)
             .context("importing newer synchronized revision")?;
         db::migrate(conn)?;
+        crate::queries::apply_active_currency(conn)?;
         let migrated = remote.schema_version < db::SCHEMA_VERSION;
         self.observed_changes = conn.total_changes();
         self.config.last_accepted_revision = Some(remote.revision_id.clone());
@@ -470,6 +471,7 @@ impl Runtime {
         conn.restore(MAIN_DB, &snapshot, None::<fn(rusqlite::backup::Progress)>)
             .context("restoring synchronized budget")?;
         db::migrate(conn)?;
+        crate::queries::apply_active_currency(conn)?;
         let migrated = revision.schema_version < db::SCHEMA_VERSION;
         self.observed_changes = conn.total_changes();
         self.config.mode = StorageMode::FolderSync;
@@ -591,6 +593,7 @@ impl Runtime {
             )
             .context("restoring selected synchronized candidate")?;
             db::migrate(conn)?;
+            crate::queries::apply_active_currency(conn)?;
             self.observed_changes = conn.total_changes();
         }
 
@@ -1148,7 +1151,8 @@ pub fn import_legacy(conn: &mut Connection, legacy: &Path, recovery: &Path) -> R
     archive_connection(conn, recovery, "before-legacy-import")?;
     conn.restore(MAIN_DB, legacy, None::<fn(rusqlite::backup::Progress)>)
         .context("importing legacy database")?;
-    db::migrate(conn)
+    db::migrate(conn)?;
+    crate::queries::apply_active_currency(conn)
 }
 
 fn publish(request: PublishRequest) -> Result<Revision> {
