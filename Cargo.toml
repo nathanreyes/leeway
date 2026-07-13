@@ -6,6 +6,7 @@ description = "A local-first terminal budgeting app focused on what's left."
 repository = "https://github.com/nathanreyes/leeway"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
+homepage = "https://get-leeway.com"
 # Keep the published crate to the buildable app. docs/help/*.md are embedded
 # via include_str! and MUST stay; the marketing site, knowledge base, and
 # design docs are not needed to build leeway.
