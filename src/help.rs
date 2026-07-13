@@ -114,13 +114,13 @@ pub fn topic_for(app: &App) -> HelpTopic {
             EnvelopeDetailFocus::Details => HelpTopic::EnvDetails,
             EnvelopeDetailFocus::Transactions => HelpTopic::EnvTransactions,
         },
-        Screen::PlanEditor { .. } => match app.plan_focus {
+        Screen::Series { .. } => HelpTopic::Series,
+        Screen::Plans => match app.plan_focus {
+            PlanFocus::List => HelpTopic::PlansList,
             PlanFocus::Income => HelpTopic::PlanIncome,
             PlanFocus::Expenses => HelpTopic::PlanExpenses,
             PlanFocus::Envelopes => HelpTopic::PlanEnvelopes,
         },
-        Screen::Series { .. } => HelpTopic::Series,
-        Screen::Plans => HelpTopic::PlansList,
         Screen::Settings { .. } => HelpTopic::Overview,
     }
 }
@@ -148,13 +148,13 @@ pub fn screen_ring(app: &App) -> Vec<HelpTopic> {
         Screen::EnvelopeDetail { .. } => {
             vec![HelpTopic::EnvDetails, HelpTopic::EnvTransactions]
         }
-        Screen::PlanEditor { .. } => vec![
+        Screen::Series { .. } => vec![HelpTopic::Series],
+        Screen::Plans => vec![
+            HelpTopic::PlansList,
             HelpTopic::PlanIncome,
             HelpTopic::PlanExpenses,
             HelpTopic::PlanEnvelopes,
         ],
-        Screen::Series { .. } => vec![HelpTopic::Series],
-        Screen::Plans => vec![HelpTopic::PlansList],
         Screen::Settings { .. } => vec![HelpTopic::Overview],
     }
 }

@@ -1,10 +1,13 @@
-//! The plans screens: a list of templates, and an editor for one plan's items.
+//! The unified Plans screen: a master list of plan templates on the left, the selected
+//! plan's item sublists (Income, Expenses, Envelopes) stacked on the right, and the plan's
+//! cash-flow Summary across the bottom.
 //!
-//! Editing model: focus Income, Expenses, or Envelopes, press `n` to search/create a
-//! series in that block, then fill the plan amount. The editor only touches plan-scoped
-//! things — `a` sets this plan's amount, `x` removes the item from this plan. Editing the
-//! shared series itself (label, mode, period) lives on the Series page (`S`), so a
-//! plan can never silently rewrite a definition used by other plans.
+//! Editing model: focus the plan list to act on whole plans — `n` new, `l` label, `s` stamp,
+//! `x` delete. Focus an item pane to act on that block's items — `n` searches/creates a
+//! series and fills the plan amount, `a` sets this plan's amount, `x` removes the item from
+//! this plan. The screen only touches plan-scoped things; editing the shared series itself
+//! (label, mode, period) lives on the Series page (`S`), so a plan can never silently
+//! rewrite a definition used by other plans.
 
 use crate::{AddDestination, App, BudgetBlock, ConfirmAction, PlanFocus, PromptKind, Screen};
 use anyhow::Result;
@@ -19,16 +22,49 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{ListItem, ListState, Paragraph};
 
-// --- Plans list ----------------------------------------------------------------
+// --- Key handling --------------------------------------------------------------
 
-pub fn handle_list_key(app: &mut App, key: KeyEvent, summaries: &[PlanSummary]) -> Result<()> {
+/// Route a key on the unified Plans screen. Screen-global keys (leave, cycle focus) act
+/// regardless of pane; everything else dispatches to the focused pane's handler.
+pub fn handle_key(
+    app: &mut App,
+    key: KeyEvent,
+    summaries: &[PlanSummary],
+    plan: Option<&Plan>,
+    entries: &[PlanEntry],
+) -> Result<()> {
     app.status = None;
-    let selected = summaries.get(app.plans_sel);
 
     match key.code {
         // `q` (quit) and `S` (jump to Series) are handled globally; `Esc` goes back to the
         // Dashboard/month view.
-        KeyCode::Esc => app.screen = Screen::Dashboard,
+        KeyCode::Esc => {
+            app.screen = Screen::Dashboard;
+            return Ok(());
+        }
+        KeyCode::Tab => {
+            app.plan_focus = next_plan_focus(app.plan_focus);
+            return Ok(());
+        }
+        KeyCode::BackTab => {
+            app.plan_focus = previous_plan_focus(app.plan_focus);
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    if app.plan_focus == PlanFocus::List {
+        handle_list_key(app, key, summaries)
+    } else {
+        handle_item_key(app, key, plan, entries)
+    }
+}
+
+/// Plan-scoped verbs, active while the master list is focused.
+fn handle_list_key(app: &mut App, key: KeyEvent, summaries: &[PlanSummary]) -> Result<()> {
+    let selected = summaries.get(app.plans_sel);
+
+    match key.code {
         KeyCode::Char('j') | KeyCode::Down => {
             if !summaries.is_empty() && app.plans_sel + 1 < summaries.len() {
                 app.plans_sel += 1;
@@ -38,17 +74,6 @@ pub fn handle_list_key(app: &mut App, key: KeyEvent, summaries: &[PlanSummary]) 
 
         KeyCode::Char('n') => app.open_text("New plan name", "", PromptKind::NewPlan),
 
-        KeyCode::Enter => {
-            if let Some(s) = selected {
-                app.plan_focus = PlanFocus::Income;
-                app.editor_income_sel = 0;
-                app.editor_expense_sel = 0;
-                app.editor_env_sel = 0;
-                app.screen = Screen::PlanEditor {
-                    plan_id: s.plan.id.clone(),
-                };
-            }
-        }
         KeyCode::Char('l') => {
             if let Some(s) = selected {
                 app.open_text_replace_on_type(
@@ -83,100 +108,21 @@ pub fn handle_list_key(app: &mut App, key: KeyEvent, summaries: &[PlanSummary]) 
                 );
             }
         }
+        // `Enter` is intentionally inert: the detail already tracks the selected plan live, so
+        // there is nothing to "open". Tab moves focus into the item panes.
         _ => {}
     }
     Ok(())
 }
 
-pub fn draw_list(frame: &mut Frame, app: &App, summaries: &[PlanSummary]) {
-    let [header, body, footer] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(0),
-        Constraint::Length(2),
-    ])
-    .areas(frame.area());
-
-    let title = Paragraph::new(Line::from(" Plans ".bold()))
-        .alignment(Alignment::Center)
-        .block(crate::bordered_block());
-    frame.render_widget(title, header);
-
-    if summaries.is_empty() {
-        let p = Paragraph::new("No plans yet — press n to create one.")
-            .block(crate::titled_block(" Templates "));
-        frame.render_widget(p, body);
-    } else {
-        let items: Vec<ListItem> = summaries
-            .iter()
-            .map(|s| {
-                let count = format!(
-                    "{} item{}",
-                    s.item_count,
-                    if s.item_count == 1 { "" } else { "s" }
-                );
-                let line = Line::from(vec![
-                    Span::raw(format!("{:<28}", crate::truncate(&s.plan.name, 28))),
-                    Span::styled(count, Style::default().fg(Color::DarkGray)),
-                ]);
-                ListItem::new(line)
-            })
-            .collect();
-
-        let mut state = ListState::default();
-        state.select(Some(app.plans_sel));
-
-        let list =
-            crate::selectable_list(items).block(crate::selectable_block(" Templates ", false));
-        frame.render_stateful_widget(list, body, &mut state);
-    }
-
-    let hints = Line::from(vec![
-        key(" n "),
-        Span::raw(" new  "),
-        key(" Enter "),
-        Span::raw(" edit  "),
-        key(" l "),
-        Span::raw(" label  "),
-        key(" s "),
-        Span::raw(" stamp  "),
-        key(" x "),
-        Span::raw(" delete"),
-    ]);
-    let nav_hints = Line::from(vec![
-        key(" h "),
-        Span::raw(" help  "),
-        key(" S "),
-        Span::raw(" series  "),
-        key(" Esc "),
-        Span::raw(" back  "),
-        key(" , "),
-        Span::raw(" settings  "),
-        key(" q "),
-        Span::raw(" quit"),
-    ]);
-    let status = crate::footer_status(app);
-    crate::draw_screen_footer(frame, footer, hints, nav_hints, status.as_deref());
-}
-
-// --- Plan editor ---------------------------------------------------------------
-
-pub fn handle_editor_key(
+/// Item-scoped verbs, active while one of the Income/Expenses/Envelopes panes is focused.
+fn handle_item_key(
     app: &mut App,
     key: KeyEvent,
-    plan: &Plan,
+    plan: Option<&Plan>,
     entries: &[PlanEntry],
 ) -> Result<()> {
-    app.status = None;
-
     match key.code {
-        // `q` quits globally; `Esc` steps back up to the plans list.
-        KeyCode::Esc => app.screen = Screen::Plans,
-        KeyCode::Tab => {
-            app.plan_focus = next_plan_focus(app.plan_focus);
-        }
-        KeyCode::BackTab => {
-            app.plan_focus = previous_plan_focus(app.plan_focus);
-        }
         KeyCode::Char('j') | KeyCode::Down => {
             let selected = current_plan_selection(app);
             if selected + 1 < entry_count(entries, app.plan_focus) {
@@ -189,15 +135,19 @@ pub fn handle_editor_key(
         }
 
         // Search existing series in this block, or create one from the typed label.
-        KeyCode::Char('n') => app.open_series_search(
-            AddDestination::Plan {
-                plan_id: plan.id.clone(),
-            },
-            budget_block_for_focus(app.plan_focus),
-        )?,
+        KeyCode::Char('n') => {
+            if let Some(plan) = plan {
+                app.open_series_search(
+                    AddDestination::Plan {
+                        plan_id: plan.id.clone(),
+                    },
+                    budget_block_for_focus(app.plan_focus),
+                )?;
+            }
+        }
 
-        // The plan editor only changes plan-scoped things: which series are in the plan and
-        // this plan's amount for each. Label, mode, and period belong to the *shared* series
+        // The screen only changes plan-scoped things: which series are in the plan and this
+        // plan's amount for each. Label, mode, and period belong to the *shared* series
         // (they'd change every plan), so those edits live on the Series page. Redirect the
         // mode and period keys there rather than leaving them as silent dead ends.
         KeyCode::Char('m') | KeyCode::Char('p') => {
@@ -236,15 +186,17 @@ pub fn handle_editor_key(
 
 fn next_plan_focus(current: PlanFocus) -> PlanFocus {
     match current {
+        PlanFocus::List => PlanFocus::Income,
         PlanFocus::Income => PlanFocus::Expenses,
         PlanFocus::Expenses => PlanFocus::Envelopes,
-        PlanFocus::Envelopes => PlanFocus::Income,
+        PlanFocus::Envelopes => PlanFocus::List,
     }
 }
 
 fn previous_plan_focus(current: PlanFocus) -> PlanFocus {
     match current {
-        PlanFocus::Income => PlanFocus::Envelopes,
+        PlanFocus::List => PlanFocus::Envelopes,
+        PlanFocus::Income => PlanFocus::List,
         PlanFocus::Expenses => PlanFocus::Income,
         PlanFocus::Envelopes => PlanFocus::Expenses,
     }
@@ -264,6 +216,7 @@ pub fn selected_series_id(app: &App, entries: &[PlanEntry]) -> Option<String> {
 
 fn current_plan_selection(app: &App) -> usize {
     match app.plan_focus {
+        PlanFocus::List => app.plans_sel,
         PlanFocus::Income => app.editor_income_sel,
         PlanFocus::Expenses => app.editor_expense_sel,
         PlanFocus::Envelopes => app.editor_env_sel,
@@ -272,6 +225,7 @@ fn current_plan_selection(app: &App) -> usize {
 
 fn set_plan_selection(app: &mut App, selected: usize) {
     match app.plan_focus {
+        PlanFocus::List => app.plans_sel = selected,
         PlanFocus::Income => app.editor_income_sel = selected,
         PlanFocus::Expenses => app.editor_expense_sel = selected,
         PlanFocus::Envelopes => app.editor_env_sel = selected,
@@ -287,6 +241,8 @@ fn entry_count(entries: &[PlanEntry], focus: PlanFocus) -> usize {
 
 fn entry_matches_focus(entry: &PlanEntry, focus: PlanFocus) -> bool {
     match focus {
+        // The master list holds no plan items, so nothing matches it.
+        PlanFocus::List => false,
         PlanFocus::Income => {
             entry.series.kind == Kind::Transaction && entry.series.direction == Some(Direction::In)
         }
@@ -299,65 +255,85 @@ fn entry_matches_focus(entry: &PlanEntry, focus: PlanFocus) -> bool {
 
 fn budget_block_for_focus(focus: PlanFocus) -> BudgetBlock {
     match focus {
-        PlanFocus::Income => BudgetBlock::Income,
+        // Only ever called from an item pane; List falls back to Income for totality.
+        PlanFocus::List | PlanFocus::Income => BudgetBlock::Income,
         PlanFocus::Expenses => BudgetBlock::Expenses,
         PlanFocus::Envelopes => BudgetBlock::Envelopes,
     }
 }
 
-pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEntry]) {
-    let [header, body, footer] = Layout::vertical([
+pub fn draw(frame: &mut Frame, app: &App, summaries: &[PlanSummary], entries: &[PlanEntry]) {
+    let [header, body, summary_area, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
+        Constraint::Length(7),
         Constraint::Length(2),
     ])
     .areas(frame.area());
 
-    let title = format!(
-        " {} — {} item{} ",
-        plan.name,
-        entries.len(),
-        if entries.len() == 1 { "" } else { "s" }
-    );
-    let header_p = Paragraph::new(Line::from(title.bold()))
+    let title = Paragraph::new(Line::from(" Plans ".bold()))
         .alignment(Alignment::Center)
         .block(crate::bordered_block());
-    frame.render_widget(header_p, header);
+    frame.render_widget(title, header);
 
-    let [blocks_area, summary_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(7)]).areas(body);
-    let [left_items, env_area] =
-        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
-            .areas(blocks_area);
-    let [income_area, expense_area] = Layout::vertical([
-        Constraint::Length(crate::income_block_height(entry_count(
+    // Master list on the left; the selected plan's stacked item panes on the right.
+    let [list_area, detail_area] =
+        Layout::horizontal([Constraint::Length(34), Constraint::Min(0)]).areas(body);
+    draw_plan_list(frame, list_area, app, summaries);
+
+    // Each pane asks for its content height as a floor; ratatui shares the leftover space
+    // evenly across the three `Min`s, so an empty (or lopsided) plan stays balanced instead
+    // of letting one block swallow all the slack.
+    let [income_area, expense_area, env_area] = Layout::vertical([
+        Constraint::Min(crate::income_block_height(entry_count(
             entries,
             PlanFocus::Income,
         ))),
-        Constraint::Min(0),
+        Constraint::Min(crate::income_block_height(entry_count(
+            entries,
+            PlanFocus::Expenses,
+        ))),
+        Constraint::Min(crate::income_block_height(entry_count(
+            entries,
+            PlanFocus::Envelopes,
+        ))),
     ])
-    .areas(left_items);
+    .areas(detail_area);
 
     draw_plan_block(frame, income_area, app, entries, PlanFocus::Income);
     draw_plan_block(frame, expense_area, app, entries, PlanFocus::Expenses);
     draw_plan_block(frame, env_area, app, entries, PlanFocus::Envelopes);
     draw_plan_summary(frame, summary_area, entries);
 
-    // The editor's verbs are the same in every block now that series-definition edits moved
-    // to the Series page: add, set this plan's amount, remove from this plan.
-    let hints = Line::from(vec![
-        key(" Tab "),
-        Span::raw(" block  "),
-        key(" j/k "),
-        Span::raw(" move  "),
-        key(" n "),
-        Span::raw(" new  "),
-        key(" a "),
-        Span::raw(" amount  "),
-        key(" x "),
-        Span::raw(" remove"),
-    ]);
+    // Local verbs switch with focus: plan-scoped in the list, item-scoped in a pane.
+    let hints = if app.plan_focus == PlanFocus::List {
+        Line::from(vec![
+            key(" j/k "),
+            Span::raw(" move  "),
+            key(" n "),
+            Span::raw(" new  "),
+            key(" l "),
+            Span::raw(" label  "),
+            key(" s "),
+            Span::raw(" stamp  "),
+            key(" x "),
+            Span::raw(" delete"),
+        ])
+    } else {
+        Line::from(vec![
+            key(" j/k "),
+            Span::raw(" move  "),
+            key(" n "),
+            Span::raw(" new  "),
+            key(" a "),
+            Span::raw(" amount  "),
+            key(" x "),
+            Span::raw(" remove"),
+        ])
+    };
     let nav_hints = Line::from(vec![
+        key(" Tab "),
+        Span::raw(" pane  "),
         key(" h "),
         Span::raw(" help  "),
         key(" S "),
@@ -371,6 +347,41 @@ pub fn draw_editor(frame: &mut Frame, app: &App, plan: &Plan, entries: &[PlanEnt
     ]);
     let status = crate::footer_status(app);
     crate::draw_screen_footer(frame, footer, hints, nav_hints, status.as_deref());
+}
+
+/// The master plan list. The selected row stays highlighted whether or not the list is the
+/// focused pane, so it's always clear which plan the detail panes belong to; the mauve border
+/// (not the highlight) signals focus.
+fn draw_plan_list(frame: &mut Frame, area: Rect, app: &App, summaries: &[PlanSummary]) {
+    let focused = app.plan_focus == PlanFocus::List;
+    if summaries.is_empty() {
+        let p = Paragraph::new("No plans yet — press n to create one.")
+            .block(crate::selectable_block(" Templates ", focused));
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = summaries
+        .iter()
+        .map(|s| {
+            let count = format!(
+                "{} item{}",
+                s.item_count,
+                if s.item_count == 1 { "" } else { "s" }
+            );
+            let line = Line::from(vec![
+                Span::raw(format!("{:<20}", crate::truncate(&s.plan.name, 20))),
+                Span::styled(count, Style::default().fg(Color::DarkGray)),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.plans_sel));
+
+    let list = crate::selectable_list(items).block(crate::selectable_block(" Templates ", focused));
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 /// Render the reusable plan's cash-flow scenario without any live account terms.
@@ -452,7 +463,7 @@ fn draw_plan_block(
 
     let focused = app.plan_focus == focus;
     let selected = match focus {
-        PlanFocus::Income => app.editor_income_sel,
+        PlanFocus::List | PlanFocus::Income => app.editor_income_sel,
         PlanFocus::Expenses => app.editor_expense_sel,
         PlanFocus::Envelopes => app.editor_env_sel,
     };
@@ -469,7 +480,8 @@ fn draw_plan_block(
 
 fn plan_block_title(focus: PlanFocus) -> &'static str {
     match focus {
-        PlanFocus::Income => " Income ",
+        // Only the three item panes render a block title; List has its own list widget.
+        PlanFocus::List | PlanFocus::Income => " Income ",
         PlanFocus::Expenses => " Expenses ",
         PlanFocus::Envelopes => " Envelopes ",
     }
@@ -480,7 +492,7 @@ fn plan_block_title(focus: PlanFocus) -> &'static str {
 fn entry_row(entry: &PlanEntry, focus: PlanFocus) -> ListItem<'static> {
     let s = &entry.series;
     let line = match focus {
-        PlanFocus::Income | PlanFocus::Expenses => Line::from(vec![
+        PlanFocus::List | PlanFocus::Income | PlanFocus::Expenses => Line::from(vec![
             Span::raw(format!("{:<24}", crate::truncate(&s.label, 24))),
             Span::raw(format!("{:>12}", entry.amount.to_string())),
         ]),
@@ -558,9 +570,7 @@ mod tests {
         let entries = queries::load_plan_entries(&conn, &plan_id).unwrap();
         let app = App {
             conn,
-            screen: Screen::PlanEditor {
-                plan_id: plan_id.clone(),
-            },
+            screen: Screen::Plans,
             should_quit: false,
             dash_focus: crate::DashFocus::Income,
             viewed_year: 2026,
@@ -585,6 +595,7 @@ mod tests {
             pending_dash_env: None,
             pending_dash_account: None,
             pending_series_select: None,
+            pending_plan_select: None,
             summary_anims: crate::anim::SummaryAnimations::new(),
             frame_now: std::time::Instant::now(),
             modal: None,
@@ -616,16 +627,20 @@ mod tests {
     }
 
     #[test]
-    fn plan_editor_renders_expenses_summary_and_projection_note() {
-        let (app, plan, entries, _) = app_with_transaction_plan();
+    fn plans_screen_renders_expenses_summary_and_projection_note() {
+        let (app, _, entries, _) = app_with_transaction_plan();
+        let summaries = queries::plan_summaries(&app.conn).unwrap();
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| draw_editor(frame, &app, &plan, &entries))
+            .draw(|frame| draw(frame, &app, &summaries, &entries))
             .unwrap();
         let text = buffer_text(&terminal);
 
+        // The master list and the selected plan's detail render together.
+        assert!(text.contains("Templates"));
+        assert!(text.contains("Normal"));
         assert!(text.contains("Expenses"));
         assert!(text.contains("Summary"));
         assert!(text.contains("planned income"));
@@ -637,22 +652,88 @@ mod tests {
     }
 
     #[test]
-    fn backtab_cycles_plan_blocks_backward() {
-        let (mut app, plan, entries, _) = app_with_transaction_plan();
+    fn empty_item_panes_are_evenly_balanced() {
+        // With no items, the three panes should split the detail column evenly rather than
+        // letting Expenses swallow the slack (the regression this guards).
+        let (app, _, _, _) = app_with_transaction_plan();
+        let summaries = queries::plan_summaries(&app.conn).unwrap();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
 
-        handle_editor_key(&mut app, backtab_key(), &plan, &entries).unwrap();
-        assert!(app.plan_focus == PlanFocus::Income);
+        terminal
+            .draw(|frame| draw(frame, &app, &summaries, &[]))
+            .unwrap();
 
-        handle_editor_key(&mut app, backtab_key(), &plan, &entries).unwrap();
-        assert!(app.plan_focus == PlanFocus::Envelopes);
+        let title_row = |needle: &str| -> u16 {
+            let buffer = terminal.backend().buffer();
+            for y in 0..buffer.area.height {
+                let row: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                if row.contains(needle) {
+                    return y;
+                }
+            }
+            panic!("no row contains {needle:?}");
+        };
+
+        let income = title_row(" Income ");
+        let expenses = title_row(" Expenses ");
+        let envelopes = title_row(" Envelopes ");
+        let top = expenses - income;
+        let bottom = envelopes - expenses;
+        assert!(
+            top.abs_diff(bottom) <= 1,
+            "panes unbalanced: Income@{income} Expenses@{expenses} Envelopes@{envelopes}"
+        );
     }
 
     #[test]
-    fn r_key_is_inert_in_plan_editor() {
+    fn draw_survives_a_tiny_frame() {
+        // The fixed header/summary/footer bands (12 rows) exceed a short terminal; ratatui
+        // must clamp rather than panic.
+        let (app, _, entries, _) = app_with_transaction_plan();
+        let summaries = queries::plan_summaries(&app.conn).unwrap();
+        let backend = TestBackend::new(20, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &summaries, &entries))
+            .unwrap();
+    }
+
+    #[test]
+    fn draw_with_no_plans_shows_the_empty_prompt() {
+        let (mut app, _, _, _) = app_with_transaction_plan();
+        app.plan_focus = PlanFocus::List;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app, &[], &[])).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("No plans yet"));
+    }
+
+    #[test]
+    fn backtab_cycles_panes_backward() {
+        // The cycle now includes the master list: Expenses → Income → List.
+        let (mut app, plan, entries, _) = app_with_transaction_plan();
+        let summaries = queries::plan_summaries(&app.conn).unwrap();
+
+        handle_key(&mut app, backtab_key(), &summaries, Some(&plan), &entries).unwrap();
+        assert!(app.plan_focus == PlanFocus::Income);
+
+        handle_key(&mut app, backtab_key(), &summaries, Some(&plan), &entries).unwrap();
+        assert!(app.plan_focus == PlanFocus::List);
+    }
+
+    #[test]
+    fn r_key_is_inert_in_item_pane() {
         // `r` is no longer a label-edit shortcut, even as a redirect to the Series page.
         let (mut app, plan, entries, rent_series_id) = app_with_transaction_plan();
+        let summaries = queries::plan_summaries(&app.conn).unwrap();
 
-        handle_editor_key(&mut app, r_key(), &plan, &entries).unwrap();
+        handle_key(&mut app, r_key(), &summaries, Some(&plan), &entries).unwrap();
 
         assert!(app.modal.is_none(), "no label prompt opened");
         assert!(app.status.is_none(), "r has no action");
@@ -665,13 +746,14 @@ mod tests {
     #[test]
     fn direction_key_does_not_change_transaction_series_direction() {
         let (mut app, plan, entries, rent_series_id) = app_with_transaction_plan();
+        let summaries = queries::plan_summaries(&app.conn).unwrap();
         let rent = entries
             .iter()
             .find(|entry| entry.series.id == rent_series_id)
             .unwrap();
         assert_eq!(rent.series.direction, Some(Direction::Out));
 
-        handle_editor_key(&mut app, direction_key(), &plan, &entries).unwrap();
+        handle_key(&mut app, direction_key(), &summaries, Some(&plan), &entries).unwrap();
 
         assert!(app.status.is_none());
         assert!(app.pending_select.is_none());
@@ -686,5 +768,68 @@ mod tests {
         let (app, _, entries, rent_series_id) = app_with_transaction_plan();
 
         assert_eq!(selected_series_id(&app, &entries), Some(rent_series_id));
+    }
+
+    #[test]
+    fn contextual_series_id_is_none_when_the_list_is_focused() {
+        // Focused on the master list, `S` should open the series list, not a detail.
+        let (mut app, _, entries, _) = app_with_transaction_plan();
+        app.plan_focus = PlanFocus::List;
+
+        assert_eq!(selected_series_id(&app, &entries), None);
+    }
+
+    #[test]
+    fn tab_cycles_forward_through_all_four_panes() {
+        let (mut app, plan, entries, _) = app_with_transaction_plan();
+        let summaries = queries::plan_summaries(&app.conn).unwrap();
+        app.plan_focus = PlanFocus::List;
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+
+        for expected in [
+            PlanFocus::Income,
+            PlanFocus::Expenses,
+            PlanFocus::Envelopes,
+            PlanFocus::List,
+        ] {
+            handle_key(&mut app, tab, &summaries, Some(&plan), &entries).unwrap();
+            assert!(app.plan_focus == expected);
+        }
+    }
+
+    #[test]
+    fn list_focus_n_opens_the_new_plan_prompt() {
+        let (mut app, plan, entries, _) = app_with_transaction_plan();
+        let summaries = queries::plan_summaries(&app.conn).unwrap();
+        app.plan_focus = PlanFocus::List;
+        let n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+
+        handle_key(&mut app, n, &summaries, Some(&plan), &entries).unwrap();
+
+        assert!(matches!(
+            app.modal,
+            Some(crate::Modal::Text(crate::TextPrompt {
+                kind: PromptKind::NewPlan,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn list_focus_n_opens_new_plan_even_with_no_plans() {
+        // The empty-state prompt must still work: `n` creates the first plan.
+        let (mut app, plan, entries, _) = app_with_transaction_plan();
+        app.plan_focus = PlanFocus::List;
+        let n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+
+        handle_key(&mut app, n, &[], Some(&plan), &entries).unwrap();
+
+        assert!(matches!(
+            app.modal,
+            Some(crate::Modal::Text(crate::TextPrompt {
+                kind: PromptKind::NewPlan,
+                ..
+            }))
+        ));
     }
 }

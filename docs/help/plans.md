@@ -24,3 +24,14 @@ Furthermore, editing a month's bills or envelopes doesn't change the plan either
 
   Stamp -> the month opens with these bills and envelopes.
 ```
+
+## Keys
+
+This list is the master pane; the selected plan's Income, Expenses, and Envelopes fill the panes to the right. Tab moves focus between them; these keys act on the plan while the list is focused.
+
+- `j` / `k` — move between plans
+- `n` — create a new plan
+- `l` — rename the selected plan
+- `s` — stamp the selected plan onto a month
+- `x` — delete the selected plan (stamped months are kept)
+- `Tab` — move focus into the item panes

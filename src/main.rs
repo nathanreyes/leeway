@@ -43,9 +43,9 @@ use std::time::{Duration, Instant};
 
 pub(crate) const SERIES_RENAME_GUIDANCE: &str = "Rename this item from its Series page — press S";
 
-/// Which screen is showing. `PlanEditor` carries the id of the plan being edited —
-/// that's how the loop knows which plan's items to load. Series carries its own compact
-/// navigation state so a contextual detail drill-in can return to its exact origin.
+/// Which screen is showing. `Plans` is the unified master/detail screen (plan list plus the
+/// selected plan's items). Series carries its own compact navigation state so a contextual
+/// detail drill-in can return to its exact origin.
 pub enum Screen {
     Dashboard,
     EnvelopeDetail {
@@ -55,9 +55,6 @@ pub enum Screen {
         state: SeriesScreen,
     },
     Plans,
-    PlanEditor {
-        plan_id: String,
-    },
     Settings {
         tab: SettingsTab,
         origin: SeriesOrigin,
@@ -128,7 +125,6 @@ pub enum SeriesOrigin {
     Dashboard,
     EnvelopeDetail { detail: EnvelopeDetail },
     Plans,
-    PlanEditor { plan_id: String },
 }
 
 impl SeriesOrigin {
@@ -139,9 +135,6 @@ impl SeriesOrigin {
                 detail: detail.clone(),
             }),
             Screen::Plans => Some(Self::Plans),
-            Screen::PlanEditor { plan_id } => Some(Self::PlanEditor {
-                plan_id: plan_id.clone(),
-            }),
             Screen::Series { .. } => None,
             Screen::Settings { origin, .. } => Some(origin.clone()),
         }
@@ -152,7 +145,6 @@ impl SeriesOrigin {
             Self::Dashboard => Screen::Dashboard,
             Self::EnvelopeDetail { detail } => Screen::EnvelopeDetail { detail },
             Self::Plans => Screen::Plans,
-            Self::PlanEditor { plan_id } => Screen::PlanEditor { plan_id },
         }
     }
 }
@@ -169,10 +161,12 @@ pub enum DashFocus {
     Accounts,
 }
 
-/// Which budget block is focused in the plan editor. It mirrors the dashboard's item
-/// grouping, minus header/accounts.
+/// Which pane is focused on the unified Plans screen. `List` is the master plan list;
+/// the other three are the selected plan's item sublists, mirroring the dashboard's item
+/// grouping minus header/accounts. Tab cycles List → Income → Expenses → Envelopes → List.
 #[derive(Clone, Copy, PartialEq)]
 pub enum PlanFocus {
+    List,
     Income,
     Expenses,
     Envelopes,
@@ -629,6 +623,10 @@ pub struct App {
     /// its id here, and the event loop resolves it to the (search-filtered) list position on
     /// the next reload so the new series lands selected.
     pub pending_series_select: Option<String>,
+    /// The plans list's counterpart to `pending_select`: after creating a plan we stash its
+    /// id here, and the event loop resolves it to the (name-sorted) list position on the
+    /// next reload so the new plan lands selected.
+    pub pending_plan_select: Option<String>,
     pub summary_anims: SummaryAnimations,
     pub frame_now: Instant,
     pub modal: Option<Modal>,
@@ -842,7 +840,7 @@ fn main() -> Result<()> {
         series_range: SeriesTimeRange::Last12Stamped,
         // Land on the common case: series that belong to a plan. `f` cycles to Ad-hoc, then Both.
         series_filter: SeriesFilter::Plans,
-        plan_focus: PlanFocus::Income,
+        plan_focus: PlanFocus::List,
         editor_income_sel: 0,
         editor_expense_sel: 0,
         editor_env_sel: 0,
@@ -852,6 +850,7 @@ fn main() -> Result<()> {
         pending_dash_env: None,
         pending_dash_account: None,
         pending_series_select: None,
+        pending_plan_select: None,
         summary_anims: SummaryAnimations::new(),
         frame_now: Instant::now(),
         modal: None,
@@ -1066,29 +1065,29 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 
             Screen::Plans => {
                 let summaries = queries::plan_summaries(&app.conn)?;
-                clamp(&mut app.plans_sel, summaries.len());
-                terminal.draw(|f| {
-                    plans::draw_list(f, app, &summaries);
-                    draw_modal(f, app);
-                })?;
-                if let Some(key) = read_key(sync_tick(app))? {
-                    if app.modal.is_some() {
-                        handle_modal_key(app, key)?;
-                    } else if handle_global_key(app, key) || !budget_key_allowed(app, key) {
-                    } else {
-                        plans::handle_list_key(app, key, &summaries)?;
-                    }
-                }
-            }
 
-            Screen::PlanEditor { plan_id } => {
-                let plan_id = plan_id.clone();
-                // The plan may have been deleted (e.g. via a confirm) — fall back to the list.
-                let Some(plan) = queries::get_plan(&app.conn, &plan_id)? else {
-                    app.screen = Screen::Plans;
-                    continue;
+                // Resolve a pending "select this new plan" request before clamping, so the
+                // newly created (name-sorted) plan lands selected on its first frame.
+                if let Some(target) = app.pending_plan_select.take()
+                    && let Some(idx) = summaries.iter().position(|s| s.plan.id == target)
+                {
+                    app.plans_sel = idx;
+                    app.plan_focus = PlanFocus::List;
+                }
+                clamp(&mut app.plans_sel, summaries.len());
+                // With no plans there is nothing to detail, so the list is the only sensible
+                // control — pin focus there.
+                if summaries.is_empty() {
+                    app.plan_focus = PlanFocus::List;
+                }
+
+                // The selected plan drives the detail panes. It can be absent (no plans yet),
+                // in which case the item panes and summary render empty.
+                let plan = summaries.get(app.plans_sel).map(|s| &s.plan);
+                let entries = match plan {
+                    Some(plan) => queries::load_plan_entries(&app.conn, &plan.id)?,
+                    None => Vec::new(),
                 };
-                let entries = queries::load_plan_entries(&app.conn, &plan_id)?;
 
                 // Resolve a pending "select this new item" request now that rows are loaded.
                 if let Some(target) = app.pending_select.take()
@@ -1100,6 +1099,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             PlanFocus::Income => app.editor_income_sel = idx,
                             PlanFocus::Expenses => app.editor_expense_sel = idx,
                             PlanFocus::Envelopes => app.editor_env_sel = idx,
+                            PlanFocus::List => {}
                         }
                     }
                 }
@@ -1116,8 +1116,9 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     plan_entry_count(&entries, PlanFocus::Envelopes),
                 );
 
+                let plan = plan.cloned();
                 terminal.draw(|f| {
-                    plans::draw_editor(f, app, &plan, &entries);
+                    plans::draw(f, app, &summaries, &entries);
                     draw_modal(f, app);
                 })?;
                 if let Some(key) = read_key(sync_tick(app))? {
@@ -1128,7 +1129,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                         || !budget_key_allowed(app, key)
                     {
                     } else {
-                        plans::handle_editor_key(app, key, &plan, &entries)?;
+                        plans::handle_key(app, key, &summaries, plan.as_ref(), &entries)?;
                     }
                 }
             }
@@ -1715,7 +1716,7 @@ fn reset_dashboard_selections(app: &mut App) {
 }
 
 fn reset_editor_selections(app: &mut App) {
-    app.plan_focus = PlanFocus::Income;
+    app.plan_focus = PlanFocus::List;
     app.editor_income_sel = 0;
     app.editor_expense_sel = 0;
     app.editor_env_sel = 0;
@@ -1777,6 +1778,8 @@ fn plan_focus_for_entry(entry: &leeway::models::PlanEntry) -> PlanFocus {
 
 fn plan_entry_matches(entry: &leeway::models::PlanEntry, focus: PlanFocus) -> bool {
     match focus {
+        // The master list holds no plan items.
+        PlanFocus::List => false,
         PlanFocus::Income => {
             entry.series.kind == leeway::models::Kind::Transaction
                 && entry.series.direction == Some(leeway::models::Direction::In)
@@ -2405,7 +2408,10 @@ fn submit_text(app: &mut App) -> Result<()> {
             }
             let id = ops::create_plan(&app.conn, &text)?;
             reset_editor_selections(app);
-            app.screen = Screen::PlanEditor { plan_id: id };
+            // Stay on the unified Plans screen; the loop selects the new plan (name-sorted,
+            // so its index isn't known until the next reload) via `pending_plan_select`.
+            app.pending_plan_select = Some(id);
+            app.screen = Screen::Plans;
             app.status = Some(format!("Created plan “{text}”"));
         }
         PromptKind::RenamePlan { id } => {
@@ -3660,6 +3666,7 @@ mod tests {
             pending_dash_env: None,
             pending_dash_account: None,
             pending_series_select: None,
+            pending_plan_select: None,
             summary_anims: SummaryAnimations::new(),
             frame_now: Instant::now(),
             modal: None,
@@ -3783,21 +3790,25 @@ mod tests {
     }
 
     #[test]
-    fn contextual_series_returns_to_the_originating_plan_editor() {
+    fn contextual_series_returns_to_the_originating_plans_screen() {
+        // From an item pane on the unified Plans screen, `S` opens the series detail and
+        // returns to Plans (selection is restored by `plans_sel`, not an origin plan id).
         let (mut app, envelope_detail, _) = app_with_envelope_detail();
         let series_id = series_id_for_detail(&app, &envelope_detail);
-        let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
-        app.screen = Screen::PlanEditor {
-            plan_id: plan_id.clone(),
-        };
+        app.screen = Screen::Plans;
+        app.plan_focus = PlanFocus::Expenses;
 
-        handle_global_key_with_series(&mut app, key(KeyCode::Char('S')), Some(series_id));
-        app.return_from_series();
-
+        handle_global_key_with_series(&mut app, key(KeyCode::Char('S')), Some(series_id.clone()));
         match &app.screen {
-            Screen::PlanEditor { plan_id: actual } => assert_eq!(actual, &plan_id),
-            _ => panic!("expected the originating plan editor"),
+            Screen::Series { state } => {
+                assert_eq!(state.mode, SeriesMode::Detail { series_id });
+                assert!(matches!(state.origin, SeriesOrigin::Plans));
+            }
+            _ => panic!("expected the series detail"),
         }
+
+        app.return_from_series();
+        assert!(matches!(app.screen, Screen::Plans));
     }
 
     #[test]
