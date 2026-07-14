@@ -18,10 +18,12 @@ pub const GREEN: Color = Color::Rgb(147, 224, 160);
 /// Site: `--cyan`.
 pub const CYAN: Color = Color::Rgb(134, 217, 230);
 
-/// Subtle band behind a selected list row. Site: `--line-bright` (#45475a).
-pub const SELECTION: Color = Color::Rgb(69, 71, 90);
+/// Band behind a selected list row. Catppuccin Mocha `Surface2` (#585b70) —
+/// bright enough to read clearly against the terminal's dark base, where the
+/// former `#45475a` tint nearly vanished.
+pub const SELECTION: Color = Color::Rgb(88, 91, 112);
 
 /// Empty segment of an envelope meter. A touch lighter than [`SELECTION`] so an
-/// empty meter stays visible even on a selected (banded) row — the site's track
-/// colour equals SELECTION, which would vanish under the band here.
-pub const METER_TRACK: Color = Color::Rgb(88, 91, 112);
+/// empty meter stays visible even on a selected (banded) row — a track colour at
+/// or below SELECTION would vanish under the band here. Mocha `Overlay0` (#6c7086).
+pub const METER_TRACK: Color = Color::Rgb(108, 112, 134);
