@@ -51,6 +51,18 @@ pub fn set_default_envelope_mode(conn: &Connection, mode: Mode) -> Result<()> {
     Ok(())
 }
 
+/// Persist the figure requested by credit-card amount prompts. Accounts continue to store
+/// available credit; current balance is converted at the input boundary.
+pub fn set_credit_card_entry_mode(conn: &Connection, mode: CreditCardEntryMode) -> Result<()> {
+    conn.execute(
+        "INSERT INTO setting (key, value) VALUES ('credit_card_entry_mode', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![mode.as_str()],
+    )
+    .context("saving credit-card entry mode setting")?;
+    Ok(())
+}
+
 // --- Stamping (§5) -------------------------------------------------------------
 
 /// Copy a plan's entries into concrete instances for a new month, then sever the link:
@@ -1207,6 +1219,31 @@ mod tests {
                 "SELECT COUNT(*) FROM setting WHERE key='currency'",
                 [],
                 |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn credit_card_entry_mode_defaults_and_round_trips() {
+        let conn = db::open_in_memory().unwrap();
+        assert_eq!(
+            queries::credit_card_entry_mode(&conn).unwrap(),
+            CreditCardEntryMode::AvailableCredit
+        );
+
+        set_credit_card_entry_mode(&conn, CreditCardEntryMode::CurrentBalance).unwrap();
+        assert_eq!(
+            queries::credit_card_entry_mode(&conn).unwrap(),
+            CreditCardEntryMode::CurrentBalance
+        );
+
+        set_credit_card_entry_mode(&conn, CreditCardEntryMode::AvailableCredit).unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM setting WHERE key='credit_card_entry_mode'",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
         assert_eq!(rows, 1);

@@ -6,6 +6,8 @@ Accounts are your real balances right now — checking and credit cards. This is
 
 Leeway trusts your actual balance rather than a running tally of transactions. A checking buffer is money you hold back; a card's carried balance folds into what's left. Accounts apply only to the current month.
 
+When editing a credit card, you can enter either its available credit or its current balance. Press `Tab` in the amount prompt to switch between them; the choice is also available under Settings > General and becomes the default for future card prompts.
+
 ## Example
 
 ```

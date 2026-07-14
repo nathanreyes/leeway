@@ -22,7 +22,9 @@ mod theme;
 use anim::SummaryAnimations;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
-use leeway::models::{AccountType, Direction, Kind, Mode, PeriodType, Series, Txn};
+use leeway::models::{
+    AccountType, CreditCardEntryMode, Direction, Kind, Mode, PeriodType, Series, Txn,
+};
 use leeway::money::Money;
 use leeway::sync::{self, Inspection, StorageMode, SyncStatus};
 use leeway::view::SeriesTimeRange;
@@ -94,11 +96,16 @@ impl SettingsTab {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GeneralRow {
     EnvelopeMode,
+    CreditCardEntry,
     Currency,
 }
 
 impl GeneralRow {
-    const ALL: [GeneralRow; 2] = [GeneralRow::EnvelopeMode, GeneralRow::Currency];
+    const ALL: [GeneralRow; 3] = [
+        GeneralRow::EnvelopeMode,
+        GeneralRow::CreditCardEntry,
+        GeneralRow::Currency,
+    ];
 }
 
 #[derive(Clone)]
@@ -454,8 +461,11 @@ pub enum PromptKind {
     AccountBalance {
         id: String,
     },
-    CardAvailable {
+    CardEntry {
         id: String,
+        name: String,
+        limit: Money,
+        mode: CreditCardEntryMode,
     },
     CardLimit {
         id: String,
@@ -469,9 +479,10 @@ pub enum PromptKind {
     NewCardLimit {
         name: String,
     },
-    NewCardAvailable {
+    NewCardEntry {
         name: String,
         limit: Money,
+        mode: CreditCardEntryMode,
     },
     AccountName {
         id: String,
@@ -1211,6 +1222,14 @@ fn handle_general_tab_key(app: &mut App, key: KeyEvent) -> Result<()> {
                     };
                     app.status = Some(format!("New envelopes now default to {label}"));
                 }
+                GeneralRow::CreditCardEntry => {
+                    let next = queries::credit_card_entry_mode(&app.conn)?.next();
+                    ops::set_credit_card_entry_mode(&app.conn, next)?;
+                    app.status = Some(format!(
+                        "Credit card prompts now use {}",
+                        next.label().to_lowercase()
+                    ));
+                }
                 GeneralRow::Currency => app.open_currency_picker(),
             }
         }
@@ -1321,16 +1340,19 @@ fn draw_settings_header(frame: &mut Frame, area: Rect, active: SettingsTab) {
     );
 }
 
-/// The General tab: a two-row selectable list of app-wide preferences.
+/// The General tab: a short selectable list of app-wide preferences.
 fn draw_general_tab(frame: &mut Frame, area: Rect, app: &App) {
     let default_mode = queries::default_mode(&app.conn).unwrap_or(Mode::Automatic);
     let mode_label = match default_mode {
         Mode::Automatic => "automatic",
         Mode::Manual => "manual",
     };
+    let card_entry_mode =
+        queries::credit_card_entry_mode(&app.conn).unwrap_or(CreditCardEntryMode::AvailableCredit);
     let currency = leeway::currency::active();
     let rows = [
         ("New-envelope default", mode_label.to_string()),
+        ("Credit card entry", card_entry_mode.label().to_string()),
         (
             "Display currency",
             format!("{} ({})", currency.code, currency.symbol),
@@ -2064,6 +2086,7 @@ fn handle_text_key(app: &mut App, key: KeyEvent) -> Result<()> {
             };
             restore_envelope_modal(app, return_to);
         }
+        KeyCode::Tab => toggle_card_entry_prompt(app)?,
         KeyCode::Enter => submit_text(app)?,
         KeyCode::Backspace => {
             if let Some(Modal::Text(p)) = &mut app.modal {
@@ -2081,6 +2104,38 @@ fn handle_text_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         _ => {}
     }
+    Ok(())
+}
+
+/// Switch an open credit-card amount prompt between the two equivalent figures. A valid
+/// in-progress amount is converted in place, and the choice is persisted so Settings and
+/// the next card prompt stay in sync.
+fn toggle_card_entry_prompt(app: &mut App) -> Result<()> {
+    let Some(Modal::Text(prompt)) = app.modal.as_ref() else {
+        return Ok(());
+    };
+    let (limit, current_mode) = match &prompt.kind {
+        PromptKind::CardEntry { limit, mode, .. }
+        | PromptKind::NewCardEntry { limit, mode, .. } => (*limit, *mode),
+        _ => return Ok(()),
+    };
+    let next = current_mode.next();
+    ops::set_credit_card_entry_mode(&app.conn, next)?;
+
+    let Some(Modal::Text(prompt)) = app.modal.as_mut() else {
+        return Ok(());
+    };
+    if let Some(entered) = Money::parse_dollars(prompt.buffer.trim()) {
+        let available = current_mode.as_available_credit(limit, entered);
+        prompt.buffer = amount_edit_string(next.entered_amount(limit, available));
+    }
+    prompt.title = match &mut prompt.kind {
+        PromptKind::CardEntry { name, mode, .. } | PromptKind::NewCardEntry { name, mode, .. } => {
+            *mode = next;
+            format!("{} for {name}", next.label())
+        }
+        _ => return Ok(()),
+    };
     Ok(())
 }
 
@@ -2341,8 +2396,12 @@ fn submit_text(app: &mut App) -> Result<()> {
             Some(balance) => ops::set_balance(&app.conn, &id, balance)?,
             None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
         },
-        PromptKind::CardAvailable { id } => match Money::parse_dollars(&text) {
-            Some(available) => ops::set_available_credit(&app.conn, &id, available)?,
+        PromptKind::CardEntry {
+            id, limit, mode, ..
+        } => match Money::parse_dollars(&text) {
+            Some(entered) => {
+                ops::set_available_credit(&app.conn, &id, mode.as_available_credit(limit, entered))?
+            }
             None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
         },
         PromptKind::CardLimit { id } => match Money::parse_dollars(&text) {
@@ -2386,11 +2445,15 @@ fn submit_text(app: &mut App) -> Result<()> {
             }
         },
         PromptKind::NewCardLimit { name } => match Money::parse_dollars(&text) {
-            Some(limit) => app.open_text_replace_on_type(
-                format!("Available credit for {name}"),
-                amount_edit_string(limit),
-                PromptKind::NewCardAvailable { name, limit },
-            ),
+            Some(limit) => {
+                let mode = queries::credit_card_entry_mode(&app.conn)?;
+                let available = limit;
+                app.open_text_replace_on_type(
+                    format!("{} for {name}", mode.label()),
+                    amount_edit_string(mode.entered_amount(limit, available)),
+                    PromptKind::NewCardEntry { name, limit, mode },
+                );
+            }
             None => {
                 app.status = Some(format!("Couldn't read “{text}” as an amount"));
                 app.open_text_prompt(
@@ -2403,8 +2466,9 @@ fn submit_text(app: &mut App) -> Result<()> {
                 );
             }
         },
-        PromptKind::NewCardAvailable { name, limit } => match Money::parse_dollars(&text) {
-            Some(available) => {
+        PromptKind::NewCardEntry { name, limit, mode } => match Money::parse_dollars(&text) {
+            Some(entered) => {
+                let available = mode.as_available_credit(limit, entered);
                 let id = ops::create_credit_card_account(&app.conn, &name, limit, available)?;
                 app.pending_dash_account = Some(id);
                 app.status = Some(format!("Created account “{name}”"));
@@ -2412,11 +2476,11 @@ fn submit_text(app: &mut App) -> Result<()> {
             None => {
                 app.status = Some(format!("Couldn't read “{text}” as an amount"));
                 app.open_text_prompt(
-                    format!("Available credit for {name}"),
+                    format!("{} for {name}", mode.label()),
                     text,
                     Vec::new(),
                     false,
-                    PromptKind::NewCardAvailable { name, limit },
+                    PromptKind::NewCardEntry { name, limit, mode },
                     return_to_envelope_modal.clone(),
                 );
             }
@@ -2786,7 +2850,17 @@ fn draw_modal(frame: &mut Frame, app: &App) {
 
     match modal {
         Modal::Text(prompt) => {
-            let height = if prompt.help.is_empty() { 20 } else { 34 };
+            let is_card_entry = matches!(
+                &prompt.kind,
+                PromptKind::CardEntry { .. } | PromptKind::NewCardEntry { .. }
+            );
+            let height = if !prompt.help.is_empty() {
+                34
+            } else if is_card_entry {
+                36
+            } else {
+                20
+            };
             let area = centered_rect(60, height, frame.area());
             frame.render_widget(Clear, area); // erase whatever's underneath so the box is opaque
             let block = titled_block(format!(" {} ", prompt.title));
@@ -2808,6 +2882,13 @@ fn draw_modal(frame: &mut Frame, app: &App) {
                         Style::default().fg(Color::Gray),
                     )));
                 }
+                body.push(Line::raw(""));
+            }
+            if is_card_entry {
+                body.push(Line::from(Span::styled(
+                    " Tab: available credit ↔ current balance",
+                    Style::default().fg(Color::Gray),
+                )));
                 body.push(Line::raw(""));
             }
             body.push(Line::from(Span::styled(
@@ -3865,7 +3946,7 @@ mod tests {
     }
 
     #[test]
-    fn general_tab_shows_both_settings_and_keeps_the_global_legend() {
+    fn general_tab_shows_all_settings_and_keeps_the_global_legend() {
         let app = app_with_sync_screen();
         let backend = ratatui::backend::TestBackend::new(100, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -3876,8 +3957,10 @@ mod tests {
         // The tab bar names both tabs.
         assert!(text.contains("General"));
         assert!(text.contains("Storage"));
-        // Both General-tab settings render with their current values.
+        // All General-tab settings render with their current values.
         assert!(text.contains("New-envelope default"));
+        assert!(text.contains("Credit card entry"));
+        assert!(text.contains("Available credit"));
         assert!(text.contains("Display currency"));
         // The global legend stays visible even though this app is in FolderSync (whose
         // continuous status would otherwise clobber a single-row footer's right side).
@@ -3899,9 +3982,85 @@ mod tests {
     #[test]
     fn general_tab_enter_on_currency_row_opens_the_picker() {
         let mut app = app_with_sync_screen();
-        app.settings_general_sel = 1; // Currency row
+        app.settings_general_sel = 2; // Currency row
         handle_general_tab_key(&mut app, key(KeyCode::Enter)).unwrap();
         assert!(matches!(app.modal, Some(Modal::CurrencyPicker(_))));
+    }
+
+    #[test]
+    fn general_tab_toggles_the_credit_card_entry_preference() {
+        let mut app = app_with_sync_screen();
+        app.settings_general_sel = 1; // CreditCardEntry row
+        assert_eq!(
+            queries::credit_card_entry_mode(&app.conn).unwrap(),
+            CreditCardEntryMode::AvailableCredit
+        );
+
+        handle_general_tab_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(
+            queries::credit_card_entry_mode(&app.conn).unwrap(),
+            CreditCardEntryMode::CurrentBalance
+        );
+        assert!(app.status.as_deref().unwrap().contains("current balance"));
+    }
+
+    #[test]
+    fn tab_switches_card_prompt_mode_and_preserves_the_stored_value() {
+        let mut app = app_with_sync_screen();
+        let limit = Money(100_000);
+        let available = Money(70_000);
+        let id = ops::create_credit_card_account(&app.conn, "Travel", limit, available).unwrap();
+        app.open_text_replace_on_type(
+            "Available credit for Travel",
+            amount_edit_string(available),
+            PromptKind::CardEntry {
+                id: id.clone(),
+                name: "Travel".into(),
+                limit,
+                mode: CreditCardEntryMode::AvailableCredit,
+            },
+        );
+
+        handle_text_key(&mut app, key(KeyCode::Tab)).unwrap();
+
+        assert_eq!(
+            queries::credit_card_entry_mode(&app.conn).unwrap(),
+            CreditCardEntryMode::CurrentBalance
+        );
+        let Some(Modal::Text(prompt)) = &app.modal else {
+            panic!("expected card amount prompt");
+        };
+        assert_eq!(prompt.title, "Current balance for Travel");
+        assert_eq!(Money::parse_dollars(&prompt.buffer), Some(Money(30_000)));
+
+        handle_text_key(&mut app, key(KeyCode::Enter)).unwrap();
+        let card = queries::load_accounts(&app.conn)
+            .unwrap()
+            .into_iter()
+            .find(|account| account.id == id)
+            .unwrap();
+        assert_eq!(card.available_credit, Some(available));
+    }
+
+    #[test]
+    fn card_prompt_explains_the_tab_shortcut() {
+        let mut app = app_with_sync_screen();
+        app.open_text_replace_on_type(
+            "Available credit for Travel",
+            amount_edit_string(Money(70_000)),
+            PromptKind::CardEntry {
+                id: "card".into(),
+                name: "Travel".into(),
+                limit: Money(100_000),
+                mode: CreditCardEntryMode::AvailableCredit,
+            },
+        );
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
+
+        assert!(buffer_text(&terminal).contains("Tab: available credit ↔ current balance"));
     }
 
     #[test]

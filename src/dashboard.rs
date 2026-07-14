@@ -9,7 +9,7 @@ use crate::{
     anim::{SummaryAnimations, SummaryTerm, display_cents},
 };
 use anyhow::Result;
-use leeway::models::{AccountType, Direction, Mode, PeriodType};
+use leeway::models::{AccountType, CreditCardEntryMode, Direction, Mode, PeriodType};
 use leeway::money::Money;
 use leeway::ops;
 use leeway::view::{EnvelopeRow, MonthView};
@@ -502,15 +502,24 @@ fn act_on_focus(app: &mut App, view: &MonthView) -> Result<()> {
                             id: acct.id.clone(),
                         },
                     ),
-                    // Credit card: the primary edit is available credit (owed is derived);
-                    // the limit gets its own key (`l`).
-                    AccountType::CreditCard => app.open_text_replace_on_type(
-                        format!("Available credit for {}", acct.name),
-                        crate::amount_edit_string(acct.available_credit.unwrap_or(Money::ZERO)),
-                        PromptKind::CardAvailable {
-                            id: acct.id.clone(),
-                        },
-                    ),
+                    // Credit cards store available credit internally, but the preferred
+                    // input can be either that figure or the derived current balance.
+                    AccountType::CreditCard => {
+                        let mode = leeway::queries::credit_card_entry_mode(&app.conn)
+                            .unwrap_or(CreditCardEntryMode::AvailableCredit);
+                        let limit = acct.credit_limit.unwrap_or(Money::ZERO);
+                        let available = acct.available_credit.unwrap_or(Money::ZERO);
+                        app.open_text_replace_on_type(
+                            format!("{} for {}", mode.label(), acct.name),
+                            crate::amount_edit_string(mode.entered_amount(limit, available)),
+                            PromptKind::CardEntry {
+                                id: acct.id.clone(),
+                                name: acct.name.clone(),
+                                limit,
+                                mode,
+                            },
+                        );
+                    }
                 }
             }
         }

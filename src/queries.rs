@@ -28,6 +28,24 @@ pub fn default_mode(conn: &Connection) -> Result<Mode> {
     })
 }
 
+/// Which figure credit-card amount prompts ask for. Available credit remains the safe
+/// default for budgets created before this preference existed and for unknown values
+/// written by a newer version.
+pub fn credit_card_entry_mode(conn: &Connection) -> Result<CreditCardEntryMode> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM setting WHERE key = 'credit_card_entry_mode'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("reading credit-card entry mode setting")?;
+    Ok(match value.as_deref() {
+        Some("current_balance") => CreditCardEntryMode::CurrentBalance,
+        _ => CreditCardEntryMode::AvailableCredit,
+    })
+}
+
 /// The stored state of the `currency` setting. Distinguishes a fresh budget with
 /// no row (safe to detect + persist a default) from one whose row names a code
 /// this build doesn't recognize — e.g. written by a newer app version. The latter

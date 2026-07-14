@@ -61,6 +61,42 @@ sql_enum!(AccountType {
     Checking => "checking",
     CreditCard => "credit_card",
 });
+sql_enum!(CreditCardEntryMode {
+    AvailableCredit => "available_credit",
+    CurrentBalance => "current_balance",
+});
+
+impl CreditCardEntryMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AvailableCredit => "Available credit",
+            Self::CurrentBalance => "Current balance",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::AvailableCredit => Self::CurrentBalance,
+            Self::CurrentBalance => Self::AvailableCredit,
+        }
+    }
+
+    /// Convert the stored card values into the amount shown in the entry prompt.
+    pub fn entered_amount(self, limit: Money, available: Money) -> Money {
+        match self {
+            Self::AvailableCredit => available,
+            Self::CurrentBalance => limit - available,
+        }
+    }
+
+    /// Convert a submitted amount back to the available-credit value stored by accounts.
+    pub fn as_available_credit(self, limit: Money, entered: Money) -> Money {
+        match self {
+            Self::AvailableCredit => entered,
+            Self::CurrentBalance => limit - entered,
+        }
+    }
+}
 
 // --- Money <-> SQLite ----------------------------------------------------------
 // `Money` wraps an i64 (cents), and the DB stores those cents as INTEGER, so the
