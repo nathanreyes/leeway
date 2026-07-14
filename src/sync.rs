@@ -22,7 +22,9 @@ use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const SYNC_DIR_NAME: &str = "Leeway";
-pub const ORDINARY_RETENTION: usize = 20;
+/// Keep only the current ordinary snapshot and one fallback. Revisions protected during
+/// conflict resolution are retained separately from this limit.
+pub const ORDINARY_RETENTION: usize = 2;
 pub const LEASE_DURATION: Duration = Duration::from_secs(45);
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 pub const WATCH_INTERVAL: Duration = Duration::from_secs(2);
@@ -196,22 +198,35 @@ const UNNAMED_DEVICE_LABEL: &str = "Unnamed device";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncStatus {
     LocalOnly,
-    Published { revision_id: String },
+    Published {
+        revision_id: String,
+    },
     Publishing,
-    SavedLocally { message: String },
-    ReadOnly { owner: String },
-    Attention { message: String },
+    SavedLocally {
+        message: String,
+    },
+    ReadOnly {
+        owner: String,
+    },
+    ChooseVersion {
+        folder_device: String,
+        folder_updated_at_ms: i64,
+    },
+    Attention {
+        message: String,
+    },
 }
 
 impl SyncStatus {
     pub fn label(&self) -> String {
         match self {
-            Self::LocalOnly => "Local only".into(),
-            Self::Published { .. } => "Published".into(),
-            Self::Publishing => "Publishing".into(),
-            Self::SavedLocally { .. } => "Saved locally — not published".into(),
-            Self::ReadOnly { owner } => format!("Read-only — {owner} is editing"),
-            Self::Attention { .. } => "Attention needed".into(),
+            Self::LocalOnly => "On this computer".into(),
+            Self::Published { .. } => "Up to date".into(),
+            Self::Publishing => "Updating folder…".into(),
+            Self::SavedLocally { .. } => "Saved on this computer".into(),
+            Self::ReadOnly { owner } => format!("View only — {owner} is editing"),
+            Self::ChooseVersion { .. } => "Choose a version".into(),
+            Self::Attention { .. } => "Sync paused".into(),
         }
     }
 }
@@ -300,8 +315,30 @@ impl Runtime {
             };
             return Ok(());
         }
+        let local_digest = connection_digest(conn, &self.paths.data_dir)?;
+        if local_digest == remote.sha256 {
+            // A publication can become durable before this process records its new base in
+            // config.json (for example, if it is interrupted immediately after advancing
+            // the head). Identical databases need metadata repair, not a user decision.
+            self.config.last_accepted_revision = Some(remote.revision_id.clone());
+            self.config.last_published_digest = Some(remote.sha256.clone());
+            self.save_config()?;
+            match self.acquire_lease(false) {
+                Ok(()) => {
+                    self.status = SyncStatus::Published {
+                        revision_id: remote.revision_id,
+                    };
+                }
+                Err(error) => {
+                    self.status = SyncStatus::ReadOnly {
+                        owner: error.to_string(),
+                    };
+                }
+            }
+            return Ok(());
+        }
         let clean = match self.config.last_published_digest.as_deref() {
-            Some(expected) => connection_digest(conn, &self.paths.data_dir)? == expected,
+            Some(expected) => local_digest == expected,
             None => false,
         };
         if self.config.last_accepted_revision.as_deref() == Some(&remote.revision_id) {
@@ -323,11 +360,9 @@ impl Runtime {
             return Ok(());
         }
         if !clean {
-            self.status = SyncStatus::Attention {
-                message: format!(
-                    "Local work diverged from synchronized revision {}",
-                    remote.revision_id
-                ),
+            self.status = SyncStatus::ChooseVersion {
+                folder_device: remote.device_label,
+                folder_updated_at_ms: remote.published_at_ms,
             };
             return Ok(());
         }
@@ -580,9 +615,7 @@ impl Runtime {
             true,
         )?;
         protect_revision(&root, &local_candidate.revision_id)?;
-        if use_local {
-            protect_revision(&root, &remote.revision_id)?;
-        }
+        protect_revision(&root, &remote.revision_id)?;
         if !use_local {
             archive_connection(conn, &self.paths.recovery, "conflict-local-candidate")?;
             let remote_snapshot = root.join("snapshots").join(&remote.snapshot_name);
@@ -624,6 +657,9 @@ impl Runtime {
         self.status = SyncStatus::Published {
             revision_id: resolution.revision_id,
         };
+        // Resolution is already durable at this point. Cleanup is best-effort so a stale
+        // removable file cannot make a successful choice look like it failed.
+        let _ = prune_history(&root, ORDINARY_RETENTION);
         Ok(())
     }
 
@@ -698,11 +734,9 @@ impl Runtime {
                 if let Some(local) = &self.config.last_accepted_revision
                     && local != &revision.revision_id
                 {
-                    self.status = SyncStatus::Attention {
-                        message: format!(
-                            "Synchronized revision {} differs from local base {}",
-                            revision.revision_id, local
-                        ),
+                    self.status = SyncStatus::ChooseVersion {
+                        folder_device: revision.device_label,
+                        folder_updated_at_ms: revision.published_at_ms,
                     };
                     return Ok(());
                 }
@@ -838,8 +872,17 @@ impl Runtime {
             .as_ref()
             .is_some_and(|id| id != &revision.revision_id)
         {
-            self.status = SyncStatus::Attention {
-                message: format!("Unexpected synchronized revision {}", revision.revision_id),
+            // `head.json` is advanced by the worker before its completion message reaches
+            // this thread. Do not turn our own in-flight publication into a false conflict.
+            if self.publish_rx.is_some()
+                && revision.device_id == self.device.device_id
+                && revision.session_id == self.session_id
+            {
+                return Ok(());
+            }
+            self.status = SyncStatus::ChooseVersion {
+                folder_device: revision.device_label,
+                folder_updated_at_ms: revision.published_at_ms,
             };
             return Ok(());
         }
@@ -1186,7 +1229,9 @@ fn publish(request: PublishRequest) -> Result<Revision> {
     if accepted.revision_id != revision.revision_id {
         bail!("head changed while confirming publication");
     }
-    prune_history(&request.root, ORDINARY_RETENTION)?;
+    // The new head has already been validated. Cleanup must not cause the caller to reject
+    // an otherwise successful publication and leave its local base revision stale.
+    let _ = prune_history(&request.root, ORDINARY_RETENTION);
     let _ = request.generation;
     Ok(revision)
 }
@@ -1574,6 +1619,34 @@ mod tests {
     }
 
     #[test]
+    fn sync_status_labels_describe_user_outcomes() {
+        assert_eq!(SyncStatus::LocalOnly.label(), "On this computer");
+        assert_eq!(
+            SyncStatus::Published {
+                revision_id: "internal-id".into(),
+            }
+            .label(),
+            "Up to date"
+        );
+        assert_eq!(SyncStatus::Publishing.label(), "Updating folder…");
+        assert_eq!(
+            SyncStatus::ChooseVersion {
+                folder_device: "Laptop".into(),
+                folder_updated_at_ms: 1,
+            }
+            .label(),
+            "Choose a version"
+        );
+        assert_eq!(
+            SyncStatus::Attention {
+                message: "broken".into(),
+            }
+            .label(),
+            "Sync paused"
+        );
+    }
+
+    #[test]
     fn generic_device_label_is_upgraded_without_changing_identity() {
         let path = temp_dir("device-upgrade").join("device.json");
         atomic_json(
@@ -1629,6 +1702,130 @@ mod tests {
         assert_eq!(accepted.revision_id, revision.revision_id);
         assert_eq!(accepted.schema_version, db::SCHEMA_VERSION);
         assert_eq!(accepted.parents, Vec::<String>::new());
+    }
+
+    #[test]
+    fn ordinary_history_keeps_current_snapshot_and_one_fallback() {
+        let paths = test_paths("retention");
+        let conn = seeded(&paths);
+        let parent = temp_dir("retention-remote");
+        let mut runtime = Runtime::load(paths, &conn).unwrap();
+        runtime.enable_new(&parent).unwrap();
+
+        for generation in 1..=4 {
+            let revision = publish(runtime.publish_request(generation).unwrap()).unwrap();
+            runtime.accept_publication(generation, revision).unwrap();
+        }
+
+        let root = parent.join(SYNC_DIR_NAME);
+        assert_eq!(fs::read_dir(root.join("snapshots")).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(root.join("revisions")).unwrap().count(), 2);
+        validate_head(&root).unwrap();
+    }
+
+    #[test]
+    fn watcher_ignores_the_current_publication_before_worker_completion() {
+        let paths = test_paths("publication-watch-race");
+        let conn = seeded(&paths);
+        let parent = temp_dir("publication-watch-race-remote");
+        let mut runtime = Runtime::load(paths.clone(), &conn).unwrap();
+        runtime.enable_new(&parent).unwrap();
+        let first = publish(runtime.publish_request(1).unwrap()).unwrap();
+        runtime.accept_publication(1, first.clone()).unwrap();
+
+        let root = parent.join(SYNC_DIR_NAME);
+        let next = write_revision_snapshot(
+            &paths.database,
+            &root,
+            &runtime.device,
+            &runtime.session_id,
+            vec![first.revision_id],
+            false,
+        )
+        .unwrap();
+        atomic_json(
+            &root.join("head.json"),
+            &Head {
+                revision_id: next.revision_id,
+                updated_at_ms: now_ms(),
+            },
+        )
+        .unwrap();
+        let (_tx, rx) = mpsc::channel();
+        runtime.publish_rx = Some(rx);
+
+        runtime.watch_remote().unwrap();
+        assert!(matches!(runtime.status, SyncStatus::Published { .. }));
+    }
+
+    #[test]
+    fn local_and_folder_changes_become_an_explicit_version_choice() {
+        let paths = test_paths("version-choice");
+        let mut conn = seeded(&paths);
+        let parent = temp_dir("version-choice-remote");
+        let mut runtime = Runtime::load(paths.clone(), &conn).unwrap();
+        runtime.enable_new(&parent).unwrap();
+        let first = publish(runtime.publish_request(1).unwrap()).unwrap();
+        runtime.accept_publication(1, first.clone()).unwrap();
+
+        conn.execute("INSERT INTO plan (id, name) VALUES ('local', 'Local')", [])
+            .unwrap();
+        let root = parent.join(SYNC_DIR_NAME);
+        let remote = write_revision_snapshot(
+            &root.join("snapshots").join(&first.snapshot_name),
+            &root,
+            &Device {
+                device_id: "other-device".into(),
+                label: "Other laptop".into(),
+            },
+            "other-session",
+            vec![first.revision_id],
+            false,
+        )
+        .unwrap();
+        atomic_json(
+            &root.join("head.json"),
+            &Head {
+                revision_id: remote.revision_id,
+                updated_at_ms: now_ms(),
+            },
+        )
+        .unwrap();
+
+        runtime.reconcile_on_launch(&mut conn).unwrap();
+        assert!(matches!(
+            &runtime.status,
+            SyncStatus::ChooseVersion {
+                folder_device,
+                ..
+            } if folder_device == "Other laptop"
+        ));
+    }
+
+    #[test]
+    fn matching_local_and_folder_data_repairs_stale_revision_metadata() {
+        let paths = test_paths("metadata-repair");
+        let mut conn = seeded(&paths);
+        let parent = temp_dir("metadata-repair-remote");
+        let mut runtime = Runtime::load(paths, &conn).unwrap();
+        runtime.enable_new(&parent).unwrap();
+        let published = publish(runtime.publish_request(1).unwrap()).unwrap();
+        runtime.accept_publication(1, published.clone()).unwrap();
+
+        runtime.config.last_accepted_revision = Some("stale-revision".into());
+        runtime.config.last_published_digest = Some("stale-digest".into());
+        runtime.save_config().unwrap();
+        runtime.reconcile_on_launch(&mut conn).unwrap();
+
+        assert_eq!(
+            runtime.config.last_accepted_revision.as_deref(),
+            Some(published.revision_id.as_str())
+        );
+        assert_eq!(
+            runtime.config.last_published_digest.as_deref(),
+            Some(published.sha256.as_str())
+        );
+        assert!(matches!(runtime.status, SyncStatus::Published { .. }));
     }
 
     #[test]

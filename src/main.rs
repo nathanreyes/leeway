@@ -21,7 +21,7 @@ mod theme;
 
 use anim::SummaryAnimations;
 use anyhow::{Context, Result};
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
 use leeway::models::{AccountType, Direction, Kind, Mode, PeriodType, Series, Txn};
 use leeway::money::Money;
 use leeway::sync::{self, Inspection, StorageMode, SyncStatus};
@@ -1248,6 +1248,14 @@ fn handle_storage_tab_key(app: &mut App, key: KeyEvent) -> Result<()> {
         .as_ref()
         .map(|runtime| runtime.config.mode.clone())
         .unwrap_or(StorageMode::LocalOnly);
+    let is_read_only = app
+        .sync
+        .as_ref()
+        .is_some_and(|runtime| matches!(runtime.status, SyncStatus::ReadOnly { .. }));
+    let needs_choice = app
+        .sync
+        .as_ref()
+        .is_some_and(|runtime| matches!(runtime.status, SyncStatus::ChooseVersion { .. }));
     match key.code {
         KeyCode::Char('e') if mode == StorageMode::LocalOnly => app.open_text_with_help(
             "Synchronized parent folder",
@@ -1262,27 +1270,18 @@ fn handle_storage_tab_key(app: &mut App, key: KeyEvent) -> Result<()> {
             "Disable folder sync? Synchronized files will be left unchanged.",
             ConfirmAction::DisableSync,
         ),
-        KeyCode::Char('p') if mode == StorageMode::FolderSync => {
-            if let Some(runtime) = app.sync.as_mut() {
-                let result = runtime.publish_now();
-                report_sync_result(app, result, "Publication queued");
-            }
-        }
-        KeyCode::Char('t') if mode == StorageMode::FolderSync => app.open_confirm(
+        KeyCode::Char('t') if mode == StorageMode::FolderSync && is_read_only => app.open_confirm(
             "Take over editing from the previous session?",
             ConfirmAction::TakeOverSync,
         ),
-        KeyCode::Char('u') if mode == StorageMode::FolderSync => app.open_confirm(
-            "Use the synchronized candidate? This computer's candidate will be kept in recovery.",
+        KeyCode::Char('u') if mode == StorageMode::FolderSync && needs_choice => app.open_confirm(
+            "Use the synced folder version? This computer's version will be backed up.",
             ConfirmAction::ResolveUseSynced,
         ),
-        KeyCode::Char('l') if mode == StorageMode::FolderSync => app.open_confirm(
-            "Publish this computer's candidate? The synchronized candidate will remain protected.",
+        KeyCode::Char('l') if mode == StorageMode::FolderSync && needs_choice => app.open_confirm(
+            "Use this computer's version? The synced folder version will be backed up.",
             ConfirmAction::ResolveUseLocal,
         ),
-        KeyCode::Char('k') if mode == StorageMode::FolderSync => {
-            app.status = Some("Both candidates kept; editing remains paused".into());
-        }
         KeyCode::Char('i') => {
             if let Some(path) = app.legacy_database.clone() {
                 app.open_confirm(
@@ -1411,13 +1410,37 @@ fn draw_storage_tab(frame: &mut Frame, area: Rect, app: &App) {
             sync_status_color(&runtime.status),
         ));
         match &runtime.status {
-            SyncStatus::Published { revision_id } => {
-                lines.push(storage_detail_line("Revision", revision_id, Color::White))
-            }
             SyncStatus::SavedLocally { message } | SyncStatus::Attention { message } => {
                 lines.push(storage_detail_line("Detail", message, Color::White))
             }
-            SyncStatus::LocalOnly | SyncStatus::Publishing | SyncStatus::ReadOnly { .. } => {}
+            SyncStatus::ChooseVersion {
+                folder_device,
+                folder_updated_at_ms,
+            } => {
+                lines.push(storage_detail_line(
+                    "Detail",
+                    "Changes were found on this computer and in the synced folder.",
+                    Color::White,
+                ));
+                lines.push(storage_detail_line(
+                    "This computer",
+                    database_modified_label(&runtime.paths().database),
+                    Color::White,
+                ));
+                lines.push(storage_detail_line(
+                    "Synced folder",
+                    format!(
+                        "{} · {}",
+                        format_sync_time(*folder_updated_at_ms),
+                        folder_device
+                    ),
+                    Color::White,
+                ));
+            }
+            SyncStatus::LocalOnly
+            | SyncStatus::Published { .. }
+            | SyncStatus::Publishing
+            | SyncStatus::ReadOnly { .. } => {}
         }
         lines.push(storage_detail_line(
             "Device",
@@ -1442,7 +1465,7 @@ fn draw_storage_tab(frame: &mut Frame, area: Rect, app: &App) {
                 " Folder sync is off. Your budget remains in the managed local database."
             }
             StorageMode::FolderSync => {
-                " Leeway publishes validated snapshots; provider upload completion is not observable."
+                " Changes save here first, then Leeway updates the folder automatically."
             }
         }));
     }
@@ -1488,33 +1511,42 @@ fn storage_tab_hints(app: &App) -> Line<'static> {
     if app.legacy_database.is_some() {
         actions.extend([modal_key(" i "), Span::raw(" import legacy  ")]);
     }
+    let status = app.sync.as_ref().map(|runtime| &runtime.status);
     match mode {
         StorageMode::LocalOnly => actions.extend([modal_key(" e "), Span::raw(" enable sync")]),
-        StorageMode::FolderSync => actions.extend([
-            modal_key(" p "),
-            Span::raw(" publish  "),
-            modal_key(" t "),
-            Span::raw(" take over  "),
-            modal_key(" d "),
-            Span::raw(" disable"),
-        ]),
-    }
-    if app
-        .sync
-        .as_ref()
-        .is_some_and(|runtime| matches!(runtime.status, SyncStatus::Attention { .. }))
-    {
-        actions.extend([
-            Span::raw("  "),
-            modal_key(" u "),
-            Span::raw(" use synced  "),
-            modal_key(" l "),
-            Span::raw(" use local  "),
-            modal_key(" k "),
-            Span::raw(" keep both"),
-        ]);
+        StorageMode::FolderSync => {
+            match status {
+                Some(SyncStatus::ChooseVersion { .. }) => actions.extend([
+                    modal_key(" u "),
+                    Span::raw(" use synced folder  "),
+                    modal_key(" l "),
+                    Span::raw(" use this computer  "),
+                ]),
+                Some(SyncStatus::ReadOnly { .. }) => {
+                    actions.extend([modal_key(" t "), Span::raw(" take over  ")]);
+                }
+                _ => {}
+            }
+            actions.extend([modal_key(" d "), Span::raw(" disable")]);
+        }
     }
     Line::from(actions)
+}
+
+fn format_sync_time(timestamp_ms: i64) -> String {
+    Local
+        .timestamp_millis_opt(timestamp_ms)
+        .single()
+        .map(|time| time.format("%b %-d, %-I:%M %p").to_string())
+        .unwrap_or_else(|| "Unknown time".into())
+}
+
+fn database_modified_label(path: &std::path::Path) -> String {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map(DateTime::<Local>::from)
+        .map(|time| time.format("%b %-d, %-I:%M %p").to_string())
+        .unwrap_or_else(|_| "Current local data".into())
 }
 
 const STORAGE_LABEL_WIDTH: usize = 17;
@@ -1536,7 +1568,7 @@ fn sync_status_color(status: &SyncStatus) -> Color {
         SyncStatus::Publishing => theme::CYAN,
         SyncStatus::LocalOnly => Color::Gray,
         SyncStatus::SavedLocally { .. } | SyncStatus::ReadOnly { .. } => Color::Yellow,
-        SyncStatus::Attention { .. } => Color::Red,
+        SyncStatus::ChooseVersion { .. } | SyncStatus::Attention { .. } => Color::Red,
     }
 }
 
@@ -3846,7 +3878,7 @@ mod tests {
             .unwrap();
 
         let text = buffer_text(&terminal);
-        assert!(text.contains(" Status           Read-only — Other-MacBook is editing"));
+        assert!(text.contains(" Status           View only — Other-MacBook is editing"));
         assert!(text.contains(" Device           Nathans-MacBook-Pro"));
         assert!(text.contains(" Local database   "));
         assert!(text.contains(" Leeway folder    /Users/nathan/dropbox/Leeway"));
@@ -3855,9 +3887,39 @@ mod tests {
         assert!(!text.contains(" Owner "));
         assert!(!text.contains(" Sync parent"));
         assert_eq!(
-            text.matches("Read-only — Other-MacBook is editing").count(),
+            text.matches("View only — Other-MacBook is editing").count(),
             1
         );
+        assert!(text.contains("take over"));
+        assert!(!text.contains("publish"));
+        assert!(!text.contains("use synced folder"));
+    }
+
+    #[test]
+    fn storage_version_choice_explains_the_decision_without_revision_internals() {
+        let mut app = app_with_sync_screen();
+        app.sync.as_mut().unwrap().status = SyncStatus::ChooseVersion {
+            folder_device: "Other-MacBook".into(),
+            folder_updated_at_ms: 1_783_999_786_511,
+        };
+        let backend = ratatui::backend::TestBackend::new(110, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_settings(frame, &app, SettingsTab::Storage))
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Choose a version"));
+        assert!(text.contains("Changes were found on this computer and in the synced folder."));
+        assert!(text.contains("This computer"));
+        assert!(text.contains("Synced folder"));
+        assert!(text.contains("Other-MacBook"));
+        assert!(text.contains("use synced folder"));
+        assert!(text.contains("use this computer"));
+        assert!(!text.contains("1783999786511"));
+        assert!(!text.contains("publish"));
+        assert!(!text.contains("take over"));
+        assert!(!text.contains("keep both"));
     }
 
     #[test]
