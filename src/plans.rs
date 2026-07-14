@@ -601,7 +601,6 @@ mod tests {
             modal: None,
             status: None,
             sync: None,
-            legacy_database: None,
         };
 
         (app, plan, entries, rent_series_id)

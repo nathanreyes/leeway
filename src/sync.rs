@@ -1189,15 +1189,6 @@ pub fn archive_connection(conn: &Connection, recovery: &Path, reason: &str) -> R
     Ok(path)
 }
 
-pub fn import_legacy(conn: &mut Connection, legacy: &Path, recovery: &Path) -> Result<()> {
-    verify_sqlite(legacy, 0).context("validating legacy database")?;
-    archive_connection(conn, recovery, "before-legacy-import")?;
-    conn.restore(MAIN_DB, legacy, None::<fn(rusqlite::backup::Progress)>)
-        .context("importing legacy database")?;
-    db::migrate(conn)?;
-    crate::queries::apply_active_currency(conn)
-}
-
 fn publish(request: PublishRequest) -> Result<Revision> {
     validate_sync_root(&request.root)?;
     verify_expected_head(&request.root, request.expected_parent.as_deref())?;

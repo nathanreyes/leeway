@@ -37,7 +37,6 @@ use ratatui::widgets::{
 };
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
-use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -59,7 +58,7 @@ pub enum Screen {
 }
 
 /// The settings screen's tabs. General holds app-wide preferences (envelope-mode default,
-/// display currency); Storage holds the folder-sync controls and legacy-import affordance.
+/// display currency); Storage holds the folder-sync controls.
 /// `Tab`/`Shift+Tab` cycle between them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
@@ -556,9 +555,6 @@ pub enum ConfirmAction {
     },
     DisableSync,
     TakeOverSync,
-    ImportLegacy {
-        path: PathBuf,
-    },
     ResolveUseSynced,
     ResolveUseLocal,
 }
@@ -616,9 +612,6 @@ pub struct App {
     pub status: Option<String>,
     /// Folder-sync runtime is absent only in focused UI unit tests.
     pub sync: Option<sync::Runtime>,
-    /// A pre-managed-location `./leeway.db` discovered at startup. It remains untouched
-    /// until the user explicitly imports it from Storage & Sync.
-    pub legacy_database: Option<PathBuf>,
 }
 
 impl App {
@@ -761,12 +754,6 @@ impl App {
 fn main() -> Result<()> {
     let paths = sync::AppPaths::discover()?;
     paths.create()?;
-    let managed_existed = paths.database.exists();
-    let legacy_path = env::current_dir()?.join("leeway.db");
-    let legacy_database = legacy_path
-        .is_file()
-        .then_some(legacy_path)
-        .filter(|path| path != &paths.database);
     let mut conn = db::open(&paths.database)?;
     // Resolve the app-wide currency before anything reads or seeds money. A budget that
     // already chose one (its own, or one adopted via sync) carries it in the `setting`
@@ -798,15 +785,7 @@ fn main() -> Result<()> {
 
     let mut app = App {
         conn,
-        screen: if !managed_existed && legacy_database.is_some() {
-            // A legacy ./leeway.db is importable only from the Storage tab, so land there.
-            Screen::Settings {
-                tab: SettingsTab::Storage,
-                origin: SeriesOrigin::Dashboard,
-            }
-        } else {
-            Screen::Dashboard
-        },
+        screen: Screen::Dashboard,
         should_quit: false,
         dash_focus: DashFocus::Header,
         viewed_year: today.year(),
@@ -836,10 +815,8 @@ fn main() -> Result<()> {
         summary_anims: SummaryAnimations::new(),
         frame_now: Instant::now(),
         modal: None,
-        status: (!managed_existed && legacy_database.is_some())
-            .then(|| "Existing ./leeway.db found — choose whether to import it".into()),
+        status: None,
         sync: Some(sync_runtime),
-        legacy_database,
     };
 
     let terminal = ratatui::init();
@@ -1282,14 +1259,6 @@ fn handle_storage_tab_key(app: &mut App, key: KeyEvent) -> Result<()> {
             "Use this computer's version? The synced folder version will be backed up.",
             ConfirmAction::ResolveUseLocal,
         ),
-        KeyCode::Char('i') => {
-            if let Some(path) = app.legacy_database.clone() {
-                app.open_confirm(
-                    format!("Import existing database from {}?", path.display()),
-                    ConfirmAction::ImportLegacy { path },
-                );
-            }
-        }
         _ => {}
     }
     Ok(())
@@ -1400,7 +1369,7 @@ fn draw_general_tab(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// The Storage tab: sync status detail and, when present, the importable legacy database.
+/// The Storage tab: sync status and the configured folder when folder sync is enabled.
 fn draw_storage_tab(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = Vec::new();
     if let Some(runtime) = app.sync.as_ref() {
@@ -1442,19 +1411,9 @@ fn draw_storage_tab(frame: &mut Frame, area: Rect, app: &App) {
             | SyncStatus::Publishing
             | SyncStatus::ReadOnly { .. } => {}
         }
-        lines.push(storage_detail_line(
-            "Device",
-            &runtime.device.label,
-            Color::White,
-        ));
-        lines.push(storage_detail_line(
-            "Local database",
-            runtime.paths().database.display().to_string(),
-            Color::White,
-        ));
         if let Some(parent) = runtime.config.sync_parent.as_ref() {
             lines.push(storage_detail_line(
-                "Leeway folder",
+                "Sync folder",
                 parent.join(sync::SYNC_DIR_NAME).display().to_string(),
                 Color::White,
             ));
@@ -1468,21 +1427,6 @@ fn draw_storage_tab(frame: &mut Frame, area: Rect, app: &App) {
                 " Changes save here first, then Leeway updates the folder automatically."
             }
         }));
-    }
-    if let Some(path) = app.legacy_database.as_ref() {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            " Legacy database",
-            Style::default().fg(Color::Yellow),
-        )));
-        lines.push(storage_detail_line(
-            "Path",
-            path.display().to_string(),
-            Color::White,
-        ));
-        lines.push(Line::raw(
-            " Importing creates a recovery backup and leaves the original unchanged.",
-        ));
     }
     frame.render_widget(
         Paragraph::new(lines)
@@ -1508,9 +1452,6 @@ fn storage_tab_hints(app: &App) -> Line<'static> {
         .map(|runtime| runtime.config.mode.clone())
         .unwrap_or(StorageMode::LocalOnly);
     let mut actions = Vec::new();
-    if app.legacy_database.is_some() {
-        actions.extend([modal_key(" i "), Span::raw(" import legacy  ")]);
-    }
     let status = app.sync.as_ref().map(|runtime| &runtime.status);
     match mode {
         StorageMode::LocalOnly => actions.extend([modal_key(" e "), Span::raw(" enable sync")]),
@@ -2708,34 +2649,6 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                             "Editing ownership taken over on this computer",
                         );
                     }
-                    ConfirmAction::ImportLegacy { path } => {
-                        let result = app
-                            .sync
-                            .as_ref()
-                            .context("sync runtime is unavailable")
-                            .map(|runtime| runtime.paths().recovery.clone())
-                            .and_then(|recovery| {
-                                sync::import_legacy(&mut app.conn, &path, &recovery)
-                            })
-                            .and_then(|()| {
-                                if let Some(runtime) = app.sync.as_mut() {
-                                    runtime.note_changes(&app.conn)?;
-                                }
-                                Ok(())
-                            });
-                        if result.is_ok() {
-                            app.legacy_database = None;
-                            reset_dashboard_selections(app);
-                        }
-                        report_sync_result(
-                            app,
-                            result,
-                            &format!(
-                                "Imported {}; the original file was preserved",
-                                path.display()
-                            ),
-                        );
-                    }
                     ConfirmAction::ResolveUseSynced => {
                         let result = app
                             .sync
@@ -3527,7 +3440,6 @@ mod tests {
             modal: Some(Modal::Envelope(manage.clone())),
             status: None,
             sync: None,
-            legacy_database: None,
         };
 
         (app, manage, envelope.id)
@@ -3864,12 +3776,11 @@ mod tests {
         };
         app.status = None;
         app.sync = Some(runtime);
-        app.legacy_database = Some(PathBuf::from("/old/leeway.db"));
         app
     }
 
     #[test]
-    fn storage_sync_details_are_aligned_without_duplicate_rows_or_status() {
+    fn storage_sync_details_show_only_status_and_sync_folder() {
         let app = app_with_sync_screen();
         let backend = ratatui::backend::TestBackend::new(100, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -3879,13 +3790,11 @@ mod tests {
 
         let text = buffer_text(&terminal);
         assert!(text.contains(" Status           View only — Other-MacBook is editing"));
-        assert!(text.contains(" Device           Nathans-MacBook-Pro"));
-        assert!(text.contains(" Local database   "));
-        assert!(text.contains(" Leeway folder    /Users/nathan/dropbox/Leeway"));
-        assert!(text.contains(" Legacy database"));
-        assert!(text.contains(" Path             /old/leeway.db"));
-        assert!(!text.contains(" Owner "));
-        assert!(!text.contains(" Sync parent"));
+        assert!(text.contains(" Sync folder      /Users/nathan/dropbox/Leeway"));
+        assert!(!text.contains(" Device "));
+        assert!(!text.contains(" Local database"));
+        assert!(!text.contains(" Legacy database"));
+        assert!(!text.contains(" import legacy"));
         assert_eq!(
             text.matches("View only — Other-MacBook is editing").count(),
             1

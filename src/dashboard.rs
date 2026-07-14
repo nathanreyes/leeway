@@ -1218,7 +1218,6 @@ mod tests {
             modal: None,
             status: None,
             sync: None,
-            legacy_database: None,
         }
     }
 
