@@ -4,8 +4,8 @@
 //! read-only data, and `handle_key` mutates `App` (and the database) in response to a key.
 
 use crate::{
-    AddDestination, App, BudgetBlock, ChoiceOption, ConfirmAction, DashFocus, EnvelopeDetail,
-    EnvelopeDetailFocus, ModalAction, PromptKind,
+    AddDestination, App, BudgetBlock, ChoiceOption, ConfirmAction, DashFocus, EnvelopeManage,
+    Modal, ModalAction, PromptKind,
     anim::{SummaryAnimations, SummaryTerm, display_cents},
 };
 use anyhow::Result;
@@ -110,10 +110,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
             DashFocus::Header => {}
         },
 
-        // Enter opens an envelope's dedicated detail screen; otherwise it performs the focused
+        // Enter opens an envelope's transactions modal; otherwise it performs the focused
         // row's primary action. Space always keeps the lightweight primary action.
         KeyCode::Enter if app.dash_focus == DashFocus::Envelopes => {
-            open_envelope_detail(app, view);
+            open_envelope_modal(app, view);
         }
         KeyCode::Enter | KeyCode::Char(' ') => act_on_focus(app, view)?,
 
@@ -127,13 +127,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         }
 
         // The edit verbs mirror the plan editor's keys, but here they edit this month's
-        // independent snapshot. Direction changes intentionally stay out of this fast path:
-        // moving between income and expenses is safer as remove/re-add.
-        KeyCode::Char('a') | KeyCode::Char('m') | KeyCode::Char('p')
-            if app.dash_focus == DashFocus::Envelopes =>
-        {
-            app.status = Some("Press Enter to edit envelope details".into());
-        }
+        // independent snapshot. Amount/mode/period act on the focused envelope directly;
+        // only an envelope's label (its identity) is steered to the series level via
+        // `edit_label`. Direction changes intentionally stay out of this fast path: moving
+        // between income and expenses is safer as remove/re-add.
         KeyCode::Char('l') => edit_label(app, view),
         KeyCode::Char('a') => edit_amount(app, view), // amount
         KeyCode::Char('m') => cycle_mode(app, view)?, // envelope mode
@@ -390,16 +387,13 @@ fn edit_amount(app: &mut App, view: &MonthView) {
     }
 }
 
-fn open_envelope_detail(app: &mut App, view: &MonthView) {
+fn open_envelope_modal(app: &mut App, view: &MonthView) {
     if let Some(e) = selected_env(app, view) {
-        app.screen = crate::Screen::EnvelopeDetail {
-            detail: EnvelopeDetail {
-                month_id: view.month.id.clone(),
-                envelope_id: e.envelope.id.clone(),
-                focus: EnvelopeDetailFocus::Details,
-                selected_spend: 0,
-            },
-        };
+        app.modal = Some(Modal::Envelope(EnvelopeManage {
+            month_id: view.month.id.clone(),
+            envelope_id: e.envelope.id.clone(),
+            selected_spend: 0,
+        }));
     }
 }
 
@@ -650,7 +644,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             key(" j/k "),
             Span::raw(" move  "),
             key(" Enter "),
-            Span::raw(" detail  "),
+            Span::raw(" txns  "),
+            key(" a "),
+            Span::raw(" amount  "),
+            key(" m "),
+            Span::raw(" mode  "),
+            key(" p "),
+            Span::raw(" period  "),
             key(" s "),
             Span::raw(" record  "),
             key(" n "),
@@ -1350,6 +1350,23 @@ mod tests {
     }
 
     #[test]
+    fn envelope_footer_advertises_transactions_and_the_direct_edit_verbs() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Envelopes;
+        let view = Some(month_view(&app));
+        let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app, &view)).unwrap();
+        let text = buffer_text(&terminal);
+
+        // Enter opens the transactions modal; amount/mode/period are edited right here.
+        assert!(text.contains("txns"));
+        assert!(text.contains("amount"));
+        assert!(text.contains("mode"));
+        assert!(text.contains("period"));
+    }
+
+    #[test]
     fn account_label_key_still_opens_the_account_editor() {
         let mut app = app_with_stamped_month();
         let account_id =
@@ -1544,7 +1561,7 @@ mod tests {
     }
 
     #[test]
-    fn period_key_points_envelope_edits_to_detail_screen() {
+    fn period_key_cycles_the_focused_envelope_period() {
         let mut app = app_with_stamped_month();
         app.dash_focus = DashFocus::Envelopes;
         let view = month_view(&app);
@@ -1558,21 +1575,18 @@ mod tests {
 
         handle_key(&mut app, period_key(), &Some(view)).unwrap();
 
-        assert_eq!(
-            app.status.as_deref(),
-            Some("Press Enter to edit envelope details")
-        );
+        // `p` now flips the period directly on the dashboard rather than deferring it.
         let refreshed = month_view(&app);
         let dining = refreshed
             .envelopes
             .iter()
             .find(|row| row.envelope.id == expected_id)
             .unwrap();
-        assert_eq!(dining.envelope.period_type, PeriodType::Monthly);
+        assert_eq!(dining.envelope.period_type, PeriodType::Daily);
     }
 
     #[test]
-    fn enter_key_opens_envelope_detail_screen() {
+    fn enter_key_opens_envelope_transactions_modal() {
         let mut app = app_with_stamped_month();
         app.dash_focus = DashFocus::Envelopes;
         let view = month_view(&app);
@@ -1586,19 +1600,19 @@ mod tests {
 
         handle_key(&mut app, enter_key(), &Some(view)).unwrap();
 
-        match app.screen {
-            Screen::EnvelopeDetail { detail } => {
-                assert_eq!(detail.envelope_id, expected_id);
-                assert_eq!(detail.month_id, expected_month_id);
-                assert_eq!(detail.focus, EnvelopeDetailFocus::Details);
-                assert_eq!(detail.selected_spend, 0);
+        match &app.modal {
+            Some(Modal::Envelope(manage)) => {
+                assert_eq!(manage.envelope_id, expected_id);
+                assert_eq!(manage.month_id, expected_month_id);
+                assert_eq!(manage.selected_spend, 0);
             }
-            _ => panic!("expected envelope detail screen"),
+            _ => panic!("expected envelope transactions modal"),
         }
+        assert!(matches!(app.screen, Screen::Dashboard));
     }
 
     #[test]
-    fn e_key_does_not_open_envelope_detail() {
+    fn e_key_does_not_open_the_envelope_modal() {
         let mut app = app_with_stamped_month();
         app.dash_focus = DashFocus::Envelopes;
         let view = month_view(&app);

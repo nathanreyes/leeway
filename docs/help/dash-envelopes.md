@@ -6,7 +6,7 @@ Envelopes are spending buckets that draw down as the month goes on — groceries
 
 Unlike bills, you don't itemize every purchase. Automatic envelopes release budget steadily across the month; manual ones you draw down yourself. Whatever is still available across all envelopes is subtracted from what's left, so the number already assumes you'll spend the rest.
 
-The envelope's name belongs to its Series. Press `S` on a row to inspect or rename that shared identity; every month using it follows the new name.
+Press `Enter` on a row to open its transactions, where you record, edit, and delete this month's spending. Amount (`a`), mode (`m`), and period (`p`) are edited right here on the row. The envelope's name belongs to its Series: press `S` to inspect or rename that shared identity; every month using it follows the new name.
 
 ## Example
 

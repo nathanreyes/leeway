@@ -19,7 +19,7 @@ use std::cell::Cell;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::{App, DashFocus, EnvelopeDetailFocus, PlanFocus, Screen, theme};
+use crate::{App, DashFocus, PlanFocus, Screen, theme};
 
 /// Every focusable region across the app that has help, plus the app-level
 /// `Overview`. Each variant maps to one Markdown file in `markdown()`.
@@ -34,8 +34,6 @@ pub enum HelpTopic {
     PlanIncome,
     PlanExpenses,
     PlanEnvelopes,
-    EnvDetails,
-    EnvTransactions,
     Series,
     PlansList,
 }
@@ -110,10 +108,6 @@ pub fn topic_for(app: &App) -> HelpTopic {
             DashFocus::Envelopes => HelpTopic::DashEnvelopes,
             DashFocus::Accounts => HelpTopic::DashAccounts,
         },
-        Screen::EnvelopeDetail { detail } => match detail.focus {
-            EnvelopeDetailFocus::Details => HelpTopic::EnvDetails,
-            EnvelopeDetailFocus::Transactions => HelpTopic::EnvTransactions,
-        },
         Screen::Series { .. } => HelpTopic::Series,
         Screen::Plans => match app.plan_focus {
             PlanFocus::List => HelpTopic::PlansList,
@@ -145,9 +139,6 @@ pub fn screen_ring(app: &App) -> Vec<HelpTopic> {
             }
             ring
         }
-        Screen::EnvelopeDetail { .. } => {
-            vec![HelpTopic::EnvDetails, HelpTopic::EnvTransactions]
-        }
         Screen::Series { .. } => vec![HelpTopic::Series],
         Screen::Plans => vec![
             HelpTopic::PlansList,
@@ -172,8 +163,6 @@ fn markdown(topic: HelpTopic) -> &'static str {
         HelpTopic::PlanIncome => include_str!("../docs/help/plan-income.md"),
         HelpTopic::PlanExpenses => include_str!("../docs/help/plan-expenses.md"),
         HelpTopic::PlanEnvelopes => include_str!("../docs/help/plan-envelopes.md"),
-        HelpTopic::EnvDetails => include_str!("../docs/help/envelope-details.md"),
-        HelpTopic::EnvTransactions => include_str!("../docs/help/envelope-transactions.md"),
         HelpTopic::Series => include_str!("../docs/help/series.md"),
         HelpTopic::PlansList => include_str!("../docs/help/plans.md"),
     }
@@ -375,8 +364,6 @@ mod tests {
         HelpTopic::PlanIncome,
         HelpTopic::PlanExpenses,
         HelpTopic::PlanEnvelopes,
-        HelpTopic::EnvDetails,
-        HelpTopic::EnvTransactions,
         HelpTopic::Series,
         HelpTopic::PlansList,
     ];
