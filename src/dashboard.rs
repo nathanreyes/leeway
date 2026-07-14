@@ -550,10 +550,26 @@ fn draw_month_body(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
     ])
     .areas(area);
     // Mirror the summary's relative positioning: income and expenses share the top row
-    // side-by-side, and envelopes sit in a shorter full-width box beneath them.
+    // side-by-side, and envelopes sit in a full-width box beneath them. Size the two
+    // tiers from their contents so spare vertical room prevents unnecessary scrolling.
+    let income_rows = view
+        .standalone
+        .iter()
+        .filter(|txn| txn.direction == Direction::In)
+        .count();
+    let expense_rows = view
+        .standalone
+        .iter()
+        .filter(|txn| txn.direction == Direction::Out)
+        .count();
+    let (items_height, envelope_height) = budget_panel_heights(
+        body.height,
+        income_rows.max(expense_rows),
+        view.envelopes.len(),
+    );
     let [items_area, env_area] = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length(envelope_block_height(view.envelopes.len())),
+        Constraint::Length(items_height),
+        Constraint::Length(envelope_height),
     ])
     .areas(body);
     let [income_area, expense_area] =
@@ -567,11 +583,45 @@ fn draw_month_body(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
     draw_whats_left(frame, summary_area, view, &app.summary_anims, app.frame_now);
 }
 
-/// The full-width envelopes box sits beneath the income/expenses row, so it takes a fixed
-/// height sized to its rows (plus the border) and cedes the rest of the body to the panels
-/// above. Capped so a long envelope list can't crowd out income/expenses.
-fn envelope_block_height(row_count: usize) -> u16 {
-    row_count.saturating_add(2).clamp(3, 9) as u16
+/// Divide the budget body between the side-by-side transaction tier and the envelope tier.
+/// Each tier gets enough rows to show all of its content whenever possible. When both cannot
+/// fit, divide the usable space in proportion to their requested heights; the list renderers
+/// then add scrollbars only to the tiers that still overflow.
+fn budget_panel_heights(
+    available: u16,
+    transaction_rows: usize,
+    envelope_rows: usize,
+) -> (u16, u16) {
+    const MIN_BLOCK_HEIGHT: usize = 3;
+
+    let available = available as usize;
+    if available < MIN_BLOCK_HEIGHT * 2 {
+        let items = available.div_ceil(2);
+        return (items as u16, (available - items) as u16);
+    }
+
+    let desired_items = transaction_rows.saturating_add(2).max(MIN_BLOCK_HEIGHT);
+    let desired_envelopes = envelope_rows.saturating_add(2).max(MIN_BLOCK_HEIGHT);
+
+    if desired_items.saturating_add(desired_envelopes) <= available {
+        // Preserve the dashboard's roomy upper tier once every row in both tiers fits.
+        return (
+            (available - desired_envelopes) as u16,
+            desired_envelopes as u16,
+        );
+    }
+
+    let distributable = available - MIN_BLOCK_HEIGHT * 2;
+    let item_demand = desired_items - MIN_BLOCK_HEIGHT;
+    let envelope_demand = desired_envelopes - MIN_BLOCK_HEIGHT;
+    let total_demand = item_demand.saturating_add(envelope_demand);
+    let item_extra = if total_demand == 0 {
+        distributable / 2
+    } else {
+        distributable.saturating_mul(item_demand) / total_demand
+    };
+    let items = MIN_BLOCK_HEIGHT + item_extra;
+    (items as u16, (available - items) as u16)
 }
 
 /// One row per account plus the bordered block, capped so a large account list does not
@@ -1277,6 +1327,27 @@ mod tests {
 
     fn direction_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn budget_panels_show_every_row_when_space_is_available() {
+        let (items, envelopes) = budget_panel_heights(50, 23, 12);
+
+        assert_eq!(items + envelopes, 50);
+        assert!(items.saturating_sub(2) >= 23);
+        assert!(envelopes.saturating_sub(2) >= 12);
+        assert_eq!(envelopes, 14);
+    }
+
+    #[test]
+    fn budget_panels_share_constrained_space_and_allow_both_to_scroll() {
+        let (items, envelopes) = budget_panel_heights(20, 23, 12);
+
+        assert_eq!(items + envelopes, 20);
+        assert!(items >= 3);
+        assert!(envelopes >= 3);
+        assert!(items.saturating_sub(2) < 23);
+        assert!(envelopes.saturating_sub(2) < 12);
     }
 
     fn label_key() -> KeyEvent {
