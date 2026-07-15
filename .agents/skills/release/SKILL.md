@@ -60,7 +60,31 @@ Run these checks. If one fails, report it and stop; do not proceed.
   `curl -s https://index.crates.io/le/ew/leeway` and confirm no line has
   `"vers":"X.Y.Z"`.
 
-### 3. Bump the version
+### 3. Draft the release description
+
+Before changing the version, identify the previous release tag and read every commit that
+will be included in the new release:
+
+```sh
+git describe --tags --abbrev=0 --match 'v[0-9]*'
+git log --format='%h%x09%s%n%b' <previous-tag>..HEAD
+```
+
+Use those commit messages as the source of truth to draft a concise, user-facing Markdown
+section headed `## What's new`:
+
+- Summarize outcomes and visible behavior rather than repeating commit subjects verbatim.
+- Consolidate commits that contribute to the same feature.
+- Prefer 3–8 bullets, ordered by user impact.
+- Omit release commits, formatting-only changes, and internal maintenance unless it materially
+  affects users.
+- Do not invent details that are not supported by the commit messages. Inspect the relevant
+  diff when a subject is too vague to summarize accurately.
+
+Keep this draft available until the GitHub Release has been created. State the proposed
+description to the user before continuing so the release contents are clear.
+
+### 4. Bump the version
 
 - Edit `version = "..."` under `[package]` in `Cargo.toml` to the new version.
 - **Sync `Cargo.lock`** (critical — CI runs `cargo publish --locked`): run
@@ -69,7 +93,7 @@ Run these checks. If one fails, report it and stop; do not proceed.
   `leeway` package's `version` line — if other dependency versions changed, stop
   and investigate rather than committing an unintended dependency bump.
 
-### 4. Commit and tag
+### 5. Commit and tag
 
 ```sh
 git add Cargo.toml Cargo.lock
@@ -77,13 +101,13 @@ git commit -m "Release vX.Y.Z"
 git tag -a vX.Y.Z -m "Release vX.Y.Z"
 ```
 
-### 5. Push (this fires both workflows)
+### 6. Push (this fires both workflows)
 
 ```sh
 git push origin master vX.Y.Z
 ```
 
-### 6. Watch both workflows
+### 7. Watch both workflows
 
 Both runs start from the tag push. Watch each to completion:
 
@@ -92,9 +116,16 @@ gh run list --repo nathanreyes/leeway --limit 5
 gh run watch <run-id> --repo nathanreyes/leeway --exit-status
 ```
 
-- On success, confirm the crate is live via the sparse index
-  (`curl -s https://index.crates.io/le/ew/leeway` shows the new `vers`) and
-  report the Release URL and the three install commands.
+- On success, read the generated GitHub Release body with
+  `gh release view vX.Y.Z --repo nathanreyes/leeway --json body,url`. Prepend the drafted
+  `## What's new` section to that existing body, preserving cargo-dist's generated install
+  and download sections, then update it with
+  `gh release edit vX.Y.Z --repo nathanreyes/leeway --notes-file <combined-notes-file>`.
+- Read the release back once more and verify that both the smart description and generated
+  artifact links are present.
+- Confirm the crate is live via the sparse index
+  (`curl -s https://index.crates.io/le/ew/leeway` shows the new `vers`) and report the
+  Release URL and the three install commands.
 - On failure, fetch logs with
   `gh run view <run-id> --repo nathanreyes/leeway --log-failed` and diagnose.
 
