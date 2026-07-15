@@ -9,6 +9,7 @@ use crate::{
     anim::{SummaryAnimations, SummaryTerm, display_cents},
 };
 use anyhow::Result;
+use leeway::calc;
 use leeway::models::{AccountType, CreditCardEntryMode, Direction, Mode, PeriodType};
 use leeway::money::Money;
 use leeway::ops;
@@ -835,7 +836,7 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                                 detail_width
                             )
                         ),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::Gray),
                     ),
                 ]))
             }
@@ -857,12 +858,10 @@ fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
 
 fn carry_column(label: &str, carry_balance: Option<Money>, width: usize) -> Span<'static> {
     let carry = carry_balance.unwrap_or(Money::ZERO);
-    let style = if carry == Money::ZERO {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default().fg(Color::Yellow)
-    };
-    Span::styled(format!("{:<width$}", format!("{label} {carry}")), style)
+    Span::styled(
+        format!("{:<width$}", format!("{label} {carry}")),
+        Style::default().fg(Color::Yellow),
+    )
 }
 
 /// The month header, and the handle for month navigation. Always drawn from `app`'s viewed
@@ -1097,27 +1096,31 @@ fn draw_transactions(
 }
 
 fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
-    // Usable inner width of the list rows, so we can push the dim total flush
-    // against the panel's right edge (accounts for borders/padding/highlight).
-    let content_width = crate::selectable_list_content_width(area);
-
     let items: Vec<ListItem> = view
         .envelopes
         .iter()
         .map(|e| {
-            let mode = match e.envelope.mode {
-                Mode::Automatic => "auto",
-                Mode::Manual => "man",
+            let mode_icon = match e.envelope.mode {
+                Mode::Automatic => "↻",
+                Mode::Manual => "✎",
             };
-            let period = match e.envelope.period_type {
-                PeriodType::Daily => "day",
-                PeriodType::Weekly | PeriodType::Monthly => "mo",
-            };
+            let daily_rate = matches!(e.envelope.period_type, PeriodType::Daily).then(|| {
+                let entered_amount = calc::envelope_period_amount(
+                    e.envelope.amount,
+                    e.envelope.period_type,
+                    view.month.days_in_month,
+                );
+                format!("{entered_amount}/day")
+            });
+
             // Segmented meter, echoing the landing page's block style: discrete
             // `▮` cells (the glyph carries its own side gaps) split into a mauve
             // fill and a lighter slate track. Two spans so each gets its own
             // colour; both render over the selection band unchanged.
-            const METER_WIDTH: usize = 20;
+            const LABEL_WIDTH: usize = 28;
+            const METER_WIDTH: usize = 24;
+            const REMAINING_WIDTH: usize = 18;
+            const TOTAL_WIDTH: usize = 16;
             let filled = meter_fill(e.consumed, e.envelope.amount, METER_WIDTH);
             let meter_fill_span =
                 Span::styled("▮".repeat(filled), Style::default().fg(crate::theme::MAUVE));
@@ -1126,43 +1129,32 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
                 Style::default().fg(crate::theme::METER_TRACK),
             );
 
-            // Left portion: name (20) · cadence (8) · meter (20) · "$X left".
-            // The cadence token is padded as a whole ("auto/mo"=7, "man/mo"=6)
-            // to a fixed 8 cols, so `mode`'s length no longer shifts the meter —
-            // every meter now starts at the same column.
-            let cadence = format!("{mode}/{period}");
-            let left_spans = vec![
+            // Fixed, nearby columns keep the row easy to scan without sending the
+            // monthly total all the way to the panel's right edge. Daily envelopes
+            // append their entered rate as context; monthly is the implicit default.
+            let mut spans = vec![
                 Span::raw(format!(
-                    "{:<20}",
-                    crate::truncate(e.envelope.display_label(), 20)
+                    "{:<LABEL_WIDTH$}",
+                    crate::truncate(e.envelope.display_label(), LABEL_WIDTH)
                 )),
-                Span::styled(
-                    format!("{cadence:<8}"),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!("{mode_icon}  "), Style::default().fg(Color::Gray)),
                 meter_fill_span,
                 meter_track_span,
-                Span::raw(format!(" {:>10} left", e.remaining.to_string())),
+                Span::raw(format!(
+                    "{:>REMAINING_WIDTH$}",
+                    format!("{} left", e.remaining)
+                )),
+                Span::styled(
+                    format!("{:>TOTAL_WIDTH$}", format!("of {}", e.envelope.amount)),
+                    Style::default().fg(Color::Gray),
+                ),
             ];
-
-            // The envelope's total, de-emphasized and right-aligned to the panel
-            // edge. The "of" prefix reads it as the total (not another balance);
-            // the period is already shown in the cadence column, so it's omitted.
-            let total = Span::styled(
-                format!("of {}", e.envelope.amount),
-                Style::default().fg(Color::DarkGray),
-            );
-
-            // Filler spaces so `total` sits flush right. Measure actual rendered
-            // widths (block chars and ASCII are single-width) rather than assume
-            // fixed columns, so an over-long "left" amount can't misalign it.
-            let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
-            let total_w = total.content.chars().count();
-            let gap = content_width.saturating_sub(left_w + total_w).max(1);
-
-            let mut spans = left_spans;
-            spans.push(Span::raw(" ".repeat(gap)));
-            spans.push(total);
+            if let Some(daily_rate) = daily_rate {
+                spans.push(Span::styled(
+                    format!("  ({daily_rate})"),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -1370,6 +1362,17 @@ mod tests {
             .collect()
     }
 
+    fn buffer_lines(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
     #[test]
     fn series_backed_label_key_points_to_the_series_page() {
         let mut app = app_with_stamped_month();
@@ -1446,6 +1449,56 @@ mod tests {
     }
 
     #[test]
+    fn envelope_rows_show_entered_rate_in_compact_fixed_columns() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Envelopes;
+        let month_id = month_view(&app).month.id;
+        ops::add_oneoff_envelope(
+            &app.conn,
+            &month_id,
+            "Long Household Supplies",
+            Money::from_dollars(25.0),
+            PeriodType::Daily,
+            Mode::Manual,
+        )
+        .unwrap();
+        ops::add_oneoff_envelope(
+            &app.conn,
+            &month_id,
+            "Automatic Fuel",
+            Money::from_dollars(100.0),
+            PeriodType::Monthly,
+            Mode::Automatic,
+        )
+        .unwrap();
+        let view = Some(month_view(&app));
+        let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+
+        terminal.draw(|frame| draw(frame, &app, &view)).unwrap();
+        let lines = buffer_lines(&terminal);
+        let row = lines
+            .iter()
+            .find(|line| line.contains("Long Household Supplies"))
+            .unwrap();
+
+        assert!(row.contains("$25.00/day"));
+        assert!(row.contains("✎"));
+        assert_eq!(row.matches('▮').count(), 24);
+        assert!(row.contains("$750.00 left      of $750.00  ($25.00/day)"));
+        assert!(row.find("$25.00/day").unwrap() > row.find("of $750.00").unwrap());
+
+        let monthly_row = lines.iter().find(|line| line.contains("Dining")).unwrap();
+        assert!(!monthly_row.contains("/mo"));
+        assert!(!monthly_row.contains("/day"));
+
+        let automatic_row = lines
+            .iter()
+            .find(|line| line.contains("Automatic Fuel"))
+            .unwrap();
+        assert!(automatic_row.contains("↻"));
+    }
+
+    #[test]
     fn account_label_key_still_opens_the_account_editor() {
         let mut app = app_with_stamped_month();
         let account_id =
@@ -1463,6 +1516,15 @@ mod tests {
             },
             _ => panic!("expected account name prompt"),
         }
+    }
+
+    #[test]
+    fn account_buffer_and_carry_columns_share_the_same_color() {
+        let buffer = carry_column("buffer", Some(Money::from_dollars(5000.0)), 18);
+        let carry = carry_column("carry", Some(Money::ZERO), 18);
+
+        assert_eq!(buffer.style.fg, Some(Color::Yellow));
+        assert_eq!(carry.style.fg, buffer.style.fg);
     }
 
     #[test]
