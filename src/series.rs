@@ -605,7 +605,9 @@ fn draw_details(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
         SeriesGroup::Expenses => "Expense",
         SeriesGroup::Envelopes => "Envelope",
     };
-    let mut lines = vec![stat_row("type", type_label.to_string())];
+    // Keys here are short ("period" is the longest), so a tight column keeps the values close.
+    let key_width = 8;
+    let mut lines = vec![stat_row("type", type_label.to_string(), key_width)];
     if detail.series.kind == Kind::Envelope {
         // Envelope series always carry a concrete mode/period; None is unreachable here but
         // falls back to the calculation defaults for safety.
@@ -617,8 +619,8 @@ fn draw_details(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
             Some(PeriodType::Daily) => "daily",
             _ => "monthly",
         };
-        lines.push(stat_row("mode", mode.to_string()));
-        lines.push(stat_row("period", period.to_string()));
+        lines.push(stat_row("mode", mode.to_string(), key_width));
+        lines.push(stat_row("period", period.to_string(), key_width));
     }
     frame.render_widget(
         Paragraph::new(lines).block(crate::titled_block(" Details ")),
@@ -635,13 +637,15 @@ fn draw_stats(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
 
     // A single aligned column: fixed-width labels, values starting at the same x. This reads
     // cleanly at any panel width and lines up regardless of amount magnitude.
+    // "planned avg" is the longest key, so pad one past it to keep a gap before the values.
+    let key_width = 12;
     let lines = vec![
-        stat_row("latest", format_money_opt(stats.latest)),
-        stat_row("avg", format_money_opt(stats.avg)),
-        stat_row("min", format_money_opt(stats.min)),
-        stat_row("max", format_money_opt(stats.max)),
-        stat_row("planned avg", format_money_opt(stats.planned_avg)),
-        stat_row("avg delta", delta),
+        stat_row("latest", format_money_opt(stats.latest), key_width),
+        stat_row("avg", format_money_opt(stats.avg), key_width),
+        stat_row("min", format_money_opt(stats.min), key_width),
+        stat_row("max", format_money_opt(stats.max), key_width),
+        stat_row("planned avg", format_money_opt(stats.planned_avg), key_width),
+        stat_row("avg delta", delta, key_width),
     ];
 
     frame.render_widget(
@@ -650,11 +654,15 @@ fn draw_stats(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
     );
 }
 
-/// One aligned `label   value` row: a readable (not too dim) label in a fixed column, then
-/// the value in the terminal's default foreground for contrast.
-fn stat_row(label: &str, value: String) -> Line<'static> {
+/// One aligned `label   value` row: a readable (not too dim) label padded to `key_width`, then
+/// the value in the terminal's default foreground for contrast. Each panel sizes `key_width` to
+/// its own longest key so values sit just past it rather than a shared, over-wide column.
+fn stat_row(label: &str, value: String, key_width: usize) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!(" {label:<12}"), Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!(" {label:<key_width$}"),
+            Style::default().fg(Color::Gray),
+        ),
         Span::raw(value),
     ])
 }
