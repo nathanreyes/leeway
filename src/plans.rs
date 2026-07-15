@@ -597,6 +597,7 @@ mod tests {
             pending_series_select: None,
             pending_plan_select: None,
             summary_anims: crate::anim::SummaryAnimations::new(),
+            series_chart_anim: crate::anim::ChartAnimation::new(),
             frame_now: std::time::Instant::now(),
             modal: None,
             status: None,

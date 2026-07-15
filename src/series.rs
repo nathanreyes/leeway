@@ -345,7 +345,7 @@ pub fn draw_detail_screen(
             .block(crate::bordered_block()),
         header,
     );
-    draw_detail_content(frame, body, detail, &view.range_label);
+    draw_detail_content(frame, body, app, detail, &view.range_label);
     draw_detail_footer(frame, footer, app, detail);
 }
 
@@ -537,12 +537,13 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
         return;
     };
 
-    draw_detail_content(frame, area, detail, &view.range_label);
+    draw_detail_content(frame, area, app, detail, &view.range_label);
 }
 
 fn draw_detail_content(
     frame: &mut Frame,
     area: Rect,
+    app: &App,
     detail: &SeriesDetailView,
     range_label: &str,
 ) {
@@ -562,7 +563,7 @@ fn draw_detail_content(
     ])
     .areas(mid_area);
 
-    draw_chart(frame, chart_area, detail, range_label);
+    draw_chart(frame, chart_area, app, detail, range_label);
     draw_details(frame, details_area, detail);
     draw_stats(frame, stats_area, detail);
     draw_plans_used(frame, plans_area, detail);
@@ -686,7 +687,13 @@ fn draw_plans_used(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_chart(frame: &mut Frame, area: Rect, detail: &SeriesDetailView, range_label: &str) {
+fn draw_chart(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    detail: &SeriesDetailView,
+    range_label: &str,
+) {
     if detail.points.is_empty() {
         draw_empty_chart(frame, area, "No stamped months in this range", range_label);
         return;
@@ -706,7 +713,13 @@ fn draw_chart(frame: &mut Frame, area: Rect, detail: &SeriesDetailView, range_la
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = segmented_chart_lines(&detail.points, inner.width, inner.height);
+    // Animated bar heights when we're paging between series; falls back to the
+    // static per-month heights when the tween's shape doesn't match this series
+    // (e.g. the first frame before the loop has synced it).
+    let heights = app.series_chart_anim.heights(app.frame_now);
+    let heights = (heights.len() == detail.points.len()).then_some(heights.as_slice());
+
+    let lines = segmented_chart_lines(&detail.points, heights, inner.width, inner.height);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -718,6 +731,7 @@ fn draw_chart(frame: &mut Frame, area: Rect, detail: &SeriesDetailView, range_la
 /// compact value sits under each bar.
 fn segmented_chart_lines(
     points: &[SeriesTrendPoint],
+    heights: Option<&[f64]>,
     width: u16,
     height: u16,
 ) -> Vec<Line<'static>> {
@@ -730,12 +744,7 @@ fn segmented_chart_lines(
 
     // Peak drives the shared vertical scale; absolute cents so a negative series
     // still charts by magnitude (mirrors the old `bar_value`).
-    let max_cents = points
-        .iter()
-        .filter_map(|p| p.effective)
-        .map(|m| m.cents().unsigned_abs())
-        .max()
-        .unwrap_or(0);
+    let max_cents = chart_peak_cents(points);
 
     // The gutter holds the tick labels. Pin it to a fixed default so it doesn't
     // shift as you page between series of different magnitudes — a width of 5
@@ -771,12 +780,18 @@ fn segmented_chart_lines(
     let content_width = count * bar_width + count.saturating_sub(1) * bar_gap;
     let left_pad = plot_width.saturating_sub(content_width) / 2;
 
-    // Filled-cell count per present month; `None` months stay blank gaps.
+    // Filled-cell count per present month; `None` months stay blank gaps. When an
+    // animated height is supplied for a bar we scale off that (a tween 0.0..=1.0);
+    // otherwise we fall back to the month's own peak-relative fraction.
     let fills: Vec<Option<usize>> = points
         .iter()
-        .map(|p| {
-            p.effective
-                .map(|m| bar_fill_rows(m.cents().unsigned_abs(), max_cents, bar_rows))
+        .enumerate()
+        .map(|(i, p)| {
+            p.effective.map(|m| match heights.and_then(|h| h.get(i)) {
+                Some(&frac) => ((frac.clamp(0.0, 1.0) * bar_rows as f64).round() as usize)
+                    .min(bar_rows),
+                None => bar_fill_rows(m.cents().unsigned_abs(), max_cents, bar_rows),
+            })
         })
         .collect();
 
@@ -992,11 +1007,47 @@ fn key(label: &str) -> Span<'static> {
     )
 }
 
-fn selected_detail<'v>(app: &App, view: &'v SeriesPageView) -> Option<&'v SeriesDetailView> {
+pub fn selected_detail<'v>(app: &App, view: &'v SeriesPageView) -> Option<&'v SeriesDetailView> {
     let indices = visible_indices(app, view);
     indices
         .get(app.series_sel.min(indices.len().saturating_sub(1)))
         .and_then(|idx| view.details.get(*idx))
+}
+
+/// Normalized bar heights (`0.0..=1.0`), one per month, for driving the chart's
+/// tween. Uses the same peak-relative fill math as the chart: `0.0` for gap
+/// months and when the series has no positive amount.
+pub fn chart_targets(detail: &SeriesDetailView) -> Vec<f64> {
+    let max = chart_peak_cents(&detail.points);
+    detail
+        .points
+        .iter()
+        .map(|p| match p.effective {
+            Some(m) if max > 0 => (m.cents().unsigned_abs() as f64 / max as f64).clamp(0.0, 1.0),
+            _ => 0.0,
+        })
+        .collect()
+}
+
+/// Identity of a chart selection: `Some(series_id)` when there's data to plot
+/// (a change animates the bars), `None` for an empty or all-$0 range so the
+/// tween resets rather than animating from a stale shape.
+pub fn chart_key(detail: &SeriesDetailView) -> Option<&str> {
+    detail
+        .points
+        .iter()
+        .any(|p| p.effective.is_some_and(|m| m.cents() != 0))
+        .then_some(detail.series.id.as_str())
+}
+
+/// Peak magnitude (absolute cents) across the charted months; the shared scale.
+fn chart_peak_cents(points: &[SeriesTrendPoint]) -> u64 {
+    points
+        .iter()
+        .filter_map(|p| p.effective)
+        .map(|m| m.cents().unsigned_abs())
+        .max()
+        .unwrap_or(0)
 }
 
 fn move_selection(app: &mut App, view: &SeriesPageView, delta: isize) {
@@ -1141,6 +1192,31 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// Count the mauve-filled bar cells across all rows (each filled row of a bar
+    /// is one `▮` span in the fill colour). For a single-bar chart this is the
+    /// bar's height in cells.
+    fn mauve_fill_cells(lines: &[Line]) -> usize {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.content.contains('▮') && s.style.fg == Some(crate::theme::MAUVE))
+            .count()
+    }
+
+    #[test]
+    fn animated_heights_drive_the_mauve_fill() {
+        // The tween feeds normalized heights straight into the fill: a bar at 0.0
+        // has no mauve (all track), a bar at 1.0 is full, so mid-tween sits between.
+        let points = vec![pt("2026-01", Some(100000))];
+        let empty = segmented_chart_lines(&points, Some(&[0.0]), 20, 12);
+        let half = segmented_chart_lines(&points, Some(&[0.5]), 20, 12);
+        let full = segmented_chart_lines(&points, Some(&[1.0]), 20, 12);
+
+        assert_eq!(mauve_fill_cells(&empty), 0);
+        assert!(mauve_fill_cells(&half) > 0);
+        assert!(mauve_fill_cells(&full) > mauve_fill_cells(&half));
+    }
+
     #[test]
     fn segmented_chart_draws_axis_bars_labels_and_values() {
         let points = vec![
@@ -1148,7 +1224,7 @@ mod tests {
             pt("2026-02", None), // missing month: a genuine gap
             pt("2026-04", Some(300000)),
         ];
-        let lines = segmented_chart_lines(&points, 48, 12);
+        let lines = segmented_chart_lines(&points, None, 48, 12);
         let top = text(&lines[0]);
         // Peak tick + segmented bars at the top row.
         assert!(top.starts_with("$3.0k ┤"), "top row: {top:?}");
@@ -1171,7 +1247,7 @@ mod tests {
             pt("2026-02", None),
             pt("2026-03", Some(100000)),
         ];
-        let lines = segmented_chart_lines(&points, 40, 10);
+        let lines = segmented_chart_lines(&points, None, 40, 10);
         // Every bar row must contain a run of spaces wide enough to be the gap.
         let bar_rows = &lines[..lines.len() - 2];
         assert!(
@@ -1184,7 +1260,7 @@ mod tests {
     fn tiny_frames_do_not_panic() {
         let points = vec![pt("2026-01", Some(100000)), pt("2026-02", Some(50000))];
         for (w, h) in [(0, 0), (1, 1), (3, 2), (8, 3), (2, 12)] {
-            let _ = segmented_chart_lines(&points, w, h);
+            let _ = segmented_chart_lines(&points, None, w, h);
         }
     }
 

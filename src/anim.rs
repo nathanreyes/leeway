@@ -12,6 +12,95 @@ use std::time::{Duration, Instant};
 
 pub const ANIM_DURATION: Duration = Duration::from_millis(550);
 
+/// How long the Series trend chart takes to tween its bars when you page to a
+/// different series (or change the range). Kept snappy so scrubbing through the
+/// list with j/k feels immediate rather than laggy.
+pub const CHART_ANIM_DURATION: Duration = Duration::from_millis(300);
+
+/// Tweens the Series trend chart's bar heights when the selection changes.
+///
+/// The chart is immediate-mode like the rest of the UI; this remembers only the
+/// last selection's normalized bar heights (`0.0..=1.0`, one per month) and the
+/// in-flight tween, so switching series animates each bar from its old height to
+/// the new one — some rising, some falling — instead of snapping.
+#[derive(Default)]
+pub struct ChartAnimation {
+    /// Identity of the currently-shown series+range. A change triggers a tween.
+    key: Option<String>,
+    from: Vec<f64>,
+    to: Vec<f64>,
+    start: Option<Instant>,
+}
+
+impl ChartAnimation {
+    pub fn new() -> ChartAnimation {
+        ChartAnimation::default()
+    }
+
+    /// Point the chart at `targets` (normalized `0.0..=1.0` heights, one per bar)
+    /// for the series identified by `key`. The first sync, an empty selection, or
+    /// re-syncing the same key just tracks the targets; a *changed* key starts a
+    /// tween from whatever is on screen now to the new targets.
+    pub fn sync(&mut self, key: Option<&str>, targets: &[f64], now: Instant) {
+        match key {
+            None => {
+                // Nothing to chart (empty/all-zero series): drop any tween so the
+                // next real selection animates in cleanly.
+                self.key = None;
+                self.from.clear();
+                self.to.clear();
+                self.start = None;
+            }
+            Some(key) if self.key.as_deref() == Some(key) => {
+                // Same selection: targets are recomputed every frame but don't change.
+                self.to = targets.to_vec();
+            }
+            Some(key) => {
+                let first = self.key.is_none();
+                self.from = self.heights(now);
+                self.from.resize(targets.len(), 0.0);
+                self.to = targets.to_vec();
+                // First view sets a baseline without animating (like the summary).
+                self.start = (!first).then_some(now);
+                self.key = Some(key.to_string());
+            }
+        }
+    }
+
+    pub fn is_animating(&self, now: Instant) -> bool {
+        self.start
+            .is_some_and(|start| now.saturating_duration_since(start) < CHART_ANIM_DURATION)
+    }
+
+    /// The bar heights to render now: the eased tween while animating, otherwise
+    /// the plain targets.
+    pub fn heights(&self, now: Instant) -> Vec<f64> {
+        let p = self.progress(now);
+        self.to
+            .iter()
+            .enumerate()
+            .map(|(i, &to)| {
+                let from = self.from.get(i).copied().unwrap_or(0.0);
+                from + (to - from) * p
+            })
+            .collect()
+    }
+
+    fn progress(&self, now: Instant) -> f64 {
+        match self.start {
+            None => 1.0,
+            Some(start) => {
+                let elapsed = now.saturating_duration_since(start);
+                if elapsed >= CHART_ANIM_DURATION {
+                    1.0
+                } else {
+                    ease_out_cubic(elapsed.as_secs_f64() / CHART_ANIM_DURATION.as_secs_f64())
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SummaryTerm {
     Funds,
@@ -290,5 +379,58 @@ mod tests {
                 .0,
             35_000
         );
+    }
+
+    #[test]
+    fn chart_first_sync_shows_targets_without_animating() {
+        let mut anim = ChartAnimation::new();
+        let now = Instant::now();
+        anim.sync(Some("groceries"), &[0.5, 1.0], now);
+
+        assert!(!anim.is_animating(now));
+        assert_eq!(anim.heights(now), vec![0.5, 1.0]);
+    }
+
+    #[test]
+    fn chart_changing_series_tweens_from_previous_heights() {
+        let mut anim = ChartAnimation::new();
+        let now = Instant::now();
+        anim.sync(Some("groceries"), &[0.2, 1.0], now);
+        // Switch series: bars start at the old heights and ease toward the new ones.
+        anim.sync(Some("rent"), &[1.0, 0.0], now);
+
+        assert!(anim.is_animating(now));
+        assert_eq!(anim.heights(now), vec![0.2, 1.0]); // t=0 → the previous shape
+        let mid = anim.heights(now + CHART_ANIM_DURATION / 2);
+        assert!(mid[0] > 0.2 && mid[0] < 1.0, "bar 0 rising: {mid:?}");
+        assert!(mid[1] < 1.0 && mid[1] > 0.0, "bar 1 falling: {mid:?}");
+        // Settles exactly on the target once the tween is done.
+        assert_eq!(anim.heights(now + CHART_ANIM_DURATION), vec![1.0, 0.0]);
+        assert!(!anim.is_animating(now + CHART_ANIM_DURATION));
+    }
+
+    #[test]
+    fn chart_growing_bar_count_pads_missing_from_zero() {
+        let mut anim = ChartAnimation::new();
+        let now = Instant::now();
+        anim.sync(Some("a"), &[1.0], now);
+        anim.sync(Some("b"), &[0.5, 0.8], now); // new series has an extra bar
+
+        // The new second bar animates up from an implicit 0.0.
+        assert_eq!(anim.heights(now), vec![1.0, 0.0]);
+        assert_eq!(anim.heights(now + CHART_ANIM_DURATION), vec![0.5, 0.8]);
+    }
+
+    #[test]
+    fn chart_empty_selection_resets_without_animating() {
+        let mut anim = ChartAnimation::new();
+        let now = Instant::now();
+        anim.sync(Some("a"), &[1.0], now);
+        anim.sync(Some("b"), &[0.2], now); // animating
+        assert!(anim.is_animating(now));
+
+        anim.sync(None, &[], now); // nothing to chart
+        assert!(!anim.is_animating(now));
+        assert!(anim.heights(now).is_empty());
     }
 }

@@ -19,7 +19,7 @@ mod plans;
 mod series;
 mod theme;
 
-use anim::SummaryAnimations;
+use anim::{ChartAnimation, SummaryAnimations};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
 use leeway::models::{
@@ -617,6 +617,8 @@ pub struct App {
     /// next reload so the new plan lands selected.
     pub pending_plan_select: Option<String>,
     pub summary_anims: SummaryAnimations,
+    /// Tweens the Series trend chart's bars as you page between series.
+    pub series_chart_anim: ChartAnimation,
     pub frame_now: Instant,
     pub modal: Option<Modal>,
     /// A transient one-liner (errors, confirmations) shown in the footer.
@@ -824,6 +826,7 @@ fn main() -> Result<()> {
         pending_series_select: None,
         pending_plan_select: None,
         summary_anims: SummaryAnimations::new(),
+        series_chart_anim: ChartAnimation::new(),
         frame_now: Instant::now(),
         modal: None,
         status: None,
@@ -965,11 +968,21 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             app.status = Some("Series no longer exists".into());
                             continue;
                         };
+                        let now = Instant::now();
+                        app.frame_now = now;
+                        let anim_key = series::chart_key(detail)
+                            .map(|id| format!("{id}|{:?}", app.series_range));
+                        app.series_chart_anim.sync(
+                            anim_key.as_deref(),
+                            &series::chart_targets(detail),
+                            now,
+                        );
                         terminal.draw(|f| {
                             series::draw_detail_screen(f, app, &view, detail);
                             draw_modal(f, app);
                         })?;
-                        if let Some(key) = read_key(sync_tick(app))? {
+                        let tick = series_tick(app, now);
+                        if let Some(key) = read_key(tick)? {
                             if app.modal.is_some() {
                                 handle_modal_key(app, key)?;
                             } else if handle_global_key(app, key) || !budget_key_allowed(app, key) {
@@ -986,11 +999,22 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                         }
                         let visible_count = series::visible_count(app, &view);
                         clamp(&mut app.series_sel, visible_count);
+                        let now = Instant::now();
+                        app.frame_now = now;
+                        // The selected row drives the chart, so its bars tween as
+                        // you move the highlight up and down the list.
+                        let detail = series::selected_detail(app, &view);
+                        let anim_key = detail
+                            .and_then(series::chart_key)
+                            .map(|id| format!("{id}|{:?}", app.series_range));
+                        let targets = detail.map(series::chart_targets).unwrap_or_default();
+                        app.series_chart_anim.sync(anim_key.as_deref(), &targets, now);
                         terminal.draw(|f| {
                             series::draw(f, app, &view);
                             draw_modal(f, app);
                         })?;
-                        if let Some(key) = read_key(sync_tick(app))? {
+                        let tick = series_tick(app, now);
+                        if let Some(key) = read_key(tick)? {
                             if app.modal.is_some() {
                                 handle_modal_key(app, key)?;
                             } else if app.series_search_active {
@@ -1115,6 +1139,17 @@ fn sync_tick(app: &App) -> Duration {
         SYNC_TICK
     } else {
         IDLE_TICK
+    }
+}
+
+/// Input timeout for the Series screen: the fast frame tick while the chart is
+/// mid-tween (so the bars keep moving with no keypresses), otherwise the usual
+/// sync/idle cadence.
+fn series_tick(app: &App, now: Instant) -> Duration {
+    if app.series_chart_anim.is_animating(now) {
+        FRAME_TICK
+    } else {
+        sync_tick(app)
     }
 }
 
@@ -3520,6 +3555,7 @@ mod tests {
             pending_series_select: None,
             pending_plan_select: None,
             summary_anims: SummaryAnimations::new(),
+            series_chart_anim: ChartAnimation::new(),
             frame_now: Instant::now(),
             modal: Some(Modal::Envelope(manage.clone())),
             status: None,
