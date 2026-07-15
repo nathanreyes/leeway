@@ -31,11 +31,11 @@ use leeway::view::SeriesTimeRange;
 use leeway::{calc, db, ops, queries};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph,
-    Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    Scrollbar, ScrollbarOrientation, ScrollbarState, Tabs, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
@@ -1285,13 +1285,15 @@ fn handle_storage_tab_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
 fn draw_settings(frame: &mut Frame, app: &App, tab: SettingsTab) {
     let area = frame.area();
-    let [header, body, footer] = Layout::vertical([
+    let [header, tabs, body, footer] = Layout::vertical([
         Constraint::Length(3),
+        Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(2),
     ])
     .areas(area);
-    draw_settings_header(frame, header, tab);
+    draw_settings_header(frame, header);
+    draw_settings_tabs(frame, tabs, tab);
 
     let local_hints = match tab {
         SettingsTab::General => {
@@ -1314,30 +1316,31 @@ fn draw_settings(frame: &mut Frame, app: &App, tab: SettingsTab) {
     draw_screen_footer(frame, footer, local_hints, global, app.status.as_deref());
 }
 
-/// The settings header doubles as the tab bar: the app title on the left, then one chip
-/// per tab with the active one highlighted.
-fn draw_settings_header(frame: &mut Frame, area: Rect, active: SettingsTab) {
-    let mut spans = vec![
-        Span::styled(" Settings", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("   "),
-    ];
-    for (idx, tab) in SettingsTab::ALL.iter().enumerate() {
-        if idx > 0 {
-            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
-        }
-        let style = if *tab == active {
+/// Match the other top-level screens: the header names the screen and nothing else.
+fn draw_settings_header(frame: &mut Frame, area: Rect) {
+    let title = Paragraph::new(Line::from(" Settings ".bold()))
+        .alignment(Alignment::Center)
+        .block(bordered_block());
+    frame.render_widget(title, area);
+}
+
+/// Navigation belongs below the screen title so it can use ratatui's tab semantics and
+/// remain visually distinct from the active tab's settings.
+fn draw_settings_tabs(frame: &mut Frame, area: Rect, active: SettingsTab) {
+    let selected = SettingsTab::ALL
+        .iter()
+        .position(|tab| *tab == active)
+        .unwrap_or_default();
+    let tabs = Tabs::new(SettingsTab::ALL.map(SettingsTab::title))
+        .select(selected)
+        .style(Style::default().fg(Color::Gray))
+        .highlight_style(
             Style::default()
                 .fg(theme::MAUVE)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        spans.push(Span::styled(format!(" {} ", tab.title()), style));
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).block(bordered_block()),
-        area,
-    );
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )
+        .divider(Span::styled("│", Style::default().fg(Color::DarkGray)));
+    frame.render_widget(tabs, area);
 }
 
 /// The General tab: a short selectable list of app-wide preferences.
@@ -1386,7 +1389,7 @@ fn draw_general_tab(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(titled_block(" General ")),
+            .block(bordered_block()),
         area,
     );
 }
@@ -1453,7 +1456,7 @@ fn draw_storage_tab(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(titled_block(" Storage ")),
+            .block(bordered_block()),
         area,
     );
 }
@@ -3954,9 +3957,12 @@ mod tests {
             .draw(|frame| draw_settings(frame, &app, SettingsTab::General))
             .unwrap();
         let text = buffer_text(&terminal);
-        // The tab bar names both tabs.
-        assert!(text.contains("General"));
-        assert!(text.contains("Storage"));
+        let lines: Vec<_> = text.lines().collect();
+        // The screen title is boxed on its own, with the tab bar immediately below it.
+        assert!(lines[1].contains("Settings"));
+        assert!(!lines[1].contains("General"));
+        assert!(lines[3].contains("General"));
+        assert!(lines[3].contains("Storage"));
         // All General-tab settings render with their current values.
         assert!(text.contains("New-envelope default"));
         assert!(text.contains("Credit card entry"));
