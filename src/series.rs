@@ -500,13 +500,8 @@ fn series_row(detail: &SeriesDetailView, width: usize) -> ListItem<'static> {
     // lines up under the right-aligned "avg / mo" title. The amount's own right-alignment
     // padding within `avg_width` keeps a gap between a long label and the number.
     let label_width = width.saturating_sub(avg_width).max(8);
-    let label = match detail.group {
-        SeriesGroup::Envelopes => {
-            let meta = envelope_meta(detail);
-            crate::truncate(&format!("{} {}", detail.series.label, meta), label_width)
-        }
-        _ => crate::truncate(&detail.series.label, label_width),
-    };
+    // The mode (auto/manual) shows in the Details pane, so it's not repeated here.
+    let label = crate::truncate(&detail.series.label, label_width);
     ListItem::new(Line::from(vec![
         Span::raw(format!("{:<label_width$}", label)),
         Span::styled(
@@ -514,13 +509,6 @@ fn series_row(detail: &SeriesDetailView, width: usize) -> ListItem<'static> {
             Style::default().fg(Color::DarkGray),
         ),
     ]))
-}
-
-fn envelope_meta(detail: &SeriesDetailView) -> &'static str {
-    match detail.series.mode {
-        Some(Mode::Manual) => "manual",
-        _ => "auto",
-    }
 }
 
 fn selected_row_index(rows: &[SidebarRow], selected_item: usize) -> Option<usize> {
@@ -568,9 +556,9 @@ fn draw_detail_content(
     // Three panels across the mid row: series metadata (type, and mode/period for envelopes)
     // on the left, the aligned stat column in the middle, and plan membership on the right.
     let [details_area, stats_area, plans_area] = Layout::horizontal([
-        Constraint::Percentage(28),
-        Constraint::Percentage(32),
-        Constraint::Percentage(40),
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+        Constraint::Percentage(33),
     ])
     .areas(mid_area);
 
@@ -717,7 +705,7 @@ fn draw_chart(frame: &mut Frame, area: Rect, detail: &SeriesDetailView, range_la
                 .bg(crate::theme::CYAN)
                 .add_modifier(Modifier::BOLD),
         )
-        .label_style(Style::default().fg(Color::DarkGray));
+        .label_style(Style::default().fg(Color::Gray));
     frame.render_widget(chart, chart_area);
 }
 
