@@ -27,3 +27,9 @@ pub const SELECTION: Color = Color::Rgb(88, 91, 112);
 /// empty meter stays visible even on a selected (banded) row — a track colour at
 /// or below SELECTION would vanish under the band here. Mocha `Overlay0` (#6c7086).
 pub const METER_TRACK: Color = Color::Rgb(108, 112, 134);
+
+/// Gap segment above a bar on the Series trend chart. More subdued than
+/// [`METER_TRACK`]: the chart sits on plain background (no selection band to
+/// read over), so a dimmer slate keeps the filler quiet against the mauve
+/// fill. Mocha `Surface1` (#45475a).
+pub const CHART_TRACK: Color = Color::Rgb(69, 71, 90);

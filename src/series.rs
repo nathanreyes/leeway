@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Bar, BarChart, ListItem, ListState, Paragraph};
+use ratatui::widgets::{ListItem, ListState, Paragraph};
 
 enum SidebarRow {
     Header(SeriesGroup),
@@ -691,7 +691,13 @@ fn draw_chart(frame: &mut Frame, area: Rect, detail: &SeriesDetailView, range_la
         draw_empty_chart(frame, area, "No stamped months in this range", range_label);
         return;
     }
-    if !detail.points.iter().any(|point| point.effective.is_some()) {
+    // Needs at least one non-zero amount: an all-$0 (or all-missing) range has no
+    // scale, which would otherwise render every bar as a full-height empty track.
+    if !detail
+        .points
+        .iter()
+        .any(|point| point.effective.is_some_and(|m| m.cents() != 0))
+    {
         draw_empty_chart(frame, area, "No trend data in this range", range_label);
         return;
     }
@@ -700,21 +706,177 @@ fn draw_chart(frame: &mut Frame, area: Rect, detail: &SeriesDetailView, range_la
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let bars = trend_bars(&detail.points);
-    let (bar_width, bar_gap) = bar_chart_spacing(inner.width, bars.len());
-    let chart_area = centered_bar_chart_area(inner, bars.len(), bar_width, bar_gap);
-    let chart = BarChart::new(bars)
-        .bar_width(bar_width)
-        .bar_gap(bar_gap)
-        .bar_style(Style::default().fg(crate::theme::CYAN))
-        .value_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(crate::theme::CYAN)
-                .add_modifier(Modifier::BOLD),
-        )
-        .label_style(Style::default().fg(Color::Gray));
-    frame.render_widget(chart, chart_area);
+    let lines = segmented_chart_lines(&detail.points, inner.width, inner.height);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Build the trend chart as lines of styled cells, echoing the dashboard's
+/// envelope meters (`MAUVE` fill over a subdued `CHART_TRACK` gap) but drawn vertically:
+/// each month is a column of `▮` segments, mauve from the baseline up to its
+/// value and subdued above. A left gutter carries value ticks ($0, a midpoint,
+/// the peak) beside a `│`/`┤`/`└` axis; month labels ride the baseline and a
+/// compact value sits under each bar.
+fn segmented_chart_lines(
+    points: &[SeriesTrendPoint],
+    width: u16,
+    height: u16,
+) -> Vec<Line<'static>> {
+    const SEG: &str = "▮";
+    let inner_w = width as usize;
+    let inner_h = height as usize;
+    if inner_w == 0 || inner_h == 0 {
+        return Vec::new();
+    }
+
+    // Peak drives the shared vertical scale; absolute cents so a negative series
+    // still charts by magnitude (mirrors the old `bar_value`).
+    let max_cents = points
+        .iter()
+        .filter_map(|p| p.effective)
+        .map(|m| m.cents().unsigned_abs())
+        .max()
+        .unwrap_or(0);
+
+    // The gutter holds the tick labels. Pin it to a fixed default so it doesn't
+    // shift as you page between series of different magnitudes — a width of 5
+    // fits the common range (`$0`, `$450`, `$3.0k`, `$120k`, `$1.0m`). It only
+    // grows for genuinely larger labels (so nothing clips) and shrinks only when
+    // a narrow pane can't spare the room.
+    const DEFAULT_GUTTER_WIDTH: usize = 5;
+    let max_label = compact_money(Money(max_cents as i64));
+    let mid_label = compact_money(Money((max_cents / 2) as i64));
+    let zero_label = compact_money(Money::ZERO);
+    let gutter_w = max_label
+        .chars()
+        .count()
+        .max(mid_label.chars().count())
+        .max(zero_label.chars().count())
+        .max(DEFAULT_GUTTER_WIDTH)
+        .min(inner_w / 2);
+
+    // Left prefix = gutter + a space + the 1-col axis; the plot fills the rest.
+    let axis_col = gutter_w + 2;
+    let plot_width = inner_w.saturating_sub(axis_col);
+    // Two rows sit below the bars: the baseline (with month labels) and values.
+    let bar_rows = inner_h.saturating_sub(2);
+
+    let count = points.len();
+    if plot_width == 0 || count == 0 {
+        return Vec::new();
+    }
+    let (bar_width, bar_gap) = bar_chart_spacing(plot_width as u16, count);
+    let bar_width = bar_width as usize;
+    let bar_gap = bar_gap as usize;
+    let pitch = bar_width + bar_gap;
+    let content_width = count * bar_width + count.saturating_sub(1) * bar_gap;
+    let left_pad = plot_width.saturating_sub(content_width) / 2;
+
+    // Filled-cell count per present month; `None` months stay blank gaps.
+    let fills: Vec<Option<usize>> = points
+        .iter()
+        .map(|p| {
+            p.effective
+                .map(|m| bar_fill_rows(m.cents().unsigned_abs(), max_cents, bar_rows))
+        })
+        .collect();
+
+    let axis_style = Style::default().fg(Color::Gray);
+    let mid_row = if bar_rows >= 2 { Some(bar_rows / 2) } else { None };
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
+
+    // Bar rows, peak (top) to baseline (bottom).
+    for r in 0..bar_rows {
+        let is_tick = r == 0 || Some(r) == mid_row;
+        let tick = if r == 0 {
+            max_label.as_str()
+        } else if Some(r) == mid_row {
+            mid_label.as_str()
+        } else {
+            ""
+        };
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::styled(format!("{tick:>gutter_w$} "), axis_style),
+            Span::styled(if is_tick { "┤" } else { "│" }.to_string(), axis_style),
+            Span::raw(" ".repeat(left_pad)),
+        ];
+        for (i, fill) in fills.iter().enumerate() {
+            match fill {
+                // Bottom `filled` rows are the mauve fill; the rest is track.
+                Some(filled) => {
+                    let color = if r >= bar_rows - filled {
+                        crate::theme::MAUVE
+                    } else {
+                        crate::theme::CHART_TRACK
+                    };
+                    spans.push(Span::styled(SEG.repeat(bar_width), Style::default().fg(color)));
+                }
+                None => spans.push(Span::raw(" ".repeat(bar_width))),
+            }
+            if i + 1 < count {
+                spans.push(Span::raw(" ".repeat(bar_gap)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Baseline: the `└` corner and a `─` axis carrying centered month labels.
+    let mut baseline = vec!['─'; plot_width];
+    for (i, p) in points.iter().enumerate() {
+        write_centered(
+            &mut baseline,
+            left_pad + i * pitch,
+            bar_width,
+            &short_month_label(&p.month_label),
+        );
+    }
+    lines.push(Line::from(vec![
+        Span::styled(format!("{zero_label:>gutter_w$} └"), axis_style),
+        Span::styled(baseline.into_iter().collect::<String>(), axis_style),
+    ]));
+
+    // Values: a compact amount under each present bar. Skipped when it can't fit
+    // the bar width, so a narrow pane shows nothing rather than a clipped "$1.".
+    let mut values = vec![' '; plot_width];
+    for (i, p) in points.iter().enumerate() {
+        if let Some(m) = p.effective {
+            let value = compact_money(m);
+            if value.chars().count() <= bar_width {
+                write_centered(&mut values, left_pad + i * pitch, bar_width, &value);
+            }
+        }
+    }
+    lines.push(Line::from(vec![
+        Span::raw(format!("{:>axis_col$}", "")),
+        Span::styled(
+            values.into_iter().collect::<String>(),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+
+    lines
+}
+
+/// Filled cell count for a vertical bar of `rows` showing `value / max`. Same
+/// fraction-rounded shape as the dashboard's `meter_fill`, applied to cents.
+fn bar_fill_rows(value: u64, max: u64, rows: usize) -> usize {
+    if max == 0 || rows == 0 {
+        return 0;
+    }
+    let frac = (value as f64 / max as f64).clamp(0.0, 1.0);
+    ((frac * rows as f64).round() as usize).min(rows)
+}
+
+/// Overwrite `text` (truncated to `field`) centered within `buf[start..start + field]`.
+fn write_centered(buf: &mut [char], start: usize, field: usize, text: &str) {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len().min(field);
+    let off = start + (field - len) / 2;
+    for (k, ch) in chars.iter().take(len).enumerate() {
+        if let Some(slot) = buf.get_mut(off + k) {
+            *slot = *ch;
+        }
+    }
 }
 
 fn draw_empty_chart(frame: &mut Frame, area: Rect, msg: &str, range_label: &str) {
@@ -883,23 +1045,6 @@ fn visible_indices(app: &App, view: &SeriesPageView) -> Vec<usize> {
         .collect()
 }
 
-fn trend_bars(points: &[SeriesTrendPoint]) -> Vec<Bar<'static>> {
-    points
-        .iter()
-        .map(|point| {
-            let label = short_month_label(&point.month_label);
-            match point.effective {
-                Some(amount) => {
-                    Bar::with_label(label, bar_value(amount)).text_value(compact_money(amount))
-                }
-                None => Bar::with_label(label, 0)
-                    .text_value("")
-                    .style(Style::default().fg(Color::DarkGray)),
-            }
-        })
-        .collect()
-}
-
 fn bar_chart_spacing(width: u16, bar_count: usize) -> (u16, u16) {
     let count = u16::try_from(bar_count).unwrap_or(u16::MAX).max(1);
     let desired_bar_width = 6;
@@ -915,26 +1060,6 @@ fn bar_chart_spacing(width: u16, bar_count: usize) -> (u16, u16) {
         .unwrap_or(1)
         .clamp(1, desired_bar_width);
     (bar_width, bar_gap)
-}
-
-fn centered_bar_chart_area(area: Rect, bar_count: usize, bar_width: u16, bar_gap: u16) -> Rect {
-    let count = u16::try_from(bar_count).unwrap_or(u16::MAX);
-    let content_width = count
-        .saturating_mul(bar_width)
-        .saturating_add(count.saturating_sub(1).saturating_mul(bar_gap));
-    if content_width == 0 || content_width >= area.width {
-        area
-    } else {
-        Rect {
-            x: area.x + (area.width - content_width) / 2,
-            width: content_width,
-            ..area
-        }
-    }
-}
-
-fn bar_value(value: Money) -> u64 {
-    value.cents().unsigned_abs()
 }
 
 fn short_month_label(label: &str) -> String {
@@ -993,5 +1118,83 @@ fn format_signed_money(value: Money) -> String {
         format!("+{}", value)
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pt(label: &str, cents: Option<i64>) -> SeriesTrendPoint {
+        SeriesTrendPoint {
+            month_label: label.to_string(),
+            effective: cents.map(Money),
+            planned: None,
+            occurrence_count: 1,
+            settled_count: 0,
+            unsettled_count: 0,
+        }
+    }
+
+    /// Flatten a rendered line back into a plain string for content assertions.
+    fn text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn segmented_chart_draws_axis_bars_labels_and_values() {
+        let points = vec![
+            pt("2026-01", Some(120000)),
+            pt("2026-02", None), // missing month: a genuine gap
+            pt("2026-04", Some(300000)),
+        ];
+        let lines = segmented_chart_lines(&points, 48, 12);
+        let top = text(&lines[0]);
+        // Peak tick + segmented bars at the top row.
+        assert!(top.starts_with("$3.0k ┤"), "top row: {top:?}");
+        assert!(top.contains('▮'));
+        // Baseline carries the $0 tick, the corner, and centered month labels.
+        let baseline = text(&lines[lines.len() - 2]);
+        assert!(baseline.contains("$0 └"), "baseline: {baseline:?}");
+        assert!(baseline.contains("Jan 26") && baseline.contains("Apr 26"));
+        // Values sit under the present bars only.
+        let values = text(&lines[lines.len() - 1]);
+        assert!(values.contains("$1.2k") && values.contains("$3.0k"));
+    }
+
+    #[test]
+    fn missing_month_is_a_blank_gap_not_a_bar() {
+        // A single missing month between two present ones must leave its column
+        // clear rather than drawing a zero-height (or full-track) bar.
+        let points = vec![
+            pt("2026-01", Some(100000)),
+            pt("2026-02", None),
+            pt("2026-03", Some(100000)),
+        ];
+        let lines = segmented_chart_lines(&points, 40, 10);
+        // Every bar row must contain a run of spaces wide enough to be the gap.
+        let bar_rows = &lines[..lines.len() - 2];
+        assert!(
+            bar_rows.iter().all(|l| text(l).contains("   ")),
+            "expected a blank gap column in each bar row"
+        );
+    }
+
+    #[test]
+    fn tiny_frames_do_not_panic() {
+        let points = vec![pt("2026-01", Some(100000)), pt("2026-02", Some(50000))];
+        for (w, h) in [(0, 0), (1, 1), (3, 2), (8, 3), (2, 12)] {
+            let _ = segmented_chart_lines(&points, w, h);
+        }
+    }
+
+    #[test]
+    fn bar_fill_rows_scales_and_clamps() {
+        assert_eq!(bar_fill_rows(0, 100, 10), 0);
+        assert_eq!(bar_fill_rows(100, 100, 10), 10);
+        assert_eq!(bar_fill_rows(50, 100, 10), 5);
+        assert_eq!(bar_fill_rows(999, 100, 10), 10); // over-max clamps to full
+        assert_eq!(bar_fill_rows(50, 0, 10), 0); // no peak → empty
+        assert_eq!(bar_fill_rows(50, 100, 0), 0); // no rows → empty
     }
 }
