@@ -371,7 +371,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) {
     let [left, right] =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
+        Layout::horizontal([Constraint::Percentage(33), Constraint::Percentage(67)]).areas(area);
     draw_sidebar(frame, left, app, view);
     draw_detail(frame, right, app, view);
 }
