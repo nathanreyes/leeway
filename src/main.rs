@@ -800,7 +800,7 @@ fn main() -> Result<()> {
         conn,
         screen: Screen::Dashboard,
         should_quit: false,
-        dash_focus: DashFocus::Header,
+        dash_focus: DashFocus::Accounts,
         viewed_year: today.year(),
         viewed_month: today.month(),
         dash_income_sel: 0,
