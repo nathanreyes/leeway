@@ -25,8 +25,8 @@ Three primitives, cleanly related:
 
 And a separation across time:
 
-- **Plan** — a reusable *template*: a named set of plan-items, each referencing a **series** and carrying that plan's budgeted *amount*. The series says *what* the item is; the plan says *how much*. You can keep several plans (normal month, tight month, summer-with-the-kids) that share series, and choose which to stamp.
-- **Stamping** — at the start of a month you stamp a plan, which **copies** its items into concrete instances for that month (the series' fields + the plan's amount). The link to the plan is then **broken**: the month is an independent snapshot. Editing the plan afterward never reaches back into a stamped month. A month may be **restamped** with any plan — **merge** (additive; refresh unsettled instances, protect settled ones) or **replace** (clean slate; keeps hand-entered data only if you ask). Matching is by shared `series_id`.
+- **Plan** — a reusable *template*: a named set of plan-items, each referencing a **series** and carrying that plan's budgeted *amount* and *active months*. The series says *what* the item is; the plan says *how much* and *when*. An item runs every month unless the plan narrows it, which is how yearly costs — birthday gifts, school fees, an annual premium — live in the baseline instead of in the user's memory. You can keep several plans (normal month, tight month, summer-with-the-kids) that share series, and choose which to stamp.
+- **Stamping** — at the start of a month you stamp a plan, which **copies** its items into concrete instances for that month (the series' fields + the plan's amount), skipping any item whose active months exclude that month. The link to the plan is then **broken**: the month is an independent snapshot. Editing the plan afterward never reaches back into a stamped month. A month may be **restamped** with any plan — **merge** (additive; refresh unsettled instances, protect settled ones) or **replace** (clean slate; keeps hand-entered data only if you ask). Matching is by shared `series_id`.
 
 ---
 
@@ -64,13 +64,14 @@ CREATE TABLE series (
 );
 
 -- A series' membership in a plan. The series says WHAT the item is; the plan_item says
--- HOW MUCH this template budgets for it. `amount` is per-plan; everything else lives on
--- the series.
+-- HOW MUCH this template budgets for it and WHEN it runs. Both are per-plan; everything
+-- else lives on the series.
 CREATE TABLE plan_item (
-    id        TEXT PRIMARY KEY,            -- UUID (per-plan row; NOT the series identity)
-    plan_id   TEXT NOT NULL REFERENCES plan(id),
-    series_id TEXT NOT NULL REFERENCES series(id),
-    amount    REAL NOT NULL                -- envelopes: daily rate or monthly total, by period_type
+    id            TEXT PRIMARY KEY,        -- UUID (per-plan row; NOT the series identity)
+    plan_id       TEXT NOT NULL REFERENCES plan(id),
+    series_id     TEXT NOT NULL REFERENCES series(id),
+    amount        REAL NOT NULL,           -- envelopes: daily rate or monthly total, by period_type
+    active_months INTEGER                  -- 12-bit mask, bit 0 = Jan; NULL = every month
 );
 
 -- A stamped period.

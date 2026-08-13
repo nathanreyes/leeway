@@ -23,7 +23,7 @@ use anim::{ChartAnimation, SummaryAnimations};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
 use leeway::models::{
-    AccountType, CreditCardEntryMode, Direction, Kind, Mode, PeriodType, Series, Txn,
+    AccountType, CreditCardEntryMode, Direction, Kind, Mode, MonthSet, PeriodType, Series, Txn,
 };
 use leeway::money::Money;
 use leeway::sync::{self, Inspection, StorageMode, SyncStatus};
@@ -445,6 +445,10 @@ pub enum PromptKind {
     },
     /// Edit a plan_item's per-plan budgeted amount.
     ItemAmount {
+        id: String,
+    },
+    /// Edit which months a plan_item is stamped in — per-plan, like the amount.
+    ItemMonths {
         id: String,
     },
     /// Collect the amount, then add a selected or newly-created series to a plan/month.
@@ -1008,7 +1012,8 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             .and_then(series::chart_key)
                             .map(|id| format!("{id}|{:?}", app.series_range));
                         let targets = detail.map(series::chart_targets).unwrap_or_default();
-                        app.series_chart_anim.sync(anim_key.as_deref(), &targets, now);
+                        app.series_chart_anim
+                            .sync(anim_key.as_deref(), &targets, now);
                         terminal.draw(|f| {
                             series::draw(f, app, &view);
                             draw_modal(f, app);
@@ -2419,6 +2424,11 @@ fn submit_text(app: &mut App) -> Result<()> {
         PromptKind::ItemAmount { id } => match Money::parse_dollars(&text) {
             Some(amount) => ops::set_item_amount(&app.conn, &id, amount)?,
             None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
+        },
+        PromptKind::ItemMonths { id } => match MonthSet::parse(&text) {
+            // The parse error already names the token that failed, so show it as written.
+            Ok(months) => ops::set_item_active_months(&app.conn, &id, months)?,
+            Err(message) => app.status = Some(message),
         },
         PromptKind::StampMonth { plan_id } => stamp_from_input(app, &plan_id, &text)?,
         PromptKind::GoToMonth => match parse_year_month(&text) {

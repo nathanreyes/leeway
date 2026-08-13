@@ -4,14 +4,15 @@
 //!
 //! Editing model: focus the plan list to act on whole plans — `n` new, `l` label, `s` stamp,
 //! `x` delete. Focus an item pane to act on that block's items — `n` searches/creates a
-//! series and fills the plan amount, `a` sets this plan's amount, `x` removes the item from
-//! this plan. The screen only touches plan-scoped things; editing the shared series itself
-//! (label, mode, period) lives on the Series page (`S`), so a plan can never silently
-//! rewrite a definition used by other plans.
+//! series and fills the plan amount, `a` sets this plan's amount, `M` sets which months the
+//! plan runs it in, `x` removes the item from this plan. The screen only touches plan-scoped
+//! things; editing the shared series itself (label, mode, period) lives on the Series page
+//! (`S`), so a plan can never silently rewrite a definition used by other plans.
 
 use crate::{AddDestination, App, BudgetBlock, ConfirmAction, PlanFocus, PromptKind, Screen};
 use anyhow::Result;
 use chrono::Local;
+use leeway::calc::PlanProjection;
 use leeway::models::{Direction, Kind, Mode, PeriodType, Plan, PlanEntry};
 use leeway::money::Money;
 use leeway::queries::PlanSummary;
@@ -165,6 +166,20 @@ fn handle_item_key(
             }
         }
 
+        // Which months this plan runs the item in — per-plan, like the amount, which is why
+        // it sits here and not behind the lowercase `m` redirect to the shared series.
+        KeyCode::Char('M') => {
+            if let Some(en) = selected_entry(app, entries) {
+                app.open_text_replace_on_type(
+                    "Active months (e.g. mar,jul,nov or all)",
+                    en.active_months.edit_string(),
+                    PromptKind::ItemMonths {
+                        id: en.item_id.clone(),
+                    },
+                );
+            }
+        }
+
         // `x` removes the item from THIS plan; the series survives for other plans.
         KeyCode::Char('x') => {
             if let Some(en) = selected_entry(app, entries) {
@@ -263,10 +278,13 @@ fn budget_block_for_focus(focus: PlanFocus) -> BudgetBlock {
 }
 
 pub fn draw(frame: &mut Frame, app: &App, summaries: &[PlanSummary], entries: &[PlanEntry]) {
+    // The summary grows only when the plan has seasonal items to list, so a plan without
+    // them keeps the layout it has always had.
+    let projection = leeway::calc::project_plan(entries);
     let [header, body, summary_area, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(7),
+        Constraint::Length(7 + seasonal_line_count(&projection) as u16),
         Constraint::Length(2),
     ])
     .areas(frame.area());
@@ -303,7 +321,7 @@ pub fn draw(frame: &mut Frame, app: &App, summaries: &[PlanSummary], entries: &[
     draw_plan_block(frame, income_area, app, entries, PlanFocus::Income);
     draw_plan_block(frame, expense_area, app, entries, PlanFocus::Expenses);
     draw_plan_block(frame, env_area, app, entries, PlanFocus::Envelopes);
-    draw_plan_summary(frame, summary_area, entries);
+    draw_plan_summary(frame, summary_area, &projection);
 
     // Local verbs switch with focus: plan-scoped in the list, item-scoped in a pane.
     let hints = if app.plan_focus == PlanFocus::List {
@@ -327,6 +345,8 @@ pub fn draw(frame: &mut Frame, app: &App, summaries: &[PlanSummary], entries: &[
             Span::raw(" new  "),
             key(" a "),
             Span::raw(" amount  "),
+            key(" M "),
+            Span::raw(" months  "),
             key(" x "),
             Span::raw(" remove"),
         ])
@@ -385,8 +405,17 @@ fn draw_plan_list(frame: &mut Frame, area: Rect, app: &App, summaries: &[PlanSum
 }
 
 /// Render the reusable plan's cash-flow scenario without any live account terms.
-fn draw_plan_summary(frame: &mut Frame, area: Rect, entries: &[PlanEntry]) {
-    let projection = leeway::calc::project_plan(entries);
+/// At most this many seasonal items get a line of their own; the rest collapse to a count.
+const SEASONAL_LINES_SHOWN: usize = 3;
+
+/// Extra rows the summary block needs for its seasonal section — zero for a plan whose
+/// items all run every month.
+fn seasonal_line_count(projection: &PlanProjection) -> usize {
+    let listed = projection.seasonal.len().min(SEASONAL_LINES_SHOWN);
+    listed + usize::from(projection.seasonal.len() > SEASONAL_LINES_SHOWN)
+}
+
+fn draw_plan_summary(frame: &mut Frame, area: Rect, projection: &PlanProjection) {
     let result_color = if projection.whats_left.cents() >= 0 {
         crate::theme::GREEN
     } else {
@@ -402,7 +431,7 @@ fn draw_plan_summary(frame: &mut Frame, area: Rect, entries: &[PlanEntry]) {
         Color::Red,
     ));
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(income_and_expenses),
         Line::from(plan_summary_term(
             Money::ZERO - projection.envelopes,
@@ -420,14 +449,39 @@ fn draw_plan_summary(frame: &mut Frame, area: Rect, entries: &[PlanEntry]) {
             ),
             Span::raw("  what's left"),
         ]),
-        Line::from(Span::styled(
+    ];
+
+    // Seasonal items sit outside the totals above, so name them here — a plan that budgets
+    // birthday gifts in March and July should say so without distorting an ordinary month.
+    for item in projection.seasonal.iter().take(SEASONAL_LINES_SHOWN) {
+        let mut spans = plan_summary_term(
+            item.net,
+            &crate::truncate(&item.label, 17),
+            crate::theme::MAUVE,
+        );
+        spans.push(Span::styled(
+            format!("in {}", item.months.short_label()),
+            Style::default().fg(Color::DarkGray),
+        ));
+        lines.push(Line::from(spans));
+    }
+    if projection.seasonal.len() > SEASONAL_LINES_SHOWN {
+        lines.push(Line::from(Span::styled(
             format!(
-                "Daily envelope rates assume a {}-day month.",
-                leeway::calc::PLAN_PROJECTION_DAYS
+                "  + {} more seasonal",
+                projection.seasonal.len() - SEASONAL_LINES_SHOWN
             ),
             Style::default().fg(Color::DarkGray),
-        )),
-    ];
+        )));
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!(
+            "Daily envelope rates assume a {}-day month.",
+            leeway::calc::PLAN_PROJECTION_DAYS
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
 
     frame.render_widget(
         Paragraph::new(lines).block(crate::titled_block(" Summary ")),
@@ -491,7 +545,7 @@ fn plan_block_title(focus: PlanFocus) -> &'static str {
 /// direction, so envelopes are the only rows that need mode/period details.
 fn entry_row(entry: &PlanEntry, focus: PlanFocus) -> ListItem<'static> {
     let s = &entry.series;
-    let line = match focus {
+    let mut line = match focus {
         PlanFocus::List | PlanFocus::Income | PlanFocus::Expenses => Line::from(vec![
             Span::raw(format!("{:<24}", crate::truncate(&s.label, 24))),
             Span::raw(format!("{:>12}", entry.amount.to_string())),
@@ -516,6 +570,14 @@ fn entry_row(entry: &PlanEntry, focus: PlanFocus) -> ListItem<'static> {
             ])
         }
     };
+
+    // Only seasonal rows carry a tag, so an ordinary plan looks exactly as it always has.
+    if !entry.active_months.is_all() {
+        line.push_span(Span::styled(
+            format!("  {}", entry.active_months.short_label()),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
 
     ListItem::new(line)
 }
@@ -649,6 +711,112 @@ mod tests {
         assert!(text.contains("-$1,800.00"));
         assert!(text.contains("Daily envelope rates assume a 30-day month."));
         assert!(!text.contains("planned bills"));
+        // A plan with nothing seasonal says nothing about months.
+        assert!(!text.contains("Mar, Jul, Nov"));
+    }
+
+    /// Press a key and answer the prompt it opens, the way a user would.
+    fn answer_prompt(app: &mut App, typed: &str) {
+        match app.modal.as_mut() {
+            Some(crate::Modal::Text(prompt)) => prompt.buffer = typed.into(),
+            _ => panic!("expected a text prompt to be open"),
+        }
+        crate::submit_text(app).unwrap();
+    }
+
+    #[test]
+    fn m_sets_the_months_a_plan_runs_an_item_in() {
+        let (mut app, plan, entries, _) = app_with_transaction_plan();
+        app.plan_focus = PlanFocus::Expenses;
+        let item_id = entries[0].item_id.clone();
+        let months_key = KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE);
+
+        // The prompt opens prefilled with today's answer, "all".
+        handle_key(&mut app, months_key, &[], Some(&plan), &entries).unwrap();
+        match app.modal.as_ref() {
+            Some(crate::Modal::Text(prompt)) => assert_eq!(prompt.buffer, "all"),
+            _ => panic!("expected the months prompt"),
+        }
+
+        answer_prompt(&mut app, "mar,jul,nov");
+        let reloaded = queries::load_plan_entries(&app.conn, &plan.id).unwrap();
+        let entry = reloaded.iter().find(|e| e.item_id == item_id).unwrap();
+        assert_eq!(
+            entry.active_months,
+            leeway::models::MonthSet::parse("mar,jul,nov").unwrap()
+        );
+
+        // Reopening prefills what was saved, so editing is a tweak rather than a retype.
+        handle_key(&mut app, months_key, &[], Some(&plan), &reloaded).unwrap();
+        match app.modal.as_ref() {
+            Some(crate::Modal::Text(prompt)) => assert_eq!(prompt.buffer, "mar,jul,nov"),
+            _ => panic!("expected the months prompt"),
+        }
+
+        // Nonsense is refused with a message and leaves the saved months alone.
+        answer_prompt(&mut app, "septembre");
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("septembre"))
+        );
+        let reloaded = queries::load_plan_entries(&app.conn, &plan.id).unwrap();
+        let entry = reloaded.iter().find(|e| e.item_id == item_id).unwrap();
+        assert_eq!(
+            entry.active_months,
+            leeway::models::MonthSet::parse("mar,jul,nov").unwrap()
+        );
+
+        // And "all" puts it back to every month.
+        handle_key(&mut app, months_key, &[], Some(&plan), &reloaded).unwrap();
+        answer_prompt(&mut app, "all");
+        let reloaded = queries::load_plan_entries(&app.conn, &plan.id).unwrap();
+        let entry = reloaded.iter().find(|e| e.item_id == item_id).unwrap();
+        assert!(entry.active_months.is_all());
+    }
+
+    #[test]
+    fn seasonal_items_are_tagged_in_the_row_and_listed_below_whats_left() {
+        let (mut app, plan, _, _) = app_with_transaction_plan();
+
+        // Birthday gifts: an envelope this plan only runs in three months.
+        let gifts = ops::create_series(
+            &app.conn,
+            Kind::Envelope,
+            "Kid gifts",
+            None,
+            Some(leeway::models::PeriodType::Monthly),
+            Some(leeway::models::Mode::Automatic),
+        )
+        .unwrap();
+        let item =
+            ops::add_plan_item(&app.conn, &plan.id, &gifts, Money::from_dollars(120.0)).unwrap();
+        ops::set_item_active_months(
+            &app.conn,
+            &item,
+            leeway::models::MonthSet::parse("mar,jul,nov").unwrap(),
+        )
+        .unwrap();
+
+        app.plan_focus = PlanFocus::Envelopes;
+        let entries = queries::load_plan_entries(&app.conn, &plan.id).unwrap();
+        let summaries = queries::plan_summaries(&app.conn).unwrap();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &app, &summaries, &entries))
+            .unwrap();
+        let text = buffer_text(&terminal);
+
+        // The row carries the months, and the summary names it under what's left.
+        assert!(text.contains("Kid gifts"));
+        assert!(text.contains("Mar, Jul, Nov"));
+        assert!(text.contains("in Mar, Jul, Nov"));
+        // It stays out of the headline: planned envelopes is still zero.
+        assert!(text.contains("planned envelopes"));
+        assert!(!text.contains("-$120.00  planned envelopes"));
+        assert!(text.contains("Daily envelope rates assume a 30-day month."));
     }
 
     #[test]

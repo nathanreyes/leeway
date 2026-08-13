@@ -91,7 +91,13 @@ pub fn stamp(
     )?;
 
     // `&tx` coerces to `&Connection`, so query/insert helpers run inside this transaction.
+    // Seasonal items (birthday gifts, an annual premium) only stamp in the months their
+    // plan marks active; the instance that lands carries no trace of the restriction.
+    let month_no = start_date.month();
     for entry in queries::load_plan_entries(&tx, plan_id)? {
+        if !entry.active_months.contains(month_no) {
+            continue;
+        }
         insert_instance_from_entry(&tx, &month_id, &entry, days_in_month)?;
     }
 
@@ -158,6 +164,24 @@ fn insert_instance_from_entry(
 
 // --- Restamp: Merge / Replace --------------------------------------------------
 
+/// The plan entries that apply to an already-stamped month, plus that month's day count.
+/// Both restamp paths need the same two facts and both derive them from one `month` row —
+/// a fresh `stamp` gets them from its arguments instead.
+fn active_entries_for_month(
+    conn: &Connection,
+    month_id: &str,
+    plan_id: &str,
+) -> Result<(Vec<PlanEntry>, i64)> {
+    let month = queries::month_by_id(conn, month_id)?
+        .with_context(|| format!("month not found: {month_id}"))?;
+    let month_no = month.start_date.month();
+    let entries = queries::load_plan_entries(conn, plan_id)?
+        .into_iter()
+        .filter(|entry| entry.active_months.contains(month_no))
+        .collect();
+    Ok((entries, month.days_in_month))
+}
+
 /// Legacy predicate for seriesless hand-entered data — standalone one-offs,
 /// manual-envelope spending, OR an ad-hoc envelope. The active Replace UI uses
 /// `month_has_items_outside_plan` because series-backed month additions are now normal.
@@ -214,13 +238,14 @@ pub fn month_has_items_outside_plan(
 /// - A plan entry with no instance is inserted.
 ///
 /// Nothing is ever deleted. Repeated occurrences of a series are matched in stable row
-/// order.
+/// order. An item the plan doesn't run in this month is simply not an entry here, so it is
+/// neither inserted nor matched — and since merge never deletes, an instance already
+/// standing from an earlier stamp survives untouched.
 pub fn restamp_merge(conn: &mut Connection, month_id: &str, plan_id: &str) -> Result<()> {
     let tx = conn.transaction()?;
-    let entries = queries::load_plan_entries(&tx, plan_id)?;
+    let (entries, days_in_month) = active_entries_for_month(&tx, month_id, plan_id)?;
     let txns = queries::load_txns(&tx, month_id)?;
     let envelopes = queries::load_envelopes(&tx, month_id)?;
-    let days_in_month = queries::month_days(&tx, month_id)?;
     let mut matched_txns: HashSet<String> = HashSet::new();
     let mut matched_envelopes: HashSet<String> = HashSet::new();
 
@@ -260,7 +285,8 @@ pub fn restamp_merge(conn: &mut Connection, month_id: &str, plan_id: &str) -> Re
 /// are reset in place (amount & stamped reset, unsettled, coded fields refreshed) —
 /// resetting rather than delete+recreate keeps instance ids stable so manual-envelope
 /// spending stays linked. Rows outside the target plan are wiped unless
-/// `keep_outside_plan`.
+/// `keep_outside_plan`. An item the plan doesn't run in this month counts as outside it, so
+/// a seasonal envelope stamped into the wrong month is cleaned up by a replace.
 pub fn restamp_replace(
     conn: &mut Connection,
     month_id: &str,
@@ -268,10 +294,9 @@ pub fn restamp_replace(
     keep_outside_plan: bool,
 ) -> Result<()> {
     let tx = conn.transaction()?;
-    let entries = queries::load_plan_entries(&tx, plan_id)?;
+    let (entries, days_in_month) = active_entries_for_month(&tx, month_id, plan_id)?;
     let txns = queries::load_txns(&tx, month_id)?;
     let envelopes = queries::load_envelopes(&tx, month_id)?;
-    let days_in_month = queries::month_days(&tx, month_id)?;
     let mut matched_txns: HashSet<String> = HashSet::new();
     let mut matched_envelopes: HashSet<String> = HashSet::new();
 
@@ -697,6 +722,18 @@ pub fn set_item_amount(conn: &Connection, item_id: &str, amount: Money) -> Resul
     conn.execute(
         "UPDATE plan_item SET amount_cents = ?1 WHERE id = ?2",
         rusqlite::params![amount, item_id],
+    )?;
+    Ok(())
+}
+
+/// Per-plan: which months this plan stamps the item in. Like the amount, this edits
+/// `plan_item` — the same series can be seasonal in one plan and always-on in another.
+/// [`MonthSet::ALL`] writes NULL, so an item the user never restricted is indistinguishable
+/// from one that predates the column.
+pub fn set_item_active_months(conn: &Connection, item_id: &str, months: MonthSet) -> Result<()> {
+    conn.execute(
+        "UPDATE plan_item SET active_months = ?1 WHERE id = ?2",
+        rusqlite::params![months.to_db(), item_id],
     )?;
     Ok(())
 }
@@ -1396,6 +1433,157 @@ mod tests {
             .find(|entry| entry.item_id == item_id)
             .unwrap();
         assert_eq!(monthly.amount, Money::from_dollars(99.90));
+    }
+
+    /// A plan holding one always-on bill and one envelope restricted to March, July, and
+    /// November — the birthday-gifts shape. Returns `(conn, plan_id, gifts_series_id)`.
+    fn seasonal_plan() -> (Connection, String, String) {
+        let conn = db::open_in_memory().unwrap();
+        let plan_id = create_plan(&conn, "Baseline").unwrap();
+
+        let rent = create_series(
+            &conn,
+            Kind::Transaction,
+            "Rent",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        add_plan_item(&conn, &plan_id, &rent, Money::from_dollars(1500.0)).unwrap();
+
+        let gifts = create_series(
+            &conn,
+            Kind::Envelope,
+            "Kid gifts",
+            None,
+            Some(PeriodType::Monthly),
+            Some(Mode::Automatic),
+        )
+        .unwrap();
+        let item = add_plan_item(&conn, &plan_id, &gifts, Money::from_dollars(120.0)).unwrap();
+        set_item_active_months(&conn, &item, MonthSet::parse("mar,jul,nov").unwrap()).unwrap();
+
+        (conn, plan_id, gifts)
+    }
+
+    #[test]
+    fn active_months_default_to_every_month() {
+        let conn = db::open_in_memory().unwrap();
+        let plan_id = create_plan(&conn, "P").unwrap();
+        let series = create_series(
+            &conn,
+            Kind::Transaction,
+            "Rent",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        add_plan_item(&conn, &plan_id, &series, Money::from_dollars(10.0)).unwrap();
+
+        // A plan item nobody restricted stores NULL and reads back as ALL, so every row
+        // written before the column existed keeps its old behavior.
+        let entries = queries::load_plan_entries(&conn, &plan_id).unwrap();
+        assert_eq!(entries[0].active_months, MonthSet::ALL);
+        let stored: Option<i64> = conn
+            .query_row("SELECT active_months FROM plan_item", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, None);
+
+        // Setting it back to "all" returns the column to NULL rather than a full mask.
+        set_item_active_months(&conn, &entries[0].item_id, MonthSet::parse("mar").unwrap())
+            .unwrap();
+        set_item_active_months(&conn, &entries[0].item_id, MonthSet::ALL).unwrap();
+        let stored: Option<i64> = conn
+            .query_row("SELECT active_months FROM plan_item", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, None);
+    }
+
+    #[test]
+    fn stamp_skips_items_outside_their_active_months() {
+        let (mut conn, plan_id, _) = seasonal_plan();
+
+        let march = NaiveDate::from_ymd_opt(2027, 3, 1).unwrap();
+        let in_season = stamp(&mut conn, &plan_id, "2027-03", march, 31).unwrap();
+        let april = NaiveDate::from_ymd_opt(2027, 4, 1).unwrap();
+        let off_season = stamp(&mut conn, &plan_id, "2027-04", april, 30).unwrap();
+
+        let stamped_envelopes = queries::load_envelopes(&conn, &in_season).unwrap();
+        assert_eq!(stamped_envelopes.len(), 1);
+        assert_eq!(stamped_envelopes[0].amount, Money::from_dollars(120.0));
+        assert!(
+            queries::load_envelopes(&conn, &off_season)
+                .unwrap()
+                .is_empty()
+        );
+
+        // The always-on bill is untouched by any of this.
+        assert_eq!(queries::load_txns(&conn, &in_season).unwrap().len(), 1);
+        assert_eq!(queries::load_txns(&conn, &off_season).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_neither_adds_nor_removes_an_out_of_season_item() {
+        let (mut conn, plan_id, gifts) = seasonal_plan();
+        let april = NaiveDate::from_ymd_opt(2027, 4, 1).unwrap();
+        let month_id = stamp(&mut conn, &plan_id, "2027-04", april, 30).unwrap();
+
+        // Merging the plan into an off-season month does not bring the seasonal item in.
+        restamp_merge(&mut conn, &month_id, &plan_id).unwrap();
+        assert!(
+            queries::load_envelopes(&conn, &month_id)
+                .unwrap()
+                .is_empty()
+        );
+
+        // And once one is there by hand, merge leaves it alone — merge never deletes.
+        add_series_envelope_instance(&conn, &month_id, &gifts, Money::from_dollars(80.0)).unwrap();
+        restamp_merge(&mut conn, &month_id, &plan_id).unwrap();
+        let envelopes = queries::load_envelopes(&conn, &month_id).unwrap();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].amount, Money::from_dollars(80.0));
+    }
+
+    #[test]
+    fn replace_treats_an_out_of_season_item_as_outside_the_plan() {
+        let (mut conn, plan_id, gifts) = seasonal_plan();
+        let april = NaiveDate::from_ymd_opt(2027, 4, 1).unwrap();
+        let month_id = stamp(&mut conn, &plan_id, "2027-04", april, 30).unwrap();
+        add_series_envelope_instance(&conn, &month_id, &gifts, Money::from_dollars(80.0)).unwrap();
+
+        // Keeping outside-plan rows keeps it, because April isn't one of its months.
+        restamp_replace(&mut conn, &month_id, &plan_id, true).unwrap();
+        assert_eq!(queries::load_envelopes(&conn, &month_id).unwrap().len(), 1);
+
+        // A clean slate wipes it — this is how a gift envelope stamped into the wrong
+        // month gets cleaned up.
+        restamp_replace(&mut conn, &month_id, &plan_id, false).unwrap();
+        assert!(
+            queries::load_envelopes(&conn, &month_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn replace_still_refreshes_an_in_season_item() {
+        let (mut conn, plan_id, _) = seasonal_plan();
+        let july = NaiveDate::from_ymd_opt(2027, 7, 1).unwrap();
+        let month_id = stamp(&mut conn, &plan_id, "2027-07", july, 31).unwrap();
+
+        let envelope = queries::load_envelopes(&conn, &month_id).unwrap().remove(0);
+        set_envelope_amount(&conn, &envelope.id, Money::from_dollars(5.0)).unwrap();
+
+        restamp_replace(&mut conn, &month_id, &plan_id, false).unwrap();
+        let envelopes = queries::load_envelopes(&conn, &month_id).unwrap();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(
+            envelopes[0].id, envelope.id,
+            "reset in place, not recreated"
+        );
+        assert_eq!(envelopes[0].amount, Money::from_dollars(120.0));
     }
 
     #[test]

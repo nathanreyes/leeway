@@ -309,6 +309,7 @@ pub fn get_plan(conn: &Connection, plan_id: &str) -> Result<Option<Plan>> {
 pub fn load_plan_entries(conn: &Connection, plan_id: &str) -> Result<Vec<PlanEntry>> {
     let mut stmt = conn.prepare(
         "SELECT pi.id AS item_id, pi.plan_id AS plan_id, pi.amount_cents AS amount_cents,
+                pi.active_months AS active_months,
                 s.id AS series_id, s.kind AS kind, s.label AS label,
                 s.direction AS direction, s.period_type AS period_type, s.mode AS mode
          FROM plan_item pi JOIN series s ON s.id = pi.series_id
@@ -533,6 +534,9 @@ fn map_plan_entry(r: &Row) -> rusqlite::Result<PlanEntry> {
         item_id: r.get("item_id")?,
         plan_id: r.get("plan_id")?,
         amount: r.get("amount_cents")?,
+        // NULL is the common case and means every month, so read it as an Option and let
+        // MonthSet decide rather than teaching FromSql about a missing value.
+        active_months: MonthSet::from_db(r.get("active_months")?),
         series: Series {
             id: r.get("series_id")?,
             kind: r.get("kind")?,

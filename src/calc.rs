@@ -4,7 +4,7 @@
 //! clock, no I/O. That's what makes them trivial to unit-test (see the bottom of the
 //! file) and what lets a future web/desktop frontend reuse them unchanged.
 
-use crate::models::{Direction, Envelope, Kind, Mode, PeriodType, PlanEntry, Txn};
+use crate::models::{Direction, Envelope, Kind, Mode, MonthSet, PeriodType, PlanEntry, Txn};
 use crate::money::Money;
 use chrono::NaiveDate;
 
@@ -93,14 +93,29 @@ pub fn txn_remaining(txn: &Txn) -> Money {
 /// daily rates are projected across this many days.
 pub const PLAN_PROJECTION_DAYS: i64 = 30;
 
+/// A plan item that doesn't run every month, held out of the totals and listed on its own.
+/// `net` is signed the way it hits the bottom line: income positive, bills and envelopes
+/// negative.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeasonalItem {
+    pub label: String,
+    pub net: Money,
+    pub months: MonthSet,
+}
+
 /// A plan-only cash-flow projection. Unlike [`WhatsLeft`], this deliberately has no
 /// account or settlement terms: a reusable plan describes commitments, not live money.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The four totals describe a **typical** month — they count only the items that run every
+/// month. Seasonal items are reported separately in `seasonal` instead of being averaged
+/// in, so the headline stays the number you plan against and the exceptions stay visible.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanProjection {
     pub income: Money,
     pub expenses: Money,
     pub envelopes: Money,
     pub whats_left: Money,
+    pub seasonal: Vec<SeasonalItem>,
 }
 
 /// Sum a plan into the scenario shown on Plan Details.
@@ -109,30 +124,28 @@ pub struct PlanProjection {
 /// 30-day assumption. Legacy weekly envelopes continue to behave as monthly values,
 /// matching stamping behavior.
 pub fn project_plan(entries: &[PlanEntry]) -> PlanProjection {
-    let income: Money = entries
+    let (every_month, seasonal): (Vec<&PlanEntry>, Vec<&PlanEntry>) = entries
+        .iter()
+        .partition(|entry| entry.active_months.is_all());
+
+    let income: Money = every_month
         .iter()
         .filter(|entry| {
             entry.series.kind == Kind::Transaction && entry.series.direction == Some(Direction::In)
         })
         .map(|entry| entry.amount)
         .sum();
-    let expenses: Money = entries
+    let expenses: Money = every_month
         .iter()
         .filter(|entry| {
             entry.series.kind == Kind::Transaction && entry.series.direction == Some(Direction::Out)
         })
         .map(|entry| entry.amount)
         .sum();
-    let envelopes: Money = entries
+    let envelopes: Money = every_month
         .iter()
         .filter(|entry| entry.series.kind == Kind::Envelope)
-        .map(|entry| {
-            monthlyized_envelope_amount(
-                entry.amount,
-                entry.series.period_type.unwrap_or(PeriodType::Monthly),
-                PLAN_PROJECTION_DAYS,
-            )
-        })
+        .map(|entry| projected_monthly_amount(entry))
         .sum();
 
     PlanProjection {
@@ -140,6 +153,38 @@ pub fn project_plan(entries: &[PlanEntry]) -> PlanProjection {
         expenses,
         envelopes,
         whats_left: income - expenses - envelopes,
+        seasonal: seasonal
+            .into_iter()
+            .map(|entry| SeasonalItem {
+                label: entry.series.label.clone(),
+                net: signed_projected_amount(entry),
+                months: entry.active_months,
+            })
+            .collect(),
+    }
+}
+
+/// One entry's contribution to a month, before direction: envelopes projected across the
+/// 30-day assumption, transactions taken as entered.
+fn projected_monthly_amount(entry: &PlanEntry) -> Money {
+    match entry.series.kind {
+        Kind::Envelope => monthlyized_envelope_amount(
+            entry.amount,
+            entry.series.period_type.unwrap_or(PeriodType::Monthly),
+            PLAN_PROJECTION_DAYS,
+        ),
+        Kind::Transaction => entry.amount,
+    }
+}
+
+/// The same figure signed by its effect on what's left: incoming money adds, everything
+/// else subtracts.
+fn signed_projected_amount(entry: &PlanEntry) -> Money {
+    let amount = projected_monthly_amount(entry);
+    if entry.series.kind == Kind::Transaction && entry.series.direction == Some(Direction::In) {
+        amount
+    } else {
+        Money::ZERO - amount
     }
 }
 
@@ -443,8 +488,83 @@ mod tests {
                 expenses: Money::ZERO,
                 envelopes: Money::ZERO,
                 whats_left: Money::ZERO,
+                seasonal: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn plan_projection_holds_seasonal_items_out_of_the_totals() {
+        let entries = vec![
+            plan_entry(
+                Kind::Transaction,
+                Some(Direction::In),
+                None,
+                Money::from_dollars(3000.0),
+            ),
+            plan_entry(
+                Kind::Envelope,
+                None,
+                Some(PeriodType::Monthly),
+                Money::from_dollars(600.0),
+            ),
+            seasonal_entry(
+                Kind::Envelope,
+                None,
+                Money::from_dollars(120.0),
+                "Kid gifts",
+                "mar,jul,nov",
+            ),
+            seasonal_entry(
+                Kind::Transaction,
+                Some(Direction::In),
+                Money::from_dollars(500.0),
+                "Bonus",
+                "dec",
+            ),
+        ];
+
+        let projection = project_plan(&entries);
+
+        // The headline describes an ordinary month: neither seasonal item is folded in.
+        assert_eq!(projection.income, Money::from_dollars(3000.0));
+        assert_eq!(projection.envelopes, Money::from_dollars(600.0));
+        assert_eq!(projection.whats_left, Money::from_dollars(2400.0));
+
+        // Each is reported on its own, signed by how it would hit the bottom line.
+        assert_eq!(
+            projection.seasonal,
+            vec![
+                SeasonalItem {
+                    label: "Kid gifts".into(),
+                    net: Money::from_dollars(-120.0),
+                    months: MonthSet::parse("mar,jul,nov").unwrap(),
+                },
+                SeasonalItem {
+                    label: "Bonus".into(),
+                    net: Money::from_dollars(500.0),
+                    months: MonthSet::parse("dec").unwrap(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn seasonal_daily_envelope_uses_the_same_thirty_day_projection() {
+        let entries = vec![seasonal_entry(
+            Kind::Envelope,
+            None,
+            Money::from_dollars(12.0),
+            "Camp snacks",
+            "jun-aug",
+        )];
+        let mut entries = entries;
+        entries[0].series.period_type = Some(PeriodType::Daily);
+
+        let projection = project_plan(&entries);
+
+        assert_eq!(projection.envelopes, Money::ZERO);
+        assert_eq!(projection.seasonal[0].net, Money::from_dollars(-360.0));
     }
 
     fn plan_entry(
@@ -457,6 +577,7 @@ mod tests {
             item_id: "item".into(),
             plan_id: "plan".into(),
             amount,
+            active_months: MonthSet::ALL,
             series: Series {
                 id: "series".into(),
                 kind,
@@ -466,6 +587,26 @@ mod tests {
                 mode: (kind == Kind::Envelope).then_some(Mode::Automatic),
             },
         }
+    }
+
+    /// A plan entry that only runs in some months, with a label so the projection's
+    /// seasonal list can be told apart from the always-on ones.
+    fn seasonal_entry(
+        kind: Kind,
+        direction: Option<Direction>,
+        amount: Money,
+        label: &str,
+        months: &str,
+    ) -> PlanEntry {
+        let mut entry = plan_entry(
+            kind,
+            direction,
+            (kind == Kind::Envelope).then_some(PeriodType::Monthly),
+            amount,
+        );
+        entry.series.label = label.into();
+        entry.active_months = MonthSet::parse(months).expect("test months should parse");
+        entry
     }
 
     fn mk_txn(amount: Money) -> Txn {

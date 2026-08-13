@@ -21,12 +21,13 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
     Migrations::new(vec![
         M::up(include_str!("schema.sql")),
         M::up(include_str!("migration_002_integrity_and_indexes.sql")),
+        M::up(include_str!("migration_003_plan_item_active_months.sql")),
     ])
 });
 
 /// Latest SQLite schema understood by this build. Sync metadata records this separately
 /// from the folder-sync protocol version so older applications can fail closed.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Open the database at `path` (creating the file if missing) and bring its schema up to
 /// the latest version. Returns the live connection the rest of the app uses.
@@ -100,6 +101,56 @@ mod tests {
         assert!(
             !cols.iter().any(|c| c == "protected"),
             "protected flag dropped"
+        );
+    }
+
+    #[test]
+    fn plan_items_carry_active_months_defaulting_to_null() {
+        let conn = open_in_memory().expect("schema should apply");
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('plan_item')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(cols.iter().any(|c| c == "active_months"));
+
+        // A row written without the column reads NULL — "every month", so the migration
+        // changes nothing for plans that already exist.
+        conn.execute("INSERT INTO plan (id, name) VALUES ('p', 'P')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO series (id, kind, label, mode) VALUES ('s', 'envelope', 'E', 'automatic')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO plan_item (id, plan_id, series_id, amount_cents)
+             VALUES ('i', 'p', 's', 100)",
+            [],
+        )
+        .unwrap();
+        let stored: Option<i64> = conn
+            .query_row(
+                "SELECT active_months FROM plan_item WHERE id = 'i'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None);
+
+        // The CHECK keeps a nonsense mask out of the column.
+        assert!(
+            conn.execute(
+                "UPDATE plan_item SET active_months = 4096 WHERE id = 'i'",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute("UPDATE plan_item SET active_months = 0 WHERE id = 'i'", [])
+                .is_err()
         );
     }
 }
