@@ -449,7 +449,9 @@ mod tests {
     fn editing_a_balance_moves_whats_left() {
         let mut conn = db::open_in_memory().unwrap();
         ops::seed_starter(&mut conn).unwrap();
-        let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        // The seed stamps the real calendar month, so the view has to be built for it —
+        // a hardcoded date rots the moment that month passes.
+        let today = Local::now().date_naive();
 
         let before = MonthView::build(&conn, today).unwrap().unwrap();
         assert_eq!(
@@ -525,7 +527,7 @@ mod tests {
     fn credit_card_owed_reduces_whats_left() {
         let mut conn = db::open_in_memory().unwrap();
         ops::seed_starter(&mut conn).unwrap();
-        let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let today = Local::now().date_naive();
 
         // Fund the checking account and draw the card down so it carries a balance.
         for acct in queries::load_accounts(&conn).unwrap() {
@@ -578,7 +580,7 @@ mod tests {
         use crate::ops;
         let mut conn = db::open_in_memory().unwrap();
         ops::seed_starter(&mut conn).unwrap(); // stamps the current calendar month
-        let today = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let today = Local::now().date_naive();
 
         // Fund the checking account so the current month has a balance to fold in.
         let checking = queries::load_accounts(&conn)
@@ -588,12 +590,13 @@ mod tests {
             .unwrap();
         ops::set_balance(&conn, &checking.id, Money::from_dollars(4200.0)).unwrap();
 
-        // Stamp a clearly non-current period (next year) from the same starter plan.
+        // Stamp a clearly non-current period (next March) from the same starter plan.
         let plan_id = queries::plans(&conn).unwrap()[0].id.clone();
-        let start = NaiveDate::from_ymd_opt(2027, 3, 1).unwrap();
-        ops::stamp(&mut conn, &plan_id, "2027-03", start, 31).unwrap();
+        let year = today.year() + 1;
+        let start = NaiveDate::from_ymd_opt(year, 3, 1).unwrap();
+        ops::stamp(&mut conn, &plan_id, &format!("{year}-03"), start, 31).unwrap();
 
-        let future = MonthView::build_for(&conn, today, 2027, 3)
+        let future = MonthView::build_for(&conn, today, year, 3)
             .unwrap()
             .unwrap();
 
@@ -610,7 +613,7 @@ mod tests {
         );
 
         // The current month, by contrast, still folds the checking balance in.
-        let current = MonthView::build_for(&conn, today, 2026, 7)
+        let current = MonthView::build_for(&conn, today, today.year(), today.month())
             .unwrap()
             .unwrap();
         assert!(current.is_current);
