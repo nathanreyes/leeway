@@ -1047,31 +1047,6 @@ fn draw_transactions(
     view: &MonthView,
     direction: Direction,
 ) {
-    let items: Vec<ListItem> = view
-        .standalone
-        .iter()
-        .filter(|t| t.direction == direction)
-        .map(|t| {
-            let check = if t.settled { "[x]" } else { "[ ]" };
-            let sign = match t.direction {
-                Direction::In => "+",
-                Direction::Out => "−",
-            };
-            let amount = format!("{}{}", sign, t.amount);
-            let style = if t.settled {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            let line = Line::from(vec![
-                Span::raw(format!("{} ", check)),
-                Span::raw(format!("{:<28}", crate::truncate(t.display_label(), 28))),
-                Span::styled(format!("{:>10}", amount), style),
-            ]);
-            ListItem::new(line).style(style)
-        })
-        .collect();
-
     let (title, focused, selected) = match direction {
         Direction::In => (
             " Income ",
@@ -1084,6 +1059,36 @@ fn draw_transactions(
             app.dash_expense_sel,
         ),
     };
+
+    let items: Vec<ListItem> = view
+        .standalone
+        .iter()
+        .filter(|t| t.direction == direction)
+        .enumerate()
+        .map(|(i, t)| {
+            let check = if t.settled { "[x]" } else { "[ ]" };
+            let sign = match t.direction {
+                Direction::In => "+",
+                Direction::Out => "−",
+            };
+            let amount = format!("{}{}", sign, t.amount);
+            // Settled rows fade back, but the selection band is close enough to
+            // that fade to swallow it — so the highlighted row gets the lighter
+            // tone instead.
+            let style = if t.settled {
+                Style::default().fg(crate::theme::muted(focused && i == selected))
+            } else {
+                Style::default()
+            };
+            let line = Line::from(vec![
+                Span::raw(format!("{} ", check)),
+                Span::raw(format!("{:<28}", crate::truncate(t.display_label(), 28))),
+                Span::styled(format!("{:>10}", amount), style),
+            ]);
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
     let item_count = items.len();
     let mut state = ListState::default();
     if focused && !items.is_empty() {

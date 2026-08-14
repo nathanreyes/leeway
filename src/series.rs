@@ -462,20 +462,23 @@ fn draw_series_list(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageV
     }
 
     let inner_width = crate::selectable_list_content_width(area);
+    let selected_row = selected_row_index(&rows, app.series_sel);
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|row| match row {
+        .enumerate()
+        .map(|(i, row)| match row {
             SidebarRow::Header(group) => ListItem::new(Line::from(Span::styled(
                 group.label().to_string(),
                 Style::default()
                     .fg(crate::theme::CYAN)
                     .add_modifier(Modifier::BOLD),
             ))),
-            SidebarRow::Item(idx) => series_row(&view.details[*idx], inner_width),
+            SidebarRow::Item(idx) => {
+                series_row(&view.details[*idx], inner_width, selected_row == Some(i))
+            }
         })
         .collect();
 
-    let selected_row = selected_row_index(&rows, app.series_sel);
     let mut state = ListState::default();
     state.select(selected_row);
 
@@ -488,7 +491,9 @@ fn draw_series_list(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageV
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn series_row(detail: &SeriesDetailView, width: usize) -> ListItem<'static> {
+/// `selected` says whether the selection band sits behind this row; the avg column
+/// fades less there so it stays readable over the band.
+fn series_row(detail: &SeriesDetailView, width: usize, selected: bool) -> ListItem<'static> {
     let avg = detail
         .stats
         .avg
@@ -506,7 +511,7 @@ fn series_row(detail: &SeriesDetailView, width: usize) -> ListItem<'static> {
         Span::raw(format!("{:<label_width$}", label)),
         Span::styled(
             format!("{:>avg_width$}", avg),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(crate::theme::muted(selected)),
         ),
     ]))
 }

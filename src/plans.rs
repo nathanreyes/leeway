@@ -381,9 +381,12 @@ fn draw_plan_list(frame: &mut Frame, area: Rect, app: &App, summaries: &[PlanSum
         return;
     }
 
+    // The selection band always sits on `plans_sel` here, focused or not, so that
+    // row's count column needs the lighter muted tone to stay readable.
     let items: Vec<ListItem> = summaries
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(i, s)| {
             let count = format!(
                 "{} item{}",
                 s.item_count,
@@ -391,7 +394,10 @@ fn draw_plan_list(frame: &mut Frame, area: Rect, app: &App, summaries: &[PlanSum
             );
             let line = Line::from(vec![
                 Span::raw(format!("{:<20}", crate::truncate(&s.plan.name, 20))),
-                Span::styled(count, Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    count,
+                    Style::default().fg(crate::theme::muted(i == app.plans_sel)),
+                ),
             ]);
             ListItem::new(line)
         })
@@ -511,18 +517,19 @@ fn draw_plan_block(
     entries: &[PlanEntry],
     focus: PlanFocus,
 ) {
-    let rows: Vec<ListItem> = entries
-        .iter()
-        .filter(|entry| entry_matches_focus(entry, focus))
-        .map(|entry| entry_row(entry, focus))
-        .collect();
-
     let focused = app.plan_focus == focus;
     let selected = match focus {
         PlanFocus::List | PlanFocus::Income => app.editor_income_sel,
         PlanFocus::Expenses => app.editor_expense_sel,
         PlanFocus::Envelopes => app.editor_env_sel,
     };
+
+    let rows: Vec<ListItem> = entries
+        .iter()
+        .filter(|entry| entry_matches_focus(entry, focus))
+        .enumerate()
+        .map(|(i, entry)| entry_row(entry, focus, focused && i == selected))
+        .collect();
 
     let row_count = rows.len();
     let mut state = ListState::default();
@@ -547,8 +554,11 @@ fn plan_block_title(focus: PlanFocus) -> &'static str {
 
 /// Render one plan entry inside its logical block. Transaction blocks already imply
 /// direction, so envelopes are the only rows that need mode/period details.
-fn entry_row(entry: &PlanEntry, focus: PlanFocus) -> ListItem<'static> {
+/// `selected` says whether the selection band sits behind this row, which decides
+/// how far the secondary columns can fade.
+fn entry_row(entry: &PlanEntry, focus: PlanFocus, selected: bool) -> ListItem<'static> {
     let s = &entry.series;
+    let muted = Style::default().fg(crate::theme::muted(selected));
     let mut line = match focus {
         PlanFocus::List | PlanFocus::Income | PlanFocus::Expenses => Line::from(vec![
             Span::raw(format!("{:<24}", crate::truncate(&s.label, 24))),
@@ -566,10 +576,7 @@ fn entry_row(entry: &PlanEntry, focus: PlanFocus) -> ListItem<'static> {
             };
             Line::from(vec![
                 Span::raw(format!("{:<18}", crate::truncate(&s.label, 18))),
-                Span::styled(
-                    format!("{:<6}{:<8}", period, mode),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!("{:<6}{:<8}", period, mode), muted),
                 Span::raw(format!("{:>14}", entry.amount.to_string())),
             ])
         }
@@ -579,7 +586,7 @@ fn entry_row(entry: &PlanEntry, focus: PlanFocus) -> ListItem<'static> {
     if !entry.active_months.is_all() {
         line.push_span(Span::styled(
             format!("  {}", entry.active_months.short_label()),
-            Style::default().fg(Color::DarkGray),
+            muted,
         ));
     }
 

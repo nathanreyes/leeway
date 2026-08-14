@@ -28,6 +28,23 @@ pub const SELECTION: Color = Color::Rgb(88, 91, 112);
 /// or below SELECTION would vanish under the band here. Mocha `Overlay0` (#6c7086).
 pub const METER_TRACK: Color = Color::Rgb(108, 112, 134);
 
+/// Secondary text inside a list row — a settled transaction, a count, a period
+/// column. Faded so the row's main content leads. Mocha `Overlay1` (#7f849c): a
+/// step up from the old `DarkGray`, which sank too close to the background to
+/// read at a glance.
+pub const MUTED: Color = Color::Rgb(127, 132, 156);
+
+/// [`MUTED`] on the selected row. The plain tone sits too near [`SELECTION`] to
+/// survive the band, so a highlighted row lifts to Mocha `Subtext0` (#a6adc8):
+/// still quieter than the rest of the row, still legible.
+pub const MUTED_SELECTED: Color = Color::Rgb(166, 173, 200);
+
+/// Pick the muted tone for a list row, given whether the selection band is
+/// behind it.
+pub fn muted(selected: bool) -> Color {
+    if selected { MUTED_SELECTED } else { MUTED }
+}
+
 /// Gap segment above a bar on the Series trend chart. More subdued than
 /// [`METER_TRACK`]: the chart sits on plain background (no selection band to
 /// read over), so a dimmer slate keeps the filler quiet against the mauve
