@@ -146,11 +146,15 @@ impl MonthView {
         }
         let envelopes_remaining: Money = envelopes.iter().map(|e| e.remaining).sum();
 
-        // Sort standalone so income shows first, then bills; each group alphabetical.
+        // Sort standalone so income shows first, then bills. Within a direction, what still
+        // needs doing floats to the top: unsettled before settled, then the biggest amounts
+        // first, with the label breaking ties so the order is stable across reloads.
         let mut standalone = standalone;
         standalone.sort_by(|a, b| {
             let dir = dir_rank(a.direction).cmp(&dir_rank(b.direction));
-            dir.then_with(|| a.display_label().cmp(b.display_label()))
+            dir.then_with(|| a.settled.cmp(&b.settled))
+                .then_with(|| b.amount.cmp(&a.amount))
+                .then_with(|| a.display_label().cmp(b.display_label()))
         });
 
         let whats_left = WhatsLeft::compute_with_carry_parts(
@@ -479,6 +483,63 @@ mod tests {
             after.whats_left.whats_left,
             before.whats_left.whats_left + Money::from_dollars(500.0)
         );
+    }
+
+    #[test]
+    fn standalone_txns_sort_unsettled_first_then_by_amount() {
+        let mut conn = db::open_in_memory().unwrap();
+        ops::seed_starter(&mut conn).unwrap();
+        let today = Local::now().date_naive();
+        let month = queries::current_month(&conn).unwrap().unwrap();
+
+        // Two bills each side of the settled line, so both grouping and amount show up.
+        let small = ops::add_oneoff_txn(
+            &conn,
+            &month.id,
+            "Small bill",
+            Direction::Out,
+            Money::from_dollars(30.0),
+        )
+        .unwrap();
+        ops::add_oneoff_txn(
+            &conn,
+            &month.id,
+            "Big bill",
+            Direction::Out,
+            Money::from_dollars(900.0),
+        )
+        .unwrap();
+        let paid = ops::add_oneoff_txn(
+            &conn,
+            &month.id,
+            "Paid bill",
+            Direction::Out,
+            Money::from_dollars(500.0),
+        )
+        .unwrap();
+        ops::toggle_settled(&conn, &paid, false).unwrap();
+        ops::toggle_settled(&conn, &small, false).unwrap();
+
+        let view = MonthView::build(&conn, today).unwrap().unwrap();
+        let bills: Vec<&str> = view
+            .standalone
+            .iter()
+            .filter(|t| t.direction == Direction::Out)
+            .map(|t| t.display_label())
+            .filter(|label| label.ends_with(" bill"))
+            .collect();
+
+        // Unsettled first (biggest first inside the group), settled sunk to the bottom —
+        // where $500 still outranks $30.
+        assert_eq!(bills, ["Big bill", "Paid bill", "Small bill"]);
+        // And no settled row ever floats above an unsettled one.
+        let settled: Vec<bool> = view
+            .standalone
+            .iter()
+            .filter(|t| t.direction == Direction::Out)
+            .map(|t| t.settled)
+            .collect();
+        assert!(settled.windows(2).all(|w| w[0] <= w[1]), "{settled:?}");
     }
 
     #[test]
