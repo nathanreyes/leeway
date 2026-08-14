@@ -397,11 +397,13 @@ fn draw_plan_list(frame: &mut Frame, area: Rect, app: &App, summaries: &[PlanSum
         })
         .collect();
 
+    let item_count = items.len();
     let mut state = ListState::default();
     state.select(Some(app.plans_sel));
 
     let list = crate::selectable_list(items).block(crate::selectable_block(" Templates ", focused));
     frame.render_stateful_widget(list, area, &mut state);
+    crate::render_list_scrollbar(frame, area, item_count, state.offset(), focused);
 }
 
 /// Render the reusable plan's cash-flow scenario without any live account terms.
@@ -522,6 +524,7 @@ fn draw_plan_block(
         PlanFocus::Envelopes => app.editor_env_sel,
     };
 
+    let row_count = rows.len();
     let mut state = ListState::default();
     if focused && !rows.is_empty() {
         state.select(Some(selected));
@@ -530,6 +533,7 @@ fn draw_plan_block(
     let list = crate::selectable_list(rows)
         .block(crate::selectable_block(plan_block_title(focus), focused));
     frame.render_stateful_widget(list, area, &mut state);
+    crate::render_list_scrollbar(frame, area, row_count, state.offset(), focused);
 }
 
 fn plan_block_title(focus: PlanFocus) -> &'static str {
@@ -854,6 +858,67 @@ mod tests {
             top.abs_diff(bottom) <= 1,
             "panes unbalanced: Income@{income} Expenses@{expenses} Envelopes@{envelopes}"
         );
+    }
+
+    #[test]
+    fn an_overflowing_item_pane_draws_a_scrollbar() {
+        // Item panes cap at 7 rows, so a long expense list has to advertise the overflow.
+        let (mut app, _, _, _) = app_with_transaction_plan();
+        let plan_id = queries::plan_summaries(&app.conn).unwrap()[0]
+            .plan
+            .id
+            .clone();
+        for i in 0..10 {
+            let series_id = ops::create_series(
+                &app.conn,
+                Kind::Transaction,
+                &format!("Bill {i}"),
+                Some(Direction::Out),
+                None,
+                None,
+            )
+            .unwrap();
+            ops::add_plan_item(&app.conn, &plan_id, &series_id, Money::from_dollars(10.0)).unwrap();
+        }
+        let summaries = queries::plan_summaries(&app.conn).unwrap();
+        let entries = queries::load_plan_entries(&app.conn, &plan_id).unwrap();
+        app.plan_focus = PlanFocus::Expenses;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &summaries, &entries))
+            .unwrap();
+
+        // The thumb sits in the pane's rightmost column, over the border.
+        let buffer = terminal.backend().buffer();
+        let thumbs = (0..buffer.area.height)
+            .filter(|y| buffer[(99, *y)].symbol() == "█")
+            .count();
+        assert!(thumbs > 0, "no scrollbar thumb in the right-hand column");
+    }
+
+    #[test]
+    fn an_overflowing_templates_list_draws_a_scrollbar() {
+        let (mut app, _, _, _) = app_with_transaction_plan();
+        for i in 0..30 {
+            ops::create_plan(&app.conn, &format!("Plan {i}")).unwrap();
+        }
+        let summaries = queries::plan_summaries(&app.conn).unwrap();
+        app.plan_focus = PlanFocus::List;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &app, &summaries, &[]))
+            .unwrap();
+
+        // The list column is 34 wide, so its right border — and the thumb — sits at x = 33.
+        let buffer = terminal.backend().buffer();
+        let thumbs = (0..buffer.area.height)
+            .filter(|y| buffer[(33, *y)].symbol() == "█")
+            .count();
+        assert!(thumbs > 0, "no scrollbar thumb on the Templates list");
     }
 
     #[test]
