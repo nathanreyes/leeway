@@ -645,7 +645,11 @@ fn draw_stats(frame: &mut Frame, area: Rect, detail: &SeriesDetailView) {
         stat_row("avg", format_money_opt(stats.avg), key_width),
         stat_row("min", format_money_opt(stats.min), key_width),
         stat_row("max", format_money_opt(stats.max), key_width),
-        stat_row("planned avg", format_money_opt(stats.planned_avg), key_width),
+        stat_row(
+            "planned avg",
+            format_money_opt(stats.planned_avg),
+            key_width,
+        ),
         stat_row("avg delta", delta, key_width),
     ];
 
@@ -788,15 +792,20 @@ fn segmented_chart_lines(
         .enumerate()
         .map(|(i, p)| {
             p.effective.map(|m| match heights.and_then(|h| h.get(i)) {
-                Some(&frac) => ((frac.clamp(0.0, 1.0) * bar_rows as f64).round() as usize)
-                    .min(bar_rows),
+                Some(&frac) => {
+                    ((frac.clamp(0.0, 1.0) * bar_rows as f64).round() as usize).min(bar_rows)
+                }
                 None => bar_fill_rows(m.cents().unsigned_abs(), max_cents, bar_rows),
             })
         })
         .collect();
 
     let axis_style = Style::default().fg(Color::Gray);
-    let mid_row = if bar_rows >= 2 { Some(bar_rows / 2) } else { None };
+    let mid_row = if bar_rows >= 2 {
+        Some(bar_rows / 2)
+    } else {
+        None
+    };
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
 
@@ -824,7 +833,10 @@ fn segmented_chart_lines(
                     } else {
                         crate::theme::CHART_TRACK
                     };
-                    spans.push(Span::styled(SEG.repeat(bar_width), Style::default().fg(color)));
+                    spans.push(Span::styled(
+                        SEG.repeat(bar_width),
+                        Style::default().fg(color),
+                    ));
                 }
                 None => spans.push(Span::raw(" ".repeat(bar_width))),
             }
