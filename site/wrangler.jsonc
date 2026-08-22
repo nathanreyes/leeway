@@ -1,0 +1,8 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "leeway",
+  "compatibility_date": "2026-08-21",
+  "assets": {
+    "directory": "./dist"
+  }
+}

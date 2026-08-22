@@ -1,9 +1,0 @@
-[build]
-  # The Astro marketing site lives in the site/ subdirectory.
-  base = "site"
-  command = "npm run build"
-  # Publish dir is relative to `base`, so this resolves to site/dist.
-  publish = "dist"
-
-[build.environment]
-  NODE_VERSION = "22.12.0"

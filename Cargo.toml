@@ -10,7 +10,7 @@ homepage = "https://get-leeway.com"
 # Keep the published crate to the buildable app. docs/help/*.md are embedded
 # via include_str! and MUST stay; the marketing site, knowledge base, and
 # design docs are not needed to build leeway.
-exclude = ["site/", "knowledge/", "docs/plans/", "netlify.toml"]
+exclude = ["site/", "knowledge/", "docs/plans/"]
 
 [dependencies]
 anyhow = "1.0.103"
