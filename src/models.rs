@@ -57,6 +57,13 @@ sql_enum!(Kind { Transaction => "transaction", Envelope => "envelope" });
 // between Daily and Monthly, and calculation treats Weekly as Monthly.
 sql_enum!(PeriodType { Daily => "daily", Weekly => "weekly", Monthly => "monthly" });
 sql_enum!(Mode { Automatic => "automatic", Manual => "manual" });
+sql_enum!(ForecastMethod {
+    Static => "static",
+    PreviousMonth => "previous_month",
+    AveragePrevious3 => "average_previous_3",
+    SameMonthLastYear => "same_month_last_year",
+    OverallAverage => "overall_average",
+});
 sql_enum!(AccountType {
     Checking => "checking",
     CreditCard => "credit_card",
@@ -65,6 +72,18 @@ sql_enum!(CreditCardEntryMode {
     AvailableCredit => "available_credit",
     CurrentBalance => "current_balance",
 });
+
+impl ForecastMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::PreviousMonth => "previous month",
+            Self::AveragePrevious3 => "average previous 3",
+            Self::SameMonthLastYear => "same month last year",
+            Self::OverallAverage => "overall average",
+        }
+    }
+}
 
 impl CreditCardEntryMode {
     pub fn label(self) -> &'static str {
@@ -359,6 +378,9 @@ pub struct PlanEntry {
     pub item_id: String,
     pub plan_id: String,
     pub amount: Money,
+    /// The historical source to try when this item is stamped. Static always works; a
+    /// historical method falls back to `amount` when its required observations are absent.
+    pub forecast_method: ForecastMethod,
     /// The months this plan stamps the item in — [`MonthSet::ALL`] unless the user narrowed
     /// it. Per-plan like `amount`, so one plan can carry birthday gifts in March/July while
     /// another drops them entirely.

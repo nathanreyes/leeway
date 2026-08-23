@@ -22,12 +22,13 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("schema.sql")),
         M::up(include_str!("migration_002_integrity_and_indexes.sql")),
         M::up(include_str!("migration_003_plan_item_active_months.sql")),
+        M::up(include_str!("migration_004_plan_item_forecast_method.sql")),
     ])
 });
 
 /// Latest SQLite schema understood by this build. Sync metadata records this separately
 /// from the folder-sync protocol version so older applications can fail closed.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Open the database at `path` (creating the file if missing) and bring its schema up to
 /// the latest version. Returns the live connection the rest of the app uses.
@@ -152,5 +153,32 @@ mod tests {
             conn.execute("UPDATE plan_item SET active_months = 0 WHERE id = 'i'", [])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn plan_items_default_to_static_forecasts() {
+        let conn = open_in_memory().expect("schema should apply");
+        conn.execute("INSERT INTO plan (id, name) VALUES ('p', 'P')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO series (id, kind, label, direction) VALUES ('s', 'transaction', 'T', 'out')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO plan_item (id, plan_id, series_id, amount_cents)
+             VALUES ('i', 'p', 's', 100)",
+            [],
+        )
+        .unwrap();
+
+        let method: String = conn
+            .query_row(
+                "SELECT forecast_method FROM plan_item WHERE id = 'i'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(method, "static");
     }
 }

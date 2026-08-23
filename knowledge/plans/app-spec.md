@@ -25,8 +25,8 @@ Three primitives, cleanly related:
 
 And a separation across time:
 
-- **Plan** — a reusable *template*: a named set of plan-items, each referencing a **series** and carrying that plan's budgeted *amount* and *active months*. The series says *what* the item is; the plan says *how much* and *when*. An item runs every month unless the plan narrows it, which is how yearly costs — birthday gifts, school fees, an annual premium — live in the baseline instead of in the user's memory. You can keep several plans (normal month, tight month, summer-with-the-kids) that share series, and choose which to stamp.
-- **Stamping** — at the start of a month you stamp a plan, which **copies** its items into concrete instances for that month (the series' fields + the plan's amount), skipping any item whose active months exclude that month. The link to the plan is then **broken**: the month is an independent snapshot. Editing the plan afterward never reaches back into a stamped month. A month may be **restamped** with any plan — **merge** (additive; refresh unsettled instances, protect settled ones) or **replace** (clean slate; keeps hand-entered data only if you ask). Matching is by shared `series_id`.
+- **Plan** — a reusable *template*: a named set of plan-items, each referencing a **series** and carrying that plan's budgeted *amount*, *active months*, and saved amount source. The series says *what* the item is; the plan says *how much* and *when*. An item runs every month unless the plan narrows it, which is how yearly costs — birthday gifts, school fees, an annual premium — live in the baseline instead of in the user's memory. You can keep several plans (normal month, tight month, summer-with-the-kids) that share series, and choose which to stamp.
+- **Stamping** — at the start of a month you stamp a plan. A review shows each concrete amount and lets you choose a static or available historical source. The app remembers that source on the plan item. Confirming copies the items into concrete instances for that month, skipping any item whose active months exclude that month. The link to the plan is then **broken**: the month is an independent snapshot. Editing the plan afterward never reaches back into a stamped month. A month may be **restamped** with any plan — **merge** (additive; refresh unsettled instances, protect settled ones) or **replace** (clean slate; keeps hand-entered data only if you ask). Matching is by shared `series_id`.
 
 ---
 
@@ -71,7 +71,8 @@ CREATE TABLE plan_item (
     plan_id       TEXT NOT NULL REFERENCES plan(id),
     series_id     TEXT NOT NULL REFERENCES series(id),
     amount        REAL NOT NULL,           -- envelopes: daily rate or monthly total, by period_type
-    active_months INTEGER                  -- 12-bit mask, bit 0 = Jan; NULL = every month
+    active_months  INTEGER,                -- 12-bit mask, bit 0 = Jan; NULL = every month
+    forecast_method TEXT NOT NULL DEFAULT 'static'
 );
 
 -- A stamped period.
@@ -183,19 +184,22 @@ As the month progresses, automatic envelopes' `remaining` shrinks (commitments "
 
 ```
 stamp(plan, start_date, days_in_month):
+    review = resolve each active item's saved source from months before start_date
+             # unavailable history falls back to the static item.amount
+    user reviews amounts and may change each saved source
     m = INSERT month(plan_id=plan.id, label, start_date, days_in_month)
     # accounts persist; balances carry forward and are updated by hand as needed
-    for item in plan.items:
+    for item in review:
         if item.kind == 'envelope':
-            monthly_amount = item.amount if item.period_type == 'monthly'
-                             else item.amount * days_in_month
             INSERT envelope(month_id=m, series_id=item.id,
-                            amount=monthly_amount, stamped_amount=monthly_amount,
+                            amount=item.resolved_amount,
+                            stamped_amount=item.resolved_amount,
                             period_type=item.period_type, mode=item.mode,
                             label=item.label)
         else:  # transaction
             INSERT txn(month_id=m, series_id=item.id,
-                       amount=item.amount, stamped_amount=item.amount,
+                       amount=item.resolved_amount,
+                       stamped_amount=item.resolved_amount,
                        direction=item.direction, settled=0,
                        label=item.label)
     # link is now broken: the month is a self-contained snapshot

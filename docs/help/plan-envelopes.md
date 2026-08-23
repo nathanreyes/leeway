@@ -8,6 +8,8 @@ Stamping copies these envelopes into the month, where they draw down over time. 
 
 An envelope that only fills in some months — gifts, school fees — gets those months from `M`. Stamping skips it everywhere else.
 
+The stamp review can use prior recorded spending for a manual envelope. Automatic envelopes stay on their static plan amount because their consumed amount comes from time, not tracked spending.
+
 ## Example
 
 ```

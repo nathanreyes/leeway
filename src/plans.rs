@@ -1,6 +1,4 @@
-//! The unified Plans screen: a master list of plan templates on the left, the selected
-//! plan's item sublists (Income, Expenses, Envelopes) stacked on the right, and the plan's
-//! cash-flow Summary across the bottom.
+//! Plan detail and commands for the shared budget workspace.
 //!
 //! Editing model: focus the plan list to act on whole plans — `n` new, `l` label, `s` stamp,
 //! `x` delete. Focus an item pane to act on that block's items — `n` searches/creates a
@@ -9,7 +7,7 @@
 //! things; editing the shared series itself (label, mode, period) lives on the Series page
 //! (`S`), so a plan can never silently rewrite a definition used by other plans.
 
-use crate::{AddDestination, App, BudgetBlock, ConfirmAction, PlanFocus, PromptKind, Screen};
+use crate::{AddDestination, App, BudgetBlock, ConfirmAction, PlanFocus, PromptKind};
 use anyhow::Result;
 use chrono::Local;
 use leeway::calc::PlanProjection;
@@ -25,8 +23,8 @@ use ratatui::widgets::{ListItem, ListState, Paragraph};
 
 // --- Key handling --------------------------------------------------------------
 
-/// Route a key on the unified Plans screen. Screen-global keys (leave, cycle focus) act
-/// regardless of pane; everything else dispatches to the focused pane's handler.
+/// Route a key for a selected plan. Workspace-global keys act first; everything else
+/// dispatches to the sidebar or focused item pane.
 pub fn handle_key(
     app: &mut App,
     key: KeyEvent,
@@ -37,10 +35,13 @@ pub fn handle_key(
     app.status = None;
 
     match key.code {
-        // `q` (quit) and `S` (jump to Series) are handled globally; `Esc` goes back to the
-        // Dashboard/month view.
+        // Escape returns from an item pane to the budget sidebar. From the sidebar it exits.
         KeyCode::Esc => {
-            app.screen = Screen::Dashboard;
+            if app.plan_focus == PlanFocus::List {
+                app.should_quit = true;
+            } else {
+                app.plan_focus = PlanFocus::List;
+            }
             return Ok(());
         }
         KeyCode::Tab => {
@@ -277,6 +278,7 @@ fn budget_block_for_focus(focus: PlanFocus) -> BudgetBlock {
     }
 }
 
+#[cfg(test)]
 pub fn draw(frame: &mut Frame, app: &App, summaries: &[PlanSummary], entries: &[PlanEntry]) {
     // The summary grows only when the plan has seasonal items to list, so a plan without
     // them keeps the layout it has always had.
@@ -369,9 +371,88 @@ pub fn draw(frame: &mut Frame, app: &App, summaries: &[PlanSummary], entries: &[
     crate::draw_screen_footer(frame, footer, hints, nav_hints, status.as_deref());
 }
 
+/// Draw one plan inside the shared budget workspace. The workspace owns the sidebar and
+/// footer; this keeps the same four-panel shape as a month.
+pub fn draw_detail(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    plan: Option<&Plan>,
+    entries: &[PlanEntry],
+) {
+    let projection = leeway::calc::project_plan(entries);
+    let [header, body, summary_area] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(7 + seasonal_line_count(&projection) as u16),
+    ])
+    .areas(area);
+
+    let title = match plan {
+        Some(plan) => format!(" Leeway — Plan: {} ", plan.name),
+        None => " Leeway — No plan selected ".into(),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(title.bold()))
+            .alignment(Alignment::Center)
+            .block(crate::bordered_block()),
+        header,
+    );
+
+    let income_count = entry_count(entries, PlanFocus::Income);
+    let expense_count = entry_count(entries, PlanFocus::Expenses);
+    let envelope_count = entry_count(entries, PlanFocus::Envelopes);
+    if body.width >= 72 {
+        let (items_height, envelope_height) = crate::dashboard::budget_panel_heights(
+            body.height,
+            income_count.max(expense_count),
+            envelope_count,
+        );
+        let [items_area, env_area] = Layout::vertical([
+            Constraint::Length(items_height),
+            Constraint::Length(envelope_height),
+        ])
+        .areas(body);
+        let [income_area, expense_area] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(items_area);
+        draw_plan_block(frame, income_area, app, entries, PlanFocus::Income);
+        draw_plan_block(frame, expense_area, app, entries, PlanFocus::Expenses);
+        draw_plan_block(frame, env_area, app, entries, PlanFocus::Envelopes);
+    } else {
+        let [income_area, expense_area, env_area] = Layout::vertical([
+            Constraint::Min(crate::income_block_height(income_count)),
+            Constraint::Min(crate::income_block_height(expense_count)),
+            Constraint::Min(crate::income_block_height(envelope_count)),
+        ])
+        .areas(body);
+        draw_plan_block(frame, income_area, app, entries, PlanFocus::Income);
+        draw_plan_block(frame, expense_area, app, entries, PlanFocus::Expenses);
+        draw_plan_block(frame, env_area, app, entries, PlanFocus::Envelopes);
+    }
+    draw_plan_summary(frame, summary_area, &projection);
+}
+
+/// Detail-panel hints used by the shared budget footer.
+pub fn footer_hints(_app: &App) -> Line<'static> {
+    Line::from(vec![
+        key(" j/k "),
+        Span::raw(" move  "),
+        key(" n "),
+        Span::raw(" new  "),
+        key(" a "),
+        Span::raw(" amount  "),
+        key(" M "),
+        Span::raw(" months  "),
+        key(" x "),
+        Span::raw(" remove"),
+    ])
+}
+
 /// The master plan list. The selected row stays highlighted whether or not the list is the
 /// focused pane, so it's always clear which plan the detail panes belong to; the mauve border
 /// (not the highlight) signals focus.
+#[cfg(test)]
 fn draw_plan_list(frame: &mut Frame, area: Rect, app: &App, summaries: &[PlanSummary]) {
     let focused = app.plan_focus == PlanFocus::List;
     if summaries.is_empty() {
@@ -524,11 +605,12 @@ fn draw_plan_block(
         PlanFocus::Envelopes => app.editor_env_sel,
     };
 
+    let content_width = crate::selectable_list_content_width(area);
     let rows: Vec<ListItem> = entries
         .iter()
         .filter(|entry| entry_matches_focus(entry, focus))
         .enumerate()
-        .map(|(i, entry)| entry_row(entry, focus, focused && i == selected))
+        .map(|(i, entry)| entry_row(entry, focus, focused && i == selected, content_width))
         .collect();
 
     let row_count = rows.len();
@@ -556,13 +638,24 @@ fn plan_block_title(focus: PlanFocus) -> &'static str {
 /// direction, so envelopes are the only rows that need mode/period details.
 /// `selected` says whether the selection band sits behind this row, which decides
 /// how far the secondary columns can fade.
-fn entry_row(entry: &PlanEntry, focus: PlanFocus, selected: bool) -> ListItem<'static> {
+fn entry_row(
+    entry: &PlanEntry,
+    focus: PlanFocus,
+    selected: bool,
+    content_width: usize,
+) -> ListItem<'static> {
     let s = &entry.series;
     let muted = Style::default().fg(crate::theme::muted(selected));
+    let amount_width = 12.min(content_width.saturating_sub(1));
+    let compact_label_width = content_width.saturating_sub(amount_width + 1).max(1);
     let mut line = match focus {
         PlanFocus::List | PlanFocus::Income | PlanFocus::Expenses => Line::from(vec![
-            Span::raw(format!("{:<24}", crate::truncate(&s.label, 24))),
-            Span::raw(format!("{:>12}", entry.amount.to_string())),
+            Span::raw(format!(
+                "{:<compact_label_width$}",
+                crate::truncate(&s.label, compact_label_width)
+            )),
+            Span::raw(" "),
+            Span::raw(format!("{:>amount_width$}", entry.amount.to_string())),
         ]),
         PlanFocus::Envelopes => {
             let period = match s.period_type {
@@ -574,11 +667,27 @@ fn entry_row(entry: &PlanEntry, focus: PlanFocus, selected: bool) -> ListItem<'s
                 Some(Mode::Manual) => "manual",
                 _ => "auto",
             };
-            Line::from(vec![
-                Span::raw(format!("{:<18}", crate::truncate(&s.label, 18))),
-                Span::styled(format!("{:<6}{:<8}", period, mode), muted),
-                Span::raw(format!("{:>14}", entry.amount.to_string())),
-            ])
+            if content_width >= 44 {
+                let label_width = content_width.saturating_sub(14 + amount_width + 1);
+                Line::from(vec![
+                    Span::raw(format!(
+                        "{:<label_width$}",
+                        crate::truncate(&s.label, label_width)
+                    )),
+                    Span::styled(format!("{:<6}{:<8}", period, mode), muted),
+                    Span::raw(" "),
+                    Span::raw(format!("{:>amount_width$}", entry.amount.to_string())),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::raw(format!(
+                        "{:<compact_label_width$}",
+                        crate::truncate(&s.label, compact_label_width)
+                    )),
+                    Span::raw(" "),
+                    Span::raw(format!("{:>amount_width$}", entry.amount.to_string())),
+                ])
+            }
         }
     };
 
@@ -604,6 +713,7 @@ fn key(label: &str) -> Span<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Screen;
     use leeway::money::Money;
     use leeway::ops;
     use leeway::queries;
@@ -643,7 +753,11 @@ mod tests {
         let entries = queries::load_plan_entries(&conn, &plan_id).unwrap();
         let app = App {
             conn,
-            screen: Screen::Plans,
+            screen: Screen::Budget,
+            budget_target: crate::BudgetTarget::Plan {
+                plan_id: plan_id.clone(),
+            },
+            last_plan_id: Some(plan_id.clone()),
             should_quit: false,
             dash_focus: crate::DashFocus::Income,
             viewed_year: 2026,
@@ -965,6 +1079,20 @@ mod tests {
 
         handle_key(&mut app, backtab_key(), &summaries, Some(&plan), &entries).unwrap();
         assert!(app.plan_focus == PlanFocus::List);
+    }
+
+    #[test]
+    fn escape_returns_to_sidebar_then_exits() {
+        let (mut app, plan, entries, _) = app_with_transaction_plan();
+        app.plan_focus = PlanFocus::Expenses;
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        handle_key(&mut app, escape, &[], Some(&plan), &entries).unwrap();
+        assert!(app.plan_focus == PlanFocus::List);
+        assert!(!app.should_quit);
+
+        handle_key(&mut app, escape, &[], Some(&plan), &entries).unwrap();
+        assert!(app.should_quit);
     }
 
     #[test]

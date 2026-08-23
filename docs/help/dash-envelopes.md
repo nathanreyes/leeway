@@ -8,7 +8,7 @@ Unlike bills, you don't itemize every purchase. Automatic envelopes release budg
 
 Press `Enter` on a row to open its transactions, where you record, edit, and delete this month's spending. Amount (`a`), mode (`m`), and period (`p`) are edited right here on the row. The envelope's name belongs to its Series: press `S` to inspect or rename that shared identity; every month using it follows the new name.
 
-The dashboard marks automatic envelopes with `↻` and manual envelopes with `✎`.
+The month view marks automatic envelopes with `↻` and manual envelopes with `✎`.
 
 ## Example
 

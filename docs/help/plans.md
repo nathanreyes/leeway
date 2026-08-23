@@ -10,7 +10,13 @@ But you can also use plans to compare scenarios, like taking a vacation or buyin
 
 Stamp a plan into a month to create an independent snapshot you can then adjust freely. Editing a plan afterwards doesn't touch months you've already stamped — a plan is the starting point, not a live link.
 
-Furthermore, editing a month's bills or envelopes doesn't change the plan either. You can use a plan to create a month, then tweak that month without affecting the plan.
+Editing a month's bills or envelopes doesn't change the plan either. You can use a plan to create a month, then tweak that month without affecting the plan.
+
+## Stamp review
+
+After you choose a month, Leeway shows the amounts it will stamp. Press Enter to keep the shown amounts, or select a row and use Left/Right or `f` to choose a historical amount. Leeway remembers that source for the next stamp.
+
+Historical choices use settled bill and income amounts or spending recorded inside manual envelopes. Automatic envelopes stay static. If a saved source has no data for the target month, Leeway shows and uses the static amount but keeps the saved source for later.
 
 ## Seasonal items
 
@@ -39,9 +45,10 @@ Seasonal items stay out of the Summary totals, which describe an ordinary month.
 
 ## Keys
 
-This list is the master pane; the selected plan's Income, Expenses, and Envelopes fill the panes to the right. Tab moves focus between them; these keys act on the plan while the list is focused.
+Plans share the budget sidebar with months. The selected plan's Income, Expenses, Envelopes, and Summary fill the same detail area used by a month. Tab moves focus between them; these keys act on the plan while the sidebar is focused.
 
-- `j` / `k` — move between plans
+- `j` / `k` — move through months and plans
+- `m` — return to the Months section
 - `n` — create a new plan
 - `l` — rename the selected plan
 - `s` — stamp the selected plan onto a month

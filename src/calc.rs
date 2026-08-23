@@ -577,6 +577,7 @@ mod tests {
             item_id: "item".into(),
             plan_id: "plan".into(),
             amount,
+            forecast_method: crate::models::ForecastMethod::Static,
             active_months: MonthSet::ALL,
             series: Series {
                 id: "series".into(),

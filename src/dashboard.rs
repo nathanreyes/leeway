@@ -1,4 +1,4 @@
-//! The dashboard screen: the "what's left" daily loop.
+//! Month detail for the shared budget workspace: the "what's left" daily loop.
 //!
 //! Two public entry points, mirroring every screen module: `draw` renders a frame from
 //! read-only data, and `handle_key` mutates `App` (and the database) in response to a key.
@@ -26,11 +26,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
     // Clear any leftover status the moment the user acts again.
     app.status = None;
 
-    // Page jumps (`P`/`S`) and `q` to quit are handled globally in the event loop before we get
-    // here. The Dashboard is the home page, so `Esc` — the canonical "go back" key on the
-    // sub-pages — has nowhere further up to go and quits the app.
+    // Escape returns from a detail pane to the budget sidebar. From the sidebar it exits,
+    // matching the workspace handler that normally receives that second press.
     if key.code == KeyCode::Esc {
-        app.should_quit = true;
+        if app.dash_focus == DashFocus::Header {
+            app.should_quit = true;
+        } else {
+            app.dash_focus = DashFocus::Header;
+        }
         return Ok(());
     }
 
@@ -42,9 +45,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
             // j/k (and arrows) step the viewed period; k = previous, j = next.
             KeyCode::Char('k') | KeyCode::Up => step_month(app, -1),
             KeyCode::Char('j') | KeyCode::Down => step_month(app, 1),
-            // Jump straight to a typed month. Enter opens the same prompt as `m`, prefilled
-            // with the current period so it's a small edit.
-            KeyCode::Char('m') | KeyCode::Enter => app.open_text(
+            // Jump straight to a typed month, prefilled with the current period.
+            KeyCode::Char('g') | KeyCode::Enter => app.open_text(
                 "Go to month (YYYY-MM)",
                 format!("{:04}-{:02}", app.viewed_year, app.viewed_month),
                 PromptKind::GoToMonth,
@@ -530,6 +532,7 @@ fn act_on_focus(app: &mut App, view: &MonthView) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn draw(frame: &mut Frame, app: &App, view: &Option<MonthView>) {
     // The header and footer are always present — they carry month navigation, which must
     // work even when the viewed period has no stamped month. Only the middle changes.
@@ -540,7 +543,13 @@ pub fn draw(frame: &mut Frame, app: &App, view: &Option<MonthView>) {
     ])
     .areas(frame.area());
 
-    draw_header(frame, header, app, view.as_ref());
+    draw_header(
+        frame,
+        header,
+        app,
+        view.as_ref(),
+        app.dash_focus == DashFocus::Header,
+    );
     match view {
         Some(view) => draw_month_body(frame, middle, app, view),
         None => draw_missing_month(frame, middle, app),
@@ -548,17 +557,34 @@ pub fn draw(frame: &mut Frame, app: &App, view: &Option<MonthView>) {
     draw_footer(frame, footer, app, view);
 }
 
-/// The full month view: accounts at the top, budget blocks in the middle, and the
-/// "what's left" summary across the bottom.
+/// Draw the month side of the shared budget workspace. The sidebar owns navigation and
+/// the workspace owns the footer, so this renders only the month header and body.
+pub fn draw_detail(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView>) {
+    let [header, middle] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+    draw_header(frame, header, app, view.as_ref(), false);
+    match view {
+        Some(view) => draw_month_body(frame, middle, app, view),
+        None => draw_missing_month(frame, middle, app),
+    }
+}
+
+/// The full month view. Only the current month shows Accounts; every other month uses
+/// the same budget-block-first shape as a plan.
 fn draw_month_body(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
-    let [acct_area, body, summary_area] = Layout::vertical([
-        Constraint::Length(account_block_height(view)),
-        Constraint::Min(0),
-        // 7 rows so all breakdown lines (funds/card, income/bills/envelopes, carry)
-        // fit inside the summary border.
-        Constraint::Length(7),
-    ])
-    .areas(area);
+    let (account_area, body, summary_area) = if view.is_current {
+        let [account_area, body, summary_area] = Layout::vertical([
+            Constraint::Length(account_block_height(view)),
+            Constraint::Min(0),
+            Constraint::Length(7),
+        ])
+        .areas(area);
+        (Some(account_area), body, summary_area)
+    } else {
+        let [body, summary_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(7)]).areas(area);
+        (None, body, summary_area)
+    };
     // Mirror the summary's relative positioning: income and expenses share the top row
     // side-by-side, and envelopes sit in a full-width box beneath them. Size the two
     // tiers from their contents so spare vertical room prevents unnecessary scrolling.
@@ -586,7 +612,9 @@ fn draw_month_body(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
             .areas(items_area);
 
-    draw_accounts(frame, acct_area, app, view);
+    if let Some(account_area) = account_area {
+        draw_accounts(frame, account_area, app, view);
+    }
     draw_transactions(frame, income_area, app, view, Direction::In);
     draw_transactions(frame, expense_area, app, view, Direction::Out);
     draw_envelopes(frame, env_area, app, view);
@@ -597,7 +625,7 @@ fn draw_month_body(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
 /// Each tier gets enough rows to show all of its content whenever possible. When both cannot
 /// fit, divide the usable space in proportion to their requested heights; the list renderers
 /// then add scrollbars only to the tiers that still overflow.
-fn budget_panel_heights(
+pub(crate) fn budget_panel_heights(
     available: u16,
     transaction_rows: usize,
     envelope_rows: usize,
@@ -625,11 +653,10 @@ fn budget_panel_heights(
     let item_demand = desired_items - MIN_BLOCK_HEIGHT;
     let envelope_demand = desired_envelopes - MIN_BLOCK_HEIGHT;
     let total_demand = item_demand.saturating_add(envelope_demand);
-    let item_extra = if total_demand == 0 {
-        distributable / 2
-    } else {
-        distributable.saturating_mul(item_demand) / total_demand
-    };
+    let item_extra = distributable
+        .saturating_mul(item_demand)
+        .checked_div(total_demand)
+        .unwrap_or(distributable / 2);
     let items = MIN_BLOCK_HEIGHT + item_extra;
     (items as u16, (available - items) as u16)
 }
@@ -637,11 +664,7 @@ fn budget_panel_heights(
 /// One row per account plus the bordered block, capped so a large account list does not
 /// crowd out the budget blocks.
 fn account_block_height(view: &MonthView) -> u16 {
-    if view.is_current {
-        view.accounts.len().saturating_add(2).clamp(3, 7) as u16
-    } else {
-        4
-    }
+    view.accounts.len().saturating_add(2).clamp(3, 7) as u16
 }
 
 /// Shown when the viewed period isn't stamped: name the period and point at the ways
@@ -654,7 +677,7 @@ fn draw_missing_month(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(format!("  {label} isn't stamped yet.").bold()),
         Line::raw(""),
         Line::from(Span::styled(
-            "  Press P to open Plans and stamp one onto it,",
+            "  Choose a plan in the sidebar and press s to stamp it,",
             dim,
         )),
         Line::from(Span::styled(
@@ -668,6 +691,7 @@ fn draw_missing_month(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Footer hints, adapted to the focused control (and to whether a month exists — with none,
 /// there are no panels to Tab to).
+#[cfg(test)]
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView>) {
     let left_hints = match app.dash_focus {
         DashFocus::Header => {
@@ -679,7 +703,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             spans.extend([
                 key(" k/j "),
                 Span::raw(" prev/next month  "),
-                key(" m "),
+                key(" g "),
                 Span::raw(" go to month"),
             ]);
             Line::from(spans)
@@ -740,8 +764,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
     let nav_hints = Line::from(vec![
         key(" h "),
         Span::raw(" help  "),
-        key(" P "),
-        Span::raw(" plans  "),
         key(" S "),
         Span::raw(" series  "),
         key(" , "),
@@ -753,25 +775,67 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
     crate::draw_screen_footer(frame, area, left_hints, nav_hints, status.as_deref());
 }
 
+/// Detail-panel hints used by the shared budget footer.
+pub fn footer_hints(app: &App) -> Line<'static> {
+    match app.dash_focus {
+        DashFocus::Header => Line::from(vec![
+            key(" j/k "),
+            Span::raw(" budget  "),
+            key(" g "),
+            Span::raw(" go to month"),
+        ]),
+        DashFocus::Income | DashFocus::Expenses => Line::from(vec![
+            key(" j/k "),
+            Span::raw(" move  "),
+            key(" Enter "),
+            Span::raw(" paid  "),
+            key(" n "),
+            Span::raw(" new  "),
+            key(" a "),
+            Span::raw(" amount  "),
+            key(" x "),
+            Span::raw(" del"),
+        ]),
+        DashFocus::Envelopes => Line::from(vec![
+            key(" j/k "),
+            Span::raw(" move  "),
+            key(" Enter "),
+            Span::raw(" txns  "),
+            key(" a "),
+            Span::raw(" amount  "),
+            key(" m "),
+            Span::raw(" mode  "),
+            key(" p "),
+            Span::raw(" period  "),
+            key(" s "),
+            Span::raw(" record  "),
+            key(" n "),
+            Span::raw(" new  "),
+            key(" x "),
+            Span::raw(" del"),
+        ]),
+        DashFocus::Accounts => Line::from(vec![
+            key(" j/k "),
+            Span::raw(" move  "),
+            key(" Enter "),
+            Span::raw(" edit  "),
+            key(" n "),
+            Span::raw(" new  "),
+            key(" l "),
+            Span::raw(" label  "),
+            key(" c "),
+            Span::raw(" carry  "),
+            key(" L "),
+            Span::raw(" limit  "),
+            key(" x "),
+            Span::raw(" del"),
+        ]),
+    }
+}
+
 /// The accounts panel. Full-width rows keep the current balance/owed amount near the
 /// account name and reserve the final column for each account's buffer/carry setting.
 fn draw_accounts(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
-    if !view.is_current {
-        let lines = vec![
-            Line::from(Span::styled(
-                " Account balances apply only to the current month.",
-                Style::default().fg(Color::Gray),
-            )),
-            Line::from(Span::styled(
-                " This month uses plan snapshot math: income - expenses - envelopes.",
-                Style::default().fg(Color::Gray),
-            )),
-        ];
-        let p = Paragraph::new(lines).block(crate::focusable_block(" Accounts ", false));
-        frame.render_widget(p, area);
-        return;
-    }
-
     let inner_width = crate::selectable_list_content_width(area);
     let name_width = inner_width
         .saturating_mul(22)
@@ -867,7 +931,7 @@ fn carry_column(label: &str, carry_balance: Option<Money>, width: usize) -> Span
 /// The month header, and the handle for month navigation. Always drawn from `app`'s viewed
 /// period so it appears even when that period has no month; `view` (when present) adds the
 /// day counter and current/past/upcoming tag. A cyan border cues that it holds focus.
-fn draw_header(frame: &mut Frame, area: Rect, app: &App, view: Option<&MonthView>) {
+fn draw_header(frame: &mut Frame, area: Rect, app: &App, view: Option<&MonthView>, focused: bool) {
     let label = format!("{:04}-{:02}", app.viewed_year, app.viewed_month);
     let title = match view {
         // The live month gets the "day X of N" progress counter. `days_elapsed` is whole
@@ -894,7 +958,6 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, view: Option<&MonthView
         None => format!(" Leeway — {label}   (not stamped) "),
     };
 
-    let focused = app.dash_focus == DashFocus::Header;
     let block = crate::bordered_block();
     let block = if focused {
         block.border_style(Style::default().fg(crate::theme::MAUVE))
@@ -923,9 +986,8 @@ fn draw_whats_left(
 
     let mut lines = Vec::new();
 
-    // The account-derived terms (funds, card debt, carry) are only part of the headline for
-    // the current month; the view already zeroed them off-month. So we only *show* them for
-    // the current month, and otherwise say why the balance is income − bills − envelopes.
+    // Account terms belong only to the current month. Off-month summaries begin with the
+    // same income/expenses row as plan summaries.
     if view.is_current {
         let mut row = summary_term(
             SummaryTerm::Funds,
@@ -967,11 +1029,6 @@ fn draw_whats_left(
             ));
         }
         lines.push(Line::from(row));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "account balances count only in the current month",
-            Style::default().fg(Color::DarkGray),
-        )));
     }
 
     let mut row = summary_term(
@@ -1060,6 +1117,9 @@ fn draw_transactions(
         ),
     };
 
+    let content_width = crate::selectable_list_content_width(area);
+    let amount_width = 11.min(content_width.saturating_sub(4));
+    let label_width = content_width.saturating_sub(4 + amount_width).max(1);
     let items: Vec<ListItem> = view
         .standalone
         .iter()
@@ -1082,8 +1142,11 @@ fn draw_transactions(
             };
             let line = Line::from(vec![
                 Span::raw(format!("{} ", check)),
-                Span::raw(format!("{:<28}", crate::truncate(t.display_label(), 28))),
-                Span::styled(format!("{:>10}", amount), style),
+                Span::raw(format!(
+                    "{:<label_width$}",
+                    crate::truncate(t.display_label(), label_width)
+                )),
+                Span::styled(format!("{:>amount_width$}", amount), style),
             ]);
             ListItem::new(line).style(style)
         })
@@ -1101,6 +1164,7 @@ fn draw_transactions(
 }
 
 fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
+    let content_width = crate::selectable_list_content_width(area);
     let items: Vec<ListItem> = view
         .envelopes
         .iter()
@@ -1122,15 +1186,21 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
             // `▮` cells (the glyph carries its own side gaps) split into a mauve
             // fill and a lighter slate track. Two spans so each gets its own
             // colour; both render over the selection band unchanged.
-            const LABEL_WIDTH: usize = 28;
-            const METER_WIDTH: usize = 24;
             const REMAINING_WIDTH: usize = 18;
             const TOTAL_WIDTH: usize = 16;
-            let filled = meter_fill(e.consumed, e.envelope.amount, METER_WIDTH);
+            let wide = content_width >= 60;
+            let (label_width, meter_width) = if wide {
+                let flexible = content_width.saturating_sub(3 + REMAINING_WIDTH + TOTAL_WIDTH);
+                let label = flexible.saturating_div(2).clamp(12, 28);
+                (label, flexible.saturating_sub(label).min(24))
+            } else {
+                (content_width.saturating_sub(3 + REMAINING_WIDTH).max(1), 0)
+            };
+            let filled = meter_fill(e.consumed, e.envelope.amount, meter_width);
             let meter_fill_span =
                 Span::styled("▮".repeat(filled), Style::default().fg(crate::theme::MAUVE));
             let meter_track_span = Span::styled(
-                "▮".repeat(METER_WIDTH - filled),
+                "▮".repeat(meter_width - filled),
                 Style::default().fg(crate::theme::METER_TRACK),
             );
 
@@ -1139,22 +1209,27 @@ fn draw_envelopes(frame: &mut Frame, area: Rect, app: &App, view: &MonthView) {
             // append their entered rate as context; monthly is the implicit default.
             let mut spans = vec![
                 Span::raw(format!(
-                    "{:<LABEL_WIDTH$}",
-                    crate::truncate(e.envelope.display_label(), LABEL_WIDTH)
+                    "{:<label_width$}",
+                    crate::truncate(e.envelope.display_label(), label_width)
                 )),
                 Span::styled(format!("{mode_icon}  "), Style::default().fg(Color::Gray)),
-                meter_fill_span,
-                meter_track_span,
                 Span::raw(format!(
                     "{:>REMAINING_WIDTH$}",
                     format!("{} left", e.remaining)
                 )),
-                Span::styled(
+            ];
+            if wide {
+                spans.insert(2, meter_fill_span);
+                spans.insert(3, meter_track_span);
+                spans.push(Span::styled(
                     format!("{:>TOTAL_WIDTH$}", format!("of {}", e.envelope.amount)),
                     Style::default().fg(Color::Gray),
-                ),
-            ];
-            if let Some(daily_rate) = daily_rate {
+                ));
+            }
+            if wide
+                && content_width >= 96
+                && let Some(daily_rate) = daily_rate
+            {
                 spans.push(Span::styled(
                     format!("  ({daily_rate})"),
                     Style::default().fg(Color::Gray),
@@ -1243,7 +1318,12 @@ mod tests {
 
         App {
             conn,
-            screen: Screen::Dashboard,
+            screen: Screen::Budget,
+            budget_target: crate::BudgetTarget::Month {
+                year: 2026,
+                month: 9,
+            },
+            last_plan_id: None,
             should_quit: false,
             dash_focus: DashFocus::Income,
             viewed_year: 2026,
@@ -1377,6 +1457,26 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn off_month_layout_omits_accounts_and_the_account_summary_note() {
+        let app = app_with_stamped_month();
+        let view = Some(off_month_view(&app));
+        let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+
+        terminal
+            .draw(|frame| draw_detail(frame, frame.area(), &app, &view))
+            .unwrap();
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("Income"));
+        assert!(text.contains("Expenses"));
+        assert!(text.contains("Envelopes"));
+        assert!(text.contains("Summary"));
+        assert!(!text.contains("Accounts"));
+        assert!(!text.contains("account balances count"));
+        assert!(!text.contains("Account balances apply"));
     }
 
     #[test]
@@ -1542,6 +1642,21 @@ mod tests {
         handle_key(&mut app, tab_key(), &Some(view)).unwrap();
 
         assert!(app.dash_focus == DashFocus::Accounts);
+    }
+
+    #[test]
+    fn escape_returns_to_sidebar_then_exits() {
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Expenses;
+        let view = Some(month_view(&app));
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        handle_key(&mut app, escape, &view).unwrap();
+        assert!(app.dash_focus == DashFocus::Header);
+        assert!(!app.should_quit);
+
+        handle_key(&mut app, escape, &view).unwrap();
+        assert!(app.should_quit);
     }
 
     #[test]
@@ -1755,7 +1870,7 @@ mod tests {
             }
             _ => panic!("expected envelope transactions modal"),
         }
-        assert!(matches!(app.screen, Screen::Dashboard));
+        assert!(matches!(app.screen, Screen::Budget));
     }
 
     #[test]
@@ -1771,7 +1886,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(app.screen, Screen::Dashboard));
+        assert!(matches!(app.screen, Screen::Budget));
         assert!(app.modal.is_none());
     }
 

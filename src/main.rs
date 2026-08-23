@@ -1,9 +1,9 @@
 //! Leeway's terminal UI.
 //!
-//! The app is now multi-screen, so this file holds the *shared* scaffolding and each
-//! screen lives in its own module:
-//!   - `dashboard` — the "what's left" view (the daily loop)
-//!   - `plans`     — the plans list and the plan editor (templates you stamp)
+//! This file holds shared scaffolding while each main view lives in its own module:
+//!   - `budget`    — the month/plan workspace and sidebar
+//!   - `dashboard` — month detail and the daily loop
+//!   - `plans`     — plan detail and template commands
 //!
 //! `main.rs` owns three cross-cutting concerns the screens share:
 //!   1. `App` — all mutable UI state (the data itself stays in SQLite).
@@ -13,6 +13,7 @@
 //!      route it either to the open modal or to the screen's own handler.
 
 mod anim;
+mod budget;
 mod dashboard;
 mod help;
 mod plans;
@@ -48,15 +49,20 @@ pub(crate) const SERIES_RENAME_GUIDANCE: &str = "Rename this item from its Serie
 /// selected plan's items). Series carries its own compact navigation state so a contextual
 /// detail drill-in can return to its exact origin.
 pub enum Screen {
-    Dashboard,
+    Budget,
     Series {
         state: SeriesScreen,
     },
-    Plans,
     Settings {
         tab: SettingsTab,
         origin: SeriesOrigin,
     },
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum BudgetTarget {
+    Month { year: i32, month: u32 },
+    Plan { plan_id: String },
 }
 
 /// The settings screen's tabs. General holds app-wide preferences (envelope-mode default,
@@ -125,15 +131,13 @@ pub enum SeriesMode {
 /// should become a shared navigation abstraction instead.
 #[derive(Clone)]
 pub enum SeriesOrigin {
-    Dashboard,
-    Plans,
+    Budget,
 }
 
 impl SeriesOrigin {
     fn from_screen(screen: &Screen) -> Option<Self> {
         match screen {
-            Screen::Dashboard => Some(Self::Dashboard),
-            Screen::Plans => Some(Self::Plans),
+            Screen::Budget => Some(Self::Budget),
             Screen::Series { .. } => None,
             Screen::Settings { origin, .. } => Some(origin.clone()),
         }
@@ -141,13 +145,12 @@ impl SeriesOrigin {
 
     fn into_screen(self) -> Screen {
         match self {
-            Self::Dashboard => Screen::Dashboard,
-            Self::Plans => Screen::Plans,
+            Self::Budget => Screen::Budget,
         }
     }
 }
 
-/// Which control the dashboard's keys act on. The month header owns month navigation; the
+/// Which control the month target's keys act on. `Header` now means the budget sidebar; the
 /// budget blocks own row-level actions; accounts remain a compact support panel for
 /// balance edits. We track which is "focused" and route j/k, Enter, and `n` to it.
 #[derive(Clone, Copy, PartialEq)]
@@ -159,9 +162,9 @@ pub enum DashFocus {
     Accounts,
 }
 
-/// Which pane is focused on the unified Plans screen. `List` is the master plan list;
-/// the other three are the selected plan's item sublists, mirroring the dashboard's item
-/// grouping minus header/accounts. Tab cycles List → Income → Expenses → Envelopes → List.
+/// Which pane is focused for a plan target. `List` now means the shared budget sidebar;
+/// the other three are the selected plan's item lists. Tab cycles
+/// List → Income → Expenses → Envelopes → List.
 #[derive(Clone, Copy, PartialEq)]
 pub enum PlanFocus {
     List,
@@ -200,6 +203,9 @@ pub enum Modal {
     Confirm(Confirm),
     Choice(Choice),
     CurrencyPicker(CurrencyPicker),
+    /// Review the concrete amounts a plan will stamp into one target month. Left/right
+    /// changes a row's remembered source; Enter saves the choices and continues.
+    StampReview(StampReview),
     /// Manage an envelope's transactions. Shows the envelope's identity/metrics as a
     /// read-only header; the transaction list is the only focusable surface.
     Envelope(EnvelopeManage),
@@ -375,6 +381,17 @@ pub struct ChoiceOption {
 /// `currency::CURRENCIES`; on confirm we persist the choice and set it active.
 pub struct CurrencyPicker {
     pub selected: usize,
+}
+
+#[derive(Clone)]
+pub struct StampReview {
+    pub plan_id: String,
+    pub label: String,
+    pub start_date: NaiveDate,
+    pub days_in_month: i64,
+    pub existing_month_id: Option<String>,
+    pub selected: usize,
+    pub rows: Vec<leeway::forecast::ResolvedPlanEntry>,
 }
 
 /// The deferred effect a chosen option runs. Carries the ids it needs so the action is
@@ -579,6 +596,8 @@ pub enum ConfirmAction {
 pub struct App {
     pub conn: Connection,
     pub screen: Screen,
+    pub budget_target: BudgetTarget,
+    pub last_plan_id: Option<String>,
     pub should_quit: bool,
     pub dash_focus: DashFocus,
     /// The period the dashboard is showing, as a (year, month). Starts on today's calendar
@@ -802,7 +821,12 @@ fn main() -> Result<()> {
 
     let mut app = App {
         conn,
-        screen: Screen::Dashboard,
+        screen: Screen::Budget,
+        budget_target: BudgetTarget::Month {
+            year: today.year(),
+            month: today.month(),
+        },
+        last_plan_id: None,
         should_quit: false,
         dash_focus: DashFocus::Accounts,
         viewed_year: today.year(),
@@ -867,97 +891,136 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
         // `match` on the screen keeps each branch's data local — the borrow of `app.conn`
         // for loading is released before we take a `&mut app` to handle input.
         match &app.screen {
-            Screen::Dashboard => {
-                let view = leeway::view::MonthView::build_for(
-                    &app.conn,
-                    today,
-                    app.viewed_year,
-                    app.viewed_month,
-                )?;
-                match &view {
-                    Some(v) => {
-                        // Resolve "select the item I just created" now that the sorted lists
-                        // are loaded (mirrors the plan editor's pending_select handling).
-                        if let Some(target) = app.pending_dash_txn.take()
-                            && let Some(txn) = v.standalone.iter().find(|t| t.id == target)
-                        {
-                            app.dash_focus = match txn.direction {
-                                leeway::models::Direction::In => DashFocus::Income,
-                                leeway::models::Direction::Out => DashFocus::Expenses,
-                            };
-                            if let Some(idx) = dashboard_txn_index(v, &target, app.dash_focus) {
-                                match app.dash_focus {
-                                    DashFocus::Income => app.dash_income_sel = idx,
-                                    DashFocus::Expenses => app.dash_expense_sel = idx,
-                                    _ => {}
-                                }
-                            }
-                        }
-                        if let Some(target) = app.pending_dash_env.take()
-                            && let Some(idx) =
-                                v.envelopes.iter().position(|e| e.envelope.id == target)
-                        {
-                            app.dash_env_sel = idx;
-                            app.dash_focus = DashFocus::Envelopes;
-                        }
-                        if let Some(target) = app.pending_dash_account.take()
-                            && v.is_current
-                            && let Some(idx) = v.accounts.iter().position(|a| a.id == target)
-                        {
-                            app.dash_acct_sel = idx;
-                            app.dash_focus = DashFocus::Accounts;
-                        }
-                        if v.is_current {
-                            clamp(&mut app.dash_acct_sel, v.accounts.len());
-                        } else {
-                            app.dash_acct_sel = 0;
-                            if app.dash_focus == DashFocus::Accounts {
-                                app.dash_focus = DashFocus::Income;
-                            }
-                        }
-                        clamp(
-                            &mut app.dash_income_sel,
-                            dashboard_txn_count(v, DashFocus::Income),
-                        );
-                        clamp(
-                            &mut app.dash_expense_sel,
-                            dashboard_txn_count(v, DashFocus::Expenses),
-                        );
-                        clamp(&mut app.dash_env_sel, v.envelopes.len());
-                    }
-                    // No month for this period → the header is the only sensible control, so
-                    // pin focus there. That keeps j/k/m navigation working with nothing else
-                    // on screen (and stops Tab from stranding focus on an absent panel).
-                    None => app.dash_focus = DashFocus::Header,
+            Screen::Budget => {
+                let months = queries::months(&app.conn)?;
+                let summaries = queries::plan_summaries(&app.conn)?;
+
+                if let Some(target) = app.pending_plan_select.take()
+                    && let Some(index) = summaries.iter().position(|s| s.plan.id == target)
+                {
+                    app.plans_sel = index;
+                    budget::select_target(app, BudgetTarget::Plan { plan_id: target }, &summaries);
                 }
-                let now = Instant::now();
-                app.frame_now = now;
-                app.summary_anims.sync(
-                    view.as_ref().map(|v| &v.whats_left),
-                    view.as_ref().map(|v| v.is_current).unwrap_or(false),
-                    (app.viewed_year, app.viewed_month),
-                    now,
-                );
-                terminal.draw(|f| {
-                    dashboard::draw(f, app, &view);
-                    draw_modal(f, app);
-                })?;
-                let tick = if app.summary_anims.is_animating(now) {
-                    FRAME_TICK
-                } else {
-                    sync_tick(app)
-                };
-                if let Some(key) = read_key(tick)? {
-                    let contextual_series_id = view
-                        .as_ref()
-                        .and_then(|view| dashboard::selected_series_id(app, view));
-                    if app.modal.is_some() {
-                        handle_modal_key(app, key)?;
-                    } else if handle_global_key_with_series(app, key, contextual_series_id)
-                        || !budget_key_allowed(app, key)
-                    {
-                    } else {
-                        dashboard::handle_key(app, key, &view)?;
+
+                if let BudgetTarget::Plan { plan_id } = &app.budget_target
+                    && !summaries.iter().any(|summary| summary.plan.id == *plan_id)
+                {
+                    budget::select_target(
+                        app,
+                        BudgetTarget::Month {
+                            year: today.year(),
+                            month: today.month(),
+                        },
+                        &summaries,
+                    );
+                }
+
+                match app.budget_target.clone() {
+                    BudgetTarget::Month { year, month } => {
+                        app.viewed_year = year;
+                        app.viewed_month = month;
+                        let view = leeway::view::MonthView::build_for(
+                            &app.conn,
+                            today,
+                            app.viewed_year,
+                            app.viewed_month,
+                        )?;
+                        match &view {
+                            Some(v) => reconcile_month_selection(app, v),
+                            None => app.dash_focus = DashFocus::Header,
+                        }
+                        let now = Instant::now();
+                        app.frame_now = now;
+                        app.summary_anims.sync(
+                            view.as_ref().map(|v| &v.whats_left),
+                            view.as_ref().map(|v| v.is_current).unwrap_or(false),
+                            (app.viewed_year, app.viewed_month),
+                            now,
+                        );
+                        terminal.draw(|frame| {
+                            budget::draw_month(frame, app, &months, &summaries, &view, today);
+                            draw_modal(frame, app);
+                        })?;
+                        let tick = if app.summary_anims.is_animating(now) {
+                            FRAME_TICK
+                        } else {
+                            sync_tick(app)
+                        };
+                        if let Some(key) = read_key(tick)? {
+                            let contextual_series_id = view
+                                .as_ref()
+                                .and_then(|view| dashboard::selected_series_id(app, view));
+                            if app.modal.is_some() {
+                                handle_modal_key(app, key)?;
+                            } else if handle_global_key_with_series(app, key, contextual_series_id)
+                                || !budget_key_allowed(app, key)
+                            {
+                            } else if budget::sidebar_focused(app) {
+                                budget::handle_sidebar_key(
+                                    app,
+                                    key,
+                                    &months,
+                                    &summaries,
+                                    today,
+                                    budget::SidebarDetail::Month(view.as_ref()),
+                                )?;
+                            } else {
+                                dashboard::handle_key(app, key, &view)?;
+                            }
+                        }
+                    }
+                    BudgetTarget::Plan { plan_id } => {
+                        let plan = summaries
+                            .iter()
+                            .find(|summary| summary.plan.id == plan_id)
+                            .map(|summary| summary.plan.clone());
+                        if let Some(index) = summaries
+                            .iter()
+                            .position(|summary| summary.plan.id == plan_id)
+                        {
+                            app.plans_sel = index;
+                            app.last_plan_id = Some(plan_id.clone());
+                        }
+                        let entries = match &plan {
+                            Some(plan) => queries::load_plan_entries(&app.conn, &plan.id)?,
+                            None => Vec::new(),
+                        };
+                        reconcile_plan_selection(app, &entries);
+                        terminal.draw(|frame| {
+                            budget::draw_plan(
+                                frame,
+                                app,
+                                &months,
+                                &summaries,
+                                plan.as_ref(),
+                                &entries,
+                                today,
+                            );
+                            draw_modal(frame, app);
+                        })?;
+                        if let Some(key) = read_key(sync_tick(app))? {
+                            let contextual_series_id = plans::selected_series_id(app, &entries);
+                            if app.modal.is_some() {
+                                handle_modal_key(app, key)?;
+                            } else if handle_global_key_with_series(app, key, contextual_series_id)
+                                || !budget_key_allowed(app, key)
+                            {
+                            } else if budget::sidebar_focused(app) {
+                                budget::handle_sidebar_key(
+                                    app,
+                                    key,
+                                    &months,
+                                    &summaries,
+                                    today,
+                                    budget::SidebarDetail::Plan {
+                                        plan: plan.as_ref(),
+                                        entries: &entries,
+                                    },
+                                )?;
+                            } else {
+                                plans::handle_key(app, key, &summaries, plan.as_ref(), &entries)?;
+                            }
+                        }
                     }
                 }
             }
@@ -1031,77 +1094,6 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                                 series::handle_key(app, key, &view, today)?;
                             }
                         }
-                    }
-                }
-            }
-
-            Screen::Plans => {
-                let summaries = queries::plan_summaries(&app.conn)?;
-
-                // Resolve a pending "select this new plan" request before clamping, so the
-                // newly created (name-sorted) plan lands selected on its first frame.
-                if let Some(target) = app.pending_plan_select.take()
-                    && let Some(idx) = summaries.iter().position(|s| s.plan.id == target)
-                {
-                    app.plans_sel = idx;
-                    app.plan_focus = PlanFocus::List;
-                }
-                clamp(&mut app.plans_sel, summaries.len());
-                // With no plans there is nothing to detail, so the list is the only sensible
-                // control — pin focus there.
-                if summaries.is_empty() {
-                    app.plan_focus = PlanFocus::List;
-                }
-
-                // The selected plan drives the detail panes. It can be absent (no plans yet),
-                // in which case the item panes and summary render empty.
-                let plan = summaries.get(app.plans_sel).map(|s| &s.plan);
-                let entries = match plan {
-                    Some(plan) => queries::load_plan_entries(&app.conn, &plan.id)?,
-                    None => Vec::new(),
-                };
-
-                // Resolve a pending "select this new item" request now that rows are loaded.
-                if let Some(target) = app.pending_select.take()
-                    && let Some(entry) = entries.iter().find(|e| e.item_id == target)
-                {
-                    app.plan_focus = plan_focus_for_entry(entry);
-                    if let Some(idx) = plan_entry_index(&entries, &target, app.plan_focus) {
-                        match app.plan_focus {
-                            PlanFocus::Income => app.editor_income_sel = idx,
-                            PlanFocus::Expenses => app.editor_expense_sel = idx,
-                            PlanFocus::Envelopes => app.editor_env_sel = idx,
-                            PlanFocus::List => {}
-                        }
-                    }
-                }
-                clamp(
-                    &mut app.editor_income_sel,
-                    plan_entry_count(&entries, PlanFocus::Income),
-                );
-                clamp(
-                    &mut app.editor_expense_sel,
-                    plan_entry_count(&entries, PlanFocus::Expenses),
-                );
-                clamp(
-                    &mut app.editor_env_sel,
-                    plan_entry_count(&entries, PlanFocus::Envelopes),
-                );
-
-                let plan = plan.cloned();
-                terminal.draw(|f| {
-                    plans::draw(f, app, &summaries, &entries);
-                    draw_modal(f, app);
-                })?;
-                if let Some(key) = read_key(sync_tick(app))? {
-                    let contextual_series_id = plans::selected_series_id(app, &entries);
-                    if app.modal.is_some() {
-                        handle_modal_key(app, key)?;
-                    } else if handle_global_key_with_series(app, key, contextual_series_id)
-                        || !budget_key_allowed(app, key)
-                    {
-                    } else {
-                        plans::handle_key(app, key, &summaries, plan.as_ref(), &entries)?;
                     }
                 }
             }
@@ -1580,9 +1572,8 @@ fn sync_status_color(status: &SyncStatus) -> Color {
 
 /// Keys that mean the same thing on *every* page, checked ahead of the page's own handler.
 ///
-/// The two sub-pages each get an uppercase jump key — `P`lans and `S`eries — so they're reachable
-/// from anywhere without hunting for a page-specific shortcut, and `q` always quits. The Dashboard
-/// (the month view) is the home page you return to with `Esc`, so it needs no jump key of its own.
+/// `S` opens Series, `,` opens Settings, and `q` quits. Month and plan section shortcuts
+/// are local to the budget sidebar.
 /// Keeping these in one place is what makes navigation consistent: previously each page decided
 /// for itself what `q` did (Plans treated it as "go back", everyone else quit), and the jump keys
 /// were a mix of upper- and lowercase scattered across the page handlers.
@@ -1600,7 +1591,6 @@ fn handle_global_key_with_series(
     contextual_series_id: Option<String>,
 ) -> bool {
     let screen = match key.code {
-        KeyCode::Char('P') => Screen::Plans,
         KeyCode::Char('S') => {
             if let Screen::Series { state } = &mut app.screen {
                 if let SeriesMode::Detail { series_id } = &state.mode {
@@ -1715,6 +1705,88 @@ fn reset_editor_selections(app: &mut App) {
     app.editor_env_sel = 0;
 }
 
+fn reconcile_month_selection(app: &mut App, view: &leeway::view::MonthView) {
+    if let Some(target) = app.pending_dash_txn.take()
+        && let Some(txn) = view.standalone.iter().find(|txn| txn.id == target)
+    {
+        app.dash_focus = match txn.direction {
+            leeway::models::Direction::In => DashFocus::Income,
+            leeway::models::Direction::Out => DashFocus::Expenses,
+        };
+        if let Some(index) = dashboard_txn_index(view, &target, app.dash_focus) {
+            match app.dash_focus {
+                DashFocus::Income => app.dash_income_sel = index,
+                DashFocus::Expenses => app.dash_expense_sel = index,
+                _ => {}
+            }
+        }
+    }
+    if let Some(target) = app.pending_dash_env.take()
+        && let Some(index) = view
+            .envelopes
+            .iter()
+            .position(|row| row.envelope.id == target)
+    {
+        app.dash_env_sel = index;
+        app.dash_focus = DashFocus::Envelopes;
+    }
+    if let Some(target) = app.pending_dash_account.take()
+        && view.is_current
+        && let Some(index) = view
+            .accounts
+            .iter()
+            .position(|account| account.id == target)
+    {
+        app.dash_acct_sel = index;
+        app.dash_focus = DashFocus::Accounts;
+    }
+    if view.is_current {
+        clamp(&mut app.dash_acct_sel, view.accounts.len());
+    } else {
+        app.dash_acct_sel = 0;
+        if app.dash_focus == DashFocus::Accounts {
+            app.dash_focus = DashFocus::Income;
+        }
+    }
+    clamp(
+        &mut app.dash_income_sel,
+        dashboard_txn_count(view, DashFocus::Income),
+    );
+    clamp(
+        &mut app.dash_expense_sel,
+        dashboard_txn_count(view, DashFocus::Expenses),
+    );
+    clamp(&mut app.dash_env_sel, view.envelopes.len());
+}
+
+fn reconcile_plan_selection(app: &mut App, entries: &[leeway::models::PlanEntry]) {
+    if let Some(target) = app.pending_select.take()
+        && let Some(entry) = entries.iter().find(|entry| entry.item_id == target)
+    {
+        app.plan_focus = plan_focus_for_entry(entry);
+        if let Some(index) = plan_entry_index(entries, &target, app.plan_focus) {
+            match app.plan_focus {
+                PlanFocus::Income => app.editor_income_sel = index,
+                PlanFocus::Expenses => app.editor_expense_sel = index,
+                PlanFocus::Envelopes => app.editor_env_sel = index,
+                PlanFocus::List => {}
+            }
+        }
+    }
+    clamp(
+        &mut app.editor_income_sel,
+        plan_entry_count(entries, PlanFocus::Income),
+    );
+    clamp(
+        &mut app.editor_expense_sel,
+        plan_entry_count(entries, PlanFocus::Expenses),
+    );
+    clamp(
+        &mut app.editor_env_sel,
+        plan_entry_count(entries, PlanFocus::Envelopes),
+    );
+}
+
 fn dashboard_txn_count(view: &leeway::view::MonthView, focus: DashFocus) -> usize {
     view.standalone
         .iter()
@@ -1794,10 +1866,90 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
         Some(Modal::Confirm(_)) => handle_confirm_key(app, key),
         Some(Modal::Choice(_)) => handle_choice_key(app, key),
         Some(Modal::CurrencyPicker(_)) => handle_currency_picker_key(app, key),
+        Some(Modal::StampReview(_)) => handle_stamp_review_key(app, key),
         Some(Modal::Envelope(_)) => handle_envelope_modal_key(app, key),
         Some(Modal::Help(_)) => handle_help_key(app, key),
         None => Ok(()),
     }
+}
+
+fn handle_stamp_review_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => app.modal = None,
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let Some(Modal::StampReview(review)) = &mut app.modal
+                && review.selected + 1 < review.rows.len()
+            {
+                review.selected += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let Some(Modal::StampReview(review)) = &mut app.modal {
+                review.selected = review.selected.saturating_sub(1);
+            }
+        }
+        KeyCode::Left => cycle_stamp_method(app, -1),
+        KeyCode::Right | KeyCode::Char('f') => cycle_stamp_method(app, 1),
+        KeyCode::Enter => confirm_stamp_review(app)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn cycle_stamp_method(app: &mut App, delta: i32) {
+    let Some(Modal::StampReview(review)) = &mut app.modal else {
+        return;
+    };
+    let Some(row) = review.rows.get_mut(review.selected) else {
+        return;
+    };
+    if row.options.len() <= 1 {
+        let option = row.options[0];
+        row.entry.forecast_method = option.method;
+        row.amount = option.amount;
+        row.used_method = option.method;
+        return;
+    }
+    let current = row
+        .options
+        .iter()
+        .position(|option| option.method == row.entry.forecast_method)
+        .unwrap_or(0) as i32;
+    let next = (current + delta).rem_euclid(row.options.len() as i32) as usize;
+    let option = row.options[next];
+    row.entry.forecast_method = option.method;
+    row.amount = option.amount;
+    row.used_method = option.method;
+}
+
+fn confirm_stamp_review(app: &mut App) -> Result<()> {
+    let Some(Modal::StampReview(review)) = app.modal.take() else {
+        return Ok(());
+    };
+    for row in &review.rows {
+        ops::set_item_forecast_method(&app.conn, &row.entry.item_id, row.entry.forecast_method)?;
+    }
+
+    if let Some(month_id) = review.existing_month_id {
+        open_restamp_choice(app, &review.label, month_id, review.plan_id);
+        return Ok(());
+    }
+
+    ops::stamp(
+        &mut app.conn,
+        &review.plan_id,
+        &review.label,
+        review.start_date,
+        review.days_in_month,
+    )?;
+    reset_dashboard_selections(app);
+    app.budget_target = BudgetTarget::Month {
+        year: review.start_date.year(),
+        month: review.start_date.month(),
+    };
+    app.screen = Screen::Budget;
+    app.status = Some(format!("Stamped {}", review.label));
+    Ok(())
 }
 
 /// Keys while the currency chooser is open: ↑/↓ (or j/k) move, Enter selects and
@@ -2097,7 +2249,11 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
 
 fn finish_restamp(app: &mut App, message: &str) {
     reset_dashboard_selections(app);
-    app.screen = Screen::Dashboard;
+    app.budget_target = BudgetTarget::Month {
+        year: app.viewed_year,
+        month: app.viewed_month,
+    };
+    app.screen = Screen::Budget;
     app.status = Some(message.to_string());
 }
 
@@ -2365,10 +2521,10 @@ fn submit_text(app: &mut App) -> Result<()> {
             }
             let id = ops::create_plan(&app.conn, &text)?;
             reset_editor_selections(app);
-            // Stay on the unified Plans screen; the loop selects the new plan (name-sorted,
-            // so its index isn't known until the next reload) via `pending_plan_select`.
+            // Stay in the budget workspace; the loop selects the new name-sorted plan on
+            // the next reload via `pending_plan_select`.
             app.pending_plan_select = Some(id);
-            app.screen = Screen::Plans;
+            app.screen = Screen::Budget;
             app.status = Some(format!("Created plan “{text}”"));
         }
         PromptKind::RenamePlan { id } => {
@@ -2435,6 +2591,9 @@ fn submit_text(app: &mut App) -> Result<()> {
             Some((year, month)) => {
                 app.viewed_year = year;
                 app.viewed_month = month;
+                app.budget_target = BudgetTarget::Month { year, month };
+                app.screen = Screen::Budget;
+                app.dash_focus = DashFocus::Header;
                 // New period → old row indices are meaningless; start its lists at the top.
                 reset_dashboard_selections(app);
             }
@@ -2809,7 +2968,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-/// Parse a `YYYY-MM` month, validate it isn't already stamped, and stamp the plan onto it.
+/// Parse a `YYYY-MM` month and open a review of the concrete amounts that would be stamped.
 fn stamp_from_input(app: &mut App, plan_id: &str, input: &str) -> Result<()> {
     let Some((year, month)) = parse_year_month(input) else {
         app.status = Some(format!("Enter a month as YYYY-MM (got “{input}”)"));
@@ -2822,44 +2981,45 @@ fn stamp_from_input(app: &mut App, plan_id: &str, input: &str) -> Result<()> {
     app.viewed_year = year;
     app.viewed_month = month;
 
-    // Already stamped? Offer Merge / Replace instead of a fresh stamp.
-    if let Some(month_id) = queries::month_id_for_label(&app.conn, &label)? {
-        app.open_choice(
-            format!("{label} is already stamped. Restamp how?"),
-            vec![
-                ChoiceOption {
-                    key: 'm',
-                    label: "Merge (additive; refresh planned)".into(),
-                    action: Some(ModalAction::RestampMerge {
-                        month_id: month_id.clone(),
-                        plan_id: plan_id.to_string(),
-                    }),
-                },
-                ChoiceOption {
-                    key: 'r',
-                    label: "Replace (clean slate)".into(),
-                    action: Some(ModalAction::RestampReplace {
-                        month_id,
-                        plan_id: plan_id.to_string(),
-                    }),
-                },
-                ChoiceOption {
-                    key: 'c',
-                    label: "Cancel".into(),
-                    action: None,
-                },
-            ],
-        );
-        return Ok(());
-    }
-
     let start = NaiveDate::from_ymd_opt(year, month, 1).expect("validated y-m");
     let days = ops::days_in_month(year, month);
-    ops::stamp(&mut app.conn, plan_id, &label, start, days)?;
-    reset_dashboard_selections(app);
-    app.screen = Screen::Dashboard;
-    app.status = Some(format!("Stamped {label}"));
+    let rows = leeway::forecast::resolve_plan_entries(&app.conn, plan_id, start, days)?;
+    app.modal = Some(Modal::StampReview(StampReview {
+        plan_id: plan_id.to_string(),
+        label: label.clone(),
+        start_date: start,
+        days_in_month: days,
+        existing_month_id: queries::month_id_for_label(&app.conn, &label)?,
+        selected: 0,
+        rows,
+    }));
     Ok(())
+}
+
+fn open_restamp_choice(app: &mut App, label: &str, month_id: String, plan_id: String) {
+    app.open_choice(
+        format!("{label} is already stamped. Restamp how?"),
+        vec![
+            ChoiceOption {
+                key: 'm',
+                label: "Merge (additive; refresh planned)".into(),
+                action: Some(ModalAction::RestampMerge {
+                    month_id: month_id.clone(),
+                    plan_id: plan_id.clone(),
+                }),
+            },
+            ChoiceOption {
+                key: 'r',
+                label: "Replace (clean slate)".into(),
+                action: Some(ModalAction::RestampReplace { month_id, plan_id }),
+            },
+            ChoiceOption {
+                key: 'c',
+                label: "Cancel".into(),
+                action: None,
+            },
+        ],
+    );
 }
 
 fn parse_year_month(input: &str) -> Option<(i32, u32)> {
@@ -2947,6 +3107,7 @@ fn draw_modal(frame: &mut Frame, app: &App) {
         }
         Modal::SeriesSearch(prompt) => draw_series_search_modal(frame, prompt),
         Modal::CurrencyPicker(picker) => draw_currency_picker(frame, picker),
+        Modal::StampReview(review) => draw_stamp_review(frame, review),
         Modal::Confirm(confirm) => {
             let area = centered_rect(60, 20, frame.area());
             frame.render_widget(Clear, area);
@@ -2987,6 +3148,74 @@ fn draw_modal(frame: &mut Frame, app: &App) {
         Modal::Envelope(manage) => draw_envelope_modal(frame, app, manage),
         Modal::Help(state) => draw_help_modal(frame, state),
     }
+}
+
+fn draw_stamp_review(frame: &mut Frame, review: &StampReview) {
+    let area = centered_rect(82, 82, frame.area());
+    frame.render_widget(Clear, area);
+    let block = titled_block(format!(" Stamp {} ", review.label))
+        .border_style(Style::default().fg(theme::CYAN));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [intro_area, list_area, footer_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(2),
+    ])
+    .areas(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Review amounts. Historical sources use only data before this month.",
+            Style::default().fg(Color::Gray),
+        ))),
+        intro_area,
+    );
+
+    let items: Vec<ListItem<'_>> = review
+        .rows
+        .iter()
+        .map(|row| {
+            let selected = row
+                .option(row.entry.forecast_method)
+                .unwrap_or_else(|| row.options[0]);
+            let method = if selected.method == row.entry.forecast_method {
+                row.entry.forecast_method.label().to_string()
+            } else {
+                format!("static · {} unavailable", row.entry.forecast_method.label())
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(format!(
+                    " {:<28}",
+                    crate::truncate(&row.entry.series.label, 27)
+                )),
+                Span::styled(
+                    format!("{:>13}", selected.amount),
+                    Style::default().fg(theme::CYAN),
+                ),
+                Span::styled(format!("  {method}"), Style::default().fg(Color::Gray)),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(review.selected.min(items.len() - 1)));
+    }
+    frame.render_stateful_widget(selectable_list(items), list_area, &mut state);
+    render_list_scrollbar(frame, list_area, review.rows.len(), state.offset(), true);
+
+    let footer = if review.rows.is_empty() {
+        " Enter stamp empty plan · Esc cancel"
+    } else {
+        " j/k select · ←/→ or f source · Enter continue · Esc cancel"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        footer_area,
+    );
 }
 
 /// Draw the contextual help overlay: a large centered box over the current screen
@@ -3538,7 +3767,12 @@ mod tests {
 
         let app = App {
             conn,
-            screen: Screen::Dashboard,
+            screen: Screen::Budget,
+            budget_target: BudgetTarget::Month {
+                year: 2026,
+                month: 9,
+            },
+            last_plan_id: None,
             should_quit: false,
             dash_focus: DashFocus::Envelopes,
             viewed_year: 2026,
@@ -3586,6 +3820,236 @@ mod tests {
         }
     }
 
+    #[test]
+    fn budget_workspace_shows_months_and_plans_beside_month_detail() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        app.modal = None;
+        app.dash_focus = DashFocus::Header;
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let months = queries::months(&app.conn).unwrap();
+        let plans = queries::plan_summaries(&app.conn).unwrap();
+        let view = leeway::view::MonthView::build_for(&app.conn, today, 2026, 9).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 32)).unwrap();
+
+        terminal
+            .draw(|frame| budget::draw_month(frame, &app, &months, &plans, &view, today))
+            .unwrap();
+        let title_column = buffer_column(&terminal, "Budgets").unwrap();
+        assert!(buffer_contains_at_column(&terminal, "MONTHS", title_column));
+        assert!(buffer_contains_at_column(
+            &terminal,
+            "2026-09",
+            title_column
+        ));
+        assert!(buffer_contains_at_column(&terminal, "PLANS", title_column));
+        assert!(buffer_contains_at_column(&terminal, "Normal", title_column));
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("MONTHS"));
+        assert!(text.contains("PLANS"));
+        assert!(text.contains("2026-09"));
+        assert!(text.contains("2026-09 *"));
+        assert!(text.contains("Normal"));
+        assert!(text.contains("Accounts"));
+        assert!(text.contains("Envelopes"));
+        assert!(text.contains("Summary"));
+
+        budget::handle_sidebar_key(
+            &mut app,
+            key(KeyCode::Char('j')),
+            &months,
+            &plans,
+            today,
+            budget::SidebarDetail::Month(view.as_ref()),
+        )
+        .unwrap();
+        assert!(matches!(app.budget_target, BudgetTarget::Plan { .. }));
+    }
+
+    #[test]
+    fn budget_workspace_uses_the_same_detail_shape_for_a_plan() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        app.modal = None;
+        let plans = queries::plan_summaries(&app.conn).unwrap();
+        let plan = plans[0].plan.clone();
+        budget::select_target(
+            &mut app,
+            BudgetTarget::Plan {
+                plan_id: plan.id.clone(),
+            },
+            &plans,
+        );
+        let months = queries::months(&app.conn).unwrap();
+        let entries = queries::load_plan_entries(&app.conn, &plan.id).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 32)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                budget::draw_plan(frame, &app, &months, &plans, Some(&plan), &entries, today)
+            })
+            .unwrap();
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("Leeway — Plan: Normal"));
+        assert!(text.contains("Income"));
+        assert!(text.contains("Expenses"));
+        assert!(text.contains("Envelopes"));
+        assert!(text.contains("Summary"));
+        assert!(!text.contains("Accounts"));
+    }
+
+    #[test]
+    fn sidebar_shortcuts_switch_sections_and_g_opens_month_picker() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        app.modal = None;
+        app.dash_focus = DashFocus::Header;
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let months = queries::months(&app.conn).unwrap();
+        let plans = queries::plan_summaries(&app.conn).unwrap();
+        let view = leeway::view::MonthView::build_for(&app.conn, today, 2026, 9).unwrap();
+
+        budget::handle_sidebar_key(
+            &mut app,
+            key(KeyCode::Char('p')),
+            &months,
+            &plans,
+            today,
+            budget::SidebarDetail::Month(view.as_ref()),
+        )
+        .unwrap();
+        assert!(matches!(app.budget_target, BudgetTarget::Plan { .. }));
+        assert!(app.plan_focus == PlanFocus::List);
+
+        let plan = plans[app.plans_sel].plan.clone();
+        let entries = queries::load_plan_entries(&app.conn, &plan.id).unwrap();
+        budget::handle_sidebar_key(
+            &mut app,
+            key(KeyCode::Char('m')),
+            &months,
+            &plans,
+            today,
+            budget::SidebarDetail::Plan {
+                plan: Some(&plan),
+                entries: &entries,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            app.budget_target,
+            BudgetTarget::Month {
+                year: 2026,
+                month: 9,
+            }
+        );
+
+        budget::handle_sidebar_key(
+            &mut app,
+            key(KeyCode::Char('g')),
+            &months,
+            &plans,
+            today,
+            budget::SidebarDetail::Month(view.as_ref()),
+        )
+        .unwrap();
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Text(TextPrompt {
+                kind: PromptKind::GoToMonth,
+                ..
+            }))
+        ));
+        assert!(!handle_global_key(&mut app, key(KeyCode::Char('P'))));
+    }
+
+    #[test]
+    fn stamp_review_saves_a_source_and_recalls_it_when_data_is_missing() {
+        let (mut app, manage, _) = app_with_envelope_modal();
+        ops::add_envelope_spending(
+            &app.conn,
+            &manage.month_id,
+            &manage.envelope_id,
+            "Dinner",
+            Money::from_dollars(50.0),
+        )
+        .unwrap();
+        let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
+
+        stamp_from_input(&mut app, &plan_id, "2026-10").unwrap();
+        let Some(Modal::StampReview(review)) = &app.modal else {
+            panic!("expected stamp review");
+        };
+        assert_eq!(review.rows[0].options.len(), 3); // static, previous month, overall
+
+        handle_stamp_review_key(&mut app, key(KeyCode::Right)).unwrap();
+        handle_stamp_review_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert!(matches!(app.screen, Screen::Budget));
+        assert_eq!(
+            app.budget_target,
+            BudgetTarget::Month {
+                year: 2026,
+                month: 10,
+            }
+        );
+
+        let entry = queries::load_plan_entries(&app.conn, &plan_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            entry.forecast_method,
+            leeway::models::ForecastMethod::PreviousMonth
+        );
+        let october = queries::month_by_label(&app.conn, "2026-10")
+            .unwrap()
+            .unwrap();
+        let envelope = queries::load_envelopes(&app.conn, &october.id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(envelope.amount, Money::from_dollars(50.0));
+
+        // October has no recorded spending, so November falls back but keeps the saved
+        // previous-month source ready for the next month that can use it.
+        stamp_from_input(&mut app, &plan_id, "2026-11").unwrap();
+        let Some(Modal::StampReview(review)) = &app.modal else {
+            panic!("expected second stamp review");
+        };
+        assert_eq!(
+            review.rows[0].entry.forecast_method,
+            leeway::models::ForecastMethod::PreviousMonth
+        );
+        assert_eq!(
+            review.rows[0].used_method,
+            leeway::models::ForecastMethod::Static
+        );
+    }
+
+    #[test]
+    fn stamp_review_renders_the_saved_source_and_amount() {
+        let (mut app, manage, _) = app_with_envelope_modal();
+        ops::add_envelope_spending(
+            &app.conn,
+            &manage.month_id,
+            &manage.envelope_id,
+            "Dinner",
+            Money::from_dollars(50.0),
+        )
+        .unwrap();
+        let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
+        stamp_from_input(&mut app, &plan_id, "2026-10").unwrap();
+        handle_stamp_review_key(&mut app, key(KeyCode::Right)).unwrap();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Stamp 2026-10"));
+        assert!(text.contains("previous month"));
+        assert!(text.contains("50.00"));
+    }
+
     fn series_id_for_manage(app: &App, manage: &EnvelopeManage) -> String {
         load_detail_envelope(app, manage)
             .unwrap()
@@ -3602,7 +4066,7 @@ mod tests {
         match &app.screen {
             Screen::Settings {
                 tab: SettingsTab::General,
-                origin: SeriesOrigin::Dashboard,
+                origin: SeriesOrigin::Budget,
             } => {}
             _ => panic!("expected Settings (General) with the dashboard return address"),
         }
@@ -3648,7 +4112,7 @@ mod tests {
                         series_id: series_id.clone()
                     }
                 );
-                assert!(matches!(state.origin, SeriesOrigin::Dashboard));
+                assert!(matches!(state.origin, SeriesOrigin::Budget));
             }
             _ => panic!("expected contextual Series detail"),
         }
@@ -3664,25 +4128,25 @@ mod tests {
         );
 
         app.return_from_series();
-        assert!(matches!(app.screen, Screen::Dashboard));
+        assert!(matches!(app.screen, Screen::Budget));
     }
 
     #[test]
     fn direct_series_list_remembers_the_plans_origin() {
         let (mut app, _, _) = app_with_envelope_modal();
-        app.screen = Screen::Plans;
+        app.screen = Screen::Budget;
 
         assert!(handle_global_key(&mut app, key(KeyCode::Char('S'))));
         match &app.screen {
             Screen::Series { state } => {
                 assert_eq!(state.mode, SeriesMode::List);
-                assert!(matches!(state.origin, SeriesOrigin::Plans));
+                assert!(matches!(state.origin, SeriesOrigin::Budget));
             }
             _ => panic!("expected Series list"),
         }
 
         app.return_from_series();
-        assert!(matches!(app.screen, Screen::Plans));
+        assert!(matches!(app.screen, Screen::Budget));
     }
 
     #[test]
@@ -3691,20 +4155,20 @@ mod tests {
         // returns to Plans (selection is restored by `plans_sel`, not an origin plan id).
         let (mut app, envelope_detail, _) = app_with_envelope_modal();
         let series_id = series_id_for_manage(&app, &envelope_detail);
-        app.screen = Screen::Plans;
+        app.screen = Screen::Budget;
         app.plan_focus = PlanFocus::Expenses;
 
         handle_global_key_with_series(&mut app, key(KeyCode::Char('S')), Some(series_id.clone()));
         match &app.screen {
             Screen::Series { state } => {
                 assert_eq!(state.mode, SeriesMode::Detail { series_id });
-                assert!(matches!(state.origin, SeriesOrigin::Plans));
+                assert!(matches!(state.origin, SeriesOrigin::Budget));
             }
             _ => panic!("expected the series detail"),
         }
 
         app.return_from_series();
-        assert!(matches!(app.screen, Screen::Plans));
+        assert!(matches!(app.screen, Screen::Budget));
     }
 
     #[test]
@@ -3733,7 +4197,7 @@ mod tests {
         assert_eq!(changed.mode, Some(Mode::Automatic));
 
         series::handle_detail_key(&mut app, key(KeyCode::Esc), detail, today).unwrap();
-        assert!(matches!(app.screen, Screen::Dashboard));
+        assert!(matches!(app.screen, Screen::Budget));
     }
 
     #[test]
@@ -3839,7 +4303,7 @@ mod tests {
         handle_envelope_modal_key(&mut app, key(KeyCode::Esc)).unwrap();
 
         assert!(app.modal.is_none());
-        assert!(matches!(app.screen, Screen::Dashboard));
+        assert!(matches!(app.screen, Screen::Budget));
     }
 
     #[test]
@@ -3902,7 +4366,7 @@ mod tests {
         };
         app.screen = Screen::Settings {
             tab: SettingsTab::Storage,
-            origin: SeriesOrigin::Dashboard,
+            origin: SeriesOrigin::Budget,
         };
         app.status = None;
         app.sync = Some(runtime);
@@ -3976,13 +4440,13 @@ mod tests {
         let mut app = app_with_sync_screen();
         app.screen = Screen::Settings {
             tab: SettingsTab::General,
-            origin: SeriesOrigin::Dashboard,
+            origin: SeriesOrigin::Budget,
         };
         handle_settings_key(
             &mut app,
             key(KeyCode::Tab),
             SettingsTab::General,
-            SeriesOrigin::Dashboard,
+            SeriesOrigin::Budget,
         )
         .unwrap();
         assert!(matches!(
@@ -4165,6 +4629,51 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn buffer_column(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        needle: &str,
+    ) -> Option<u16> {
+        let buffer = terminal.backend().buffer();
+        let symbols: Vec<String> = needle
+            .chars()
+            .map(|character| character.to_string())
+            .collect();
+        let last_start = buffer.area.width.saturating_sub(symbols.len() as u16);
+        for y in 0..buffer.area.height {
+            for x in 0..=last_start {
+                if symbols
+                    .iter()
+                    .enumerate()
+                    .all(|(offset, symbol)| buffer[(x + offset as u16, y)].symbol() == symbol)
+                {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    }
+
+    fn buffer_contains_at_column(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        needle: &str,
+        column: u16,
+    ) -> bool {
+        let buffer = terminal.backend().buffer();
+        let symbols: Vec<String> = needle
+            .chars()
+            .map(|character| character.to_string())
+            .collect();
+        if column.saturating_add(symbols.len() as u16) > buffer.area.width {
+            return false;
+        }
+        (0..buffer.area.height).any(|y| {
+            symbols
+                .iter()
+                .enumerate()
+                .all(|(offset, symbol)| buffer[(column + offset as u16, y)].symbol() == symbol)
+        })
     }
 
     #[test]

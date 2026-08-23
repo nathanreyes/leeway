@@ -19,7 +19,7 @@ use std::cell::Cell;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::{App, DashFocus, PlanFocus, Screen, theme};
+use crate::{App, BudgetTarget, DashFocus, PlanFocus, Screen, theme};
 
 /// Every focusable region across the app that has help, plus the app-level
 /// `Overview`. Each variant maps to one Markdown file in `markdown()`.
@@ -101,20 +101,22 @@ impl HelpState {
 /// Resolve the topic for the box the user is currently focused on.
 pub fn topic_for(app: &App) -> HelpTopic {
     match &app.screen {
-        Screen::Dashboard => match app.dash_focus {
-            DashFocus::Header => HelpTopic::DashHeader,
-            DashFocus::Income => HelpTopic::DashIncome,
-            DashFocus::Expenses => HelpTopic::DashExpenses,
-            DashFocus::Envelopes => HelpTopic::DashEnvelopes,
-            DashFocus::Accounts => HelpTopic::DashAccounts,
+        Screen::Budget => match app.budget_target {
+            BudgetTarget::Month { .. } => match app.dash_focus {
+                DashFocus::Header => HelpTopic::DashHeader,
+                DashFocus::Income => HelpTopic::DashIncome,
+                DashFocus::Expenses => HelpTopic::DashExpenses,
+                DashFocus::Envelopes => HelpTopic::DashEnvelopes,
+                DashFocus::Accounts => HelpTopic::DashAccounts,
+            },
+            BudgetTarget::Plan { .. } => match app.plan_focus {
+                PlanFocus::List => HelpTopic::PlansList,
+                PlanFocus::Income => HelpTopic::PlanIncome,
+                PlanFocus::Expenses => HelpTopic::PlanExpenses,
+                PlanFocus::Envelopes => HelpTopic::PlanEnvelopes,
+            },
         },
         Screen::Series { .. } => HelpTopic::Series,
-        Screen::Plans => match app.plan_focus {
-            PlanFocus::List => HelpTopic::PlansList,
-            PlanFocus::Income => HelpTopic::PlanIncome,
-            PlanFocus::Expenses => HelpTopic::PlanExpenses,
-            PlanFocus::Envelopes => HelpTopic::PlanEnvelopes,
-        },
         Screen::Settings { .. } => HelpTopic::Overview,
     }
 }
@@ -125,27 +127,27 @@ pub fn topic_for(app: &App) -> HelpTopic {
 /// hidden and focus can't land on it.
 pub fn screen_ring(app: &App) -> Vec<HelpTopic> {
     match &app.screen {
-        Screen::Dashboard => {
-            let mut ring = vec![
-                HelpTopic::DashHeader,
-                HelpTopic::DashIncome,
-                HelpTopic::DashExpenses,
-                HelpTopic::DashEnvelopes,
-            ];
-            if app.dash_focus == DashFocus::Accounts {
-                // Focus only rests on Accounts when the panel is present, so its
-                // presence is a reliable "current month" signal here.
-                ring.push(HelpTopic::DashAccounts);
+        Screen::Budget => match app.budget_target {
+            BudgetTarget::Month { .. } => {
+                let mut ring = vec![
+                    HelpTopic::DashHeader,
+                    HelpTopic::DashIncome,
+                    HelpTopic::DashExpenses,
+                    HelpTopic::DashEnvelopes,
+                ];
+                if app.dash_focus == DashFocus::Accounts {
+                    ring.push(HelpTopic::DashAccounts);
+                }
+                ring
             }
-            ring
-        }
+            BudgetTarget::Plan { .. } => vec![
+                HelpTopic::PlansList,
+                HelpTopic::PlanIncome,
+                HelpTopic::PlanExpenses,
+                HelpTopic::PlanEnvelopes,
+            ],
+        },
         Screen::Series { .. } => vec![HelpTopic::Series],
-        Screen::Plans => vec![
-            HelpTopic::PlansList,
-            HelpTopic::PlanIncome,
-            HelpTopic::PlanExpenses,
-            HelpTopic::PlanEnvelopes,
-        ],
         Screen::Settings { .. } => vec![HelpTopic::Overview],
     }
 }

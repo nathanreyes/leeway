@@ -5,6 +5,7 @@
 
 use crate::calc;
 use crate::currency::Currency;
+use crate::forecast::{self, ResolvedPlanEntry};
 use crate::models::*;
 use crate::money::Money;
 use crate::queries;
@@ -78,6 +79,8 @@ pub fn stamp(
     let tx = conn.transaction()?;
     let month_id = new_id();
 
+    let entries = forecast::resolve_plan_entries(&tx, plan_id, start_date, days_in_month)?;
+
     tx.execute(
         "INSERT INTO month (id, plan_id, label, start_date, days_in_month)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -91,14 +94,10 @@ pub fn stamp(
     )?;
 
     // `&tx` coerces to `&Connection`, so query/insert helpers run inside this transaction.
-    // Seasonal items (birthday gifts, an annual premium) only stamp in the months their
-    // plan marks active; the instance that lands carries no trace of the restriction.
-    let month_no = start_date.month();
-    for entry in queries::load_plan_entries(&tx, plan_id)? {
-        if !entry.active_months.contains(month_no) {
-            continue;
-        }
-        insert_instance_from_entry(&tx, &month_id, &entry, days_in_month)?;
+    // The resolver has already removed off-season entries and chosen one concrete amount
+    // for each remaining item. The instance carries no live link to that choice.
+    for entry in entries {
+        insert_instance_from_entry(&tx, &month_id, &entry)?;
     }
 
     tx.commit()?;
@@ -111,17 +110,13 @@ pub fn stamp(
 fn insert_instance_from_entry(
     conn: &Connection,
     month_id: &str,
-    entry: &PlanEntry,
-    days_in_month: i64,
+    resolved: &ResolvedPlanEntry,
 ) -> Result<()> {
+    let entry = &resolved.entry;
     let s = &entry.series;
     match s.kind {
         Kind::Envelope => {
-            let amount = calc::monthlyized_envelope_amount(
-                entry.amount,
-                s.period_type.unwrap_or(PeriodType::Monthly),
-                days_in_month,
-            );
+            let amount = resolved.amount;
             conn.execute(
                 "INSERT INTO envelope
                    (id, month_id, series_id, label, amount_cents,
@@ -153,8 +148,8 @@ fn insert_instance_from_entry(
                     s.id,
                     s.label,
                     s.direction.unwrap_or(Direction::Out),
-                    entry.amount,
-                    entry.amount,
+                    resolved.amount,
+                    resolved.amount,
                 ],
             )?;
         }
@@ -164,22 +159,18 @@ fn insert_instance_from_entry(
 
 // --- Restamp: Merge / Replace --------------------------------------------------
 
-/// The plan entries that apply to an already-stamped month, plus that month's day count.
-/// Both restamp paths need the same two facts and both derive them from one `month` row —
-/// a fresh `stamp` gets them from its arguments instead.
+/// Resolve the plan entries that apply to an already-stamped month. Both restamp paths
+/// derive the target date and day count from the same `month` row.
 fn active_entries_for_month(
     conn: &Connection,
     month_id: &str,
     plan_id: &str,
-) -> Result<(Vec<PlanEntry>, i64)> {
+) -> Result<Vec<ResolvedPlanEntry>> {
     let month = queries::month_by_id(conn, month_id)?
         .with_context(|| format!("month not found: {month_id}"))?;
-    let month_no = month.start_date.month();
-    let entries = queries::load_plan_entries(conn, plan_id)?
-        .into_iter()
-        .filter(|entry| entry.active_months.contains(month_no))
-        .collect();
-    Ok((entries, month.days_in_month))
+    let entries =
+        forecast::resolve_plan_entries(conn, plan_id, month.start_date, month.days_in_month)?;
+    Ok(entries)
 }
 
 /// Legacy predicate for seriesless hand-entered data — standalone one-offs,
@@ -243,32 +234,32 @@ pub fn month_has_items_outside_plan(
 /// standing from an earlier stamp survives untouched.
 pub fn restamp_merge(conn: &mut Connection, month_id: &str, plan_id: &str) -> Result<()> {
     let tx = conn.transaction()?;
-    let (entries, days_in_month) = active_entries_for_month(&tx, month_id, plan_id)?;
+    let entries = active_entries_for_month(&tx, month_id, plan_id)?;
     let txns = queries::load_txns(&tx, month_id)?;
     let envelopes = queries::load_envelopes(&tx, month_id)?;
     let mut matched_txns: HashSet<String> = HashSet::new();
     let mut matched_envelopes: HashSet<String> = HashSet::new();
 
     for entry in &entries {
-        match entry.series.kind {
+        match entry.entry.series.kind {
             Kind::Envelope => {
                 if let Some(envelope) =
-                    next_matching_envelope(&envelopes, &matched_envelopes, &entry.series.id)
+                    next_matching_envelope(&envelopes, &matched_envelopes, &entry.entry.series.id)
                 {
                     matched_envelopes.insert(envelope.id.clone());
-                    refresh_envelope(&tx, &envelope.id, entry, days_in_month)?;
+                    refresh_envelope(&tx, &envelope.id, entry)?;
                 } else {
-                    insert_instance_from_entry(&tx, month_id, entry, days_in_month)?;
+                    insert_instance_from_entry(&tx, month_id, entry)?;
                 }
             }
             Kind::Transaction => {
-                if let Some(txn) = next_matching_txn(&txns, &matched_txns, &entry.series.id) {
+                if let Some(txn) = next_matching_txn(&txns, &matched_txns, &entry.entry.series.id) {
                     matched_txns.insert(txn.id.clone());
                     if !txn.settled {
                         refresh_txn(&tx, &txn.id, entry)?;
                     }
                 } else {
-                    insert_instance_from_entry(&tx, month_id, entry, days_in_month)?;
+                    insert_instance_from_entry(&tx, month_id, entry)?;
                 }
             }
         }
@@ -294,30 +285,30 @@ pub fn restamp_replace(
     keep_outside_plan: bool,
 ) -> Result<()> {
     let tx = conn.transaction()?;
-    let (entries, days_in_month) = active_entries_for_month(&tx, month_id, plan_id)?;
+    let entries = active_entries_for_month(&tx, month_id, plan_id)?;
     let txns = queries::load_txns(&tx, month_id)?;
     let envelopes = queries::load_envelopes(&tx, month_id)?;
     let mut matched_txns: HashSet<String> = HashSet::new();
     let mut matched_envelopes: HashSet<String> = HashSet::new();
 
     for entry in &entries {
-        match entry.series.kind {
+        match entry.entry.series.kind {
             Kind::Envelope => {
                 if let Some(envelope) =
-                    next_matching_envelope(&envelopes, &matched_envelopes, &entry.series.id)
+                    next_matching_envelope(&envelopes, &matched_envelopes, &entry.entry.series.id)
                 {
                     matched_envelopes.insert(envelope.id.clone());
-                    refresh_envelope(&tx, &envelope.id, entry, days_in_month)?;
+                    refresh_envelope(&tx, &envelope.id, entry)?;
                 } else {
-                    insert_instance_from_entry(&tx, month_id, entry, days_in_month)?;
+                    insert_instance_from_entry(&tx, month_id, entry)?;
                 }
             }
             Kind::Transaction => {
-                if let Some(txn) = next_matching_txn(&txns, &matched_txns, &entry.series.id) {
+                if let Some(txn) = next_matching_txn(&txns, &matched_txns, &entry.entry.series.id) {
                     matched_txns.insert(txn.id.clone());
                     refresh_txn(&tx, &txn.id, entry)?;
                 } else {
-                    insert_instance_from_entry(&tx, month_id, entry, days_in_month)?;
+                    insert_instance_from_entry(&tx, month_id, entry)?;
                 }
             }
         }
@@ -396,18 +387,10 @@ fn occurrence_key(kind: Kind, series_id: &str) -> String {
 }
 
 /// Reset an envelope instance to a plan entry's planned values.
-fn refresh_envelope(
-    conn: &Connection,
-    id: &str,
-    entry: &PlanEntry,
-    days_in_month: i64,
-) -> Result<()> {
+fn refresh_envelope(conn: &Connection, id: &str, resolved: &ResolvedPlanEntry) -> Result<()> {
+    let entry = &resolved.entry;
     let s = &entry.series;
-    let amount = calc::monthlyized_envelope_amount(
-        entry.amount,
-        s.period_type.unwrap_or(PeriodType::Monthly),
-        days_in_month,
-    );
+    let amount = resolved.amount;
     conn.execute(
         "UPDATE envelope
          SET amount_cents = ?1, stamped_amount_cents = ?2, label = ?3,
@@ -426,7 +409,8 @@ fn refresh_envelope(
 }
 
 /// Reset a standalone txn instance to a plan entry's planned values, unsettling it.
-fn refresh_txn(conn: &Connection, id: &str, entry: &PlanEntry) -> Result<()> {
+fn refresh_txn(conn: &Connection, id: &str, resolved: &ResolvedPlanEntry) -> Result<()> {
+    let entry = &resolved.entry;
     let s = &entry.series;
     conn.execute(
         "UPDATE txn
@@ -434,8 +418,8 @@ fn refresh_txn(conn: &Connection, id: &str, entry: &PlanEntry) -> Result<()> {
              direction = ?4, settled = 0, date_paid = NULL
          WHERE id = ?5",
         rusqlite::params![
-            entry.amount,
-            entry.amount,
+            resolved.amount,
+            resolved.amount,
             s.label,
             s.direction.unwrap_or(Direction::Out),
             id
@@ -722,6 +706,20 @@ pub fn set_item_amount(conn: &Connection, item_id: &str, amount: Money) -> Resul
     conn.execute(
         "UPDATE plan_item SET amount_cents = ?1 WHERE id = ?2",
         rusqlite::params![amount, item_id],
+    )?;
+    Ok(())
+}
+
+/// Remember which amount source this plan item should try on its next stamp. Historical
+/// methods fall back to the static amount when their required observations are absent.
+pub fn set_item_forecast_method(
+    conn: &Connection,
+    item_id: &str,
+    method: ForecastMethod,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE plan_item SET forecast_method = ?1 WHERE id = ?2",
+        rusqlite::params![method, item_id],
     )?;
     Ok(())
 }

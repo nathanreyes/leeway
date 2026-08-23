@@ -1,7 +1,15 @@
-# Month header
+# Months
 
-The header sets which month the dashboard is showing. Leeway works one month at a time: every total below is for this period.
+The Months section sets which month the budget workspace shows. Leeway works one month at a time: every total in the detail area is for this period.
 
 ## How it fits
 
-Move back to review a month that's closed, or forward to plan ahead. A month you haven't stamped from a plan yet shows a prompt instead of panels — stamping fills it in.
+Move through stamped months to review old budgets or plan ahead. A month you reach with `m` can appear before it has been stamped. Choose a plan below it and press `s` to fill it in.
+
+## Keys
+
+- `j` / `k` — move through months and plans
+- `m` — focus the Months section
+- `p` — focus the Plans section
+- `g` — go to any month
+- `Tab` — move into the selected month's panels

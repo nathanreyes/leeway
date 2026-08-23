@@ -8,6 +8,7 @@
 pub mod calc;
 pub mod currency;
 pub mod db;
+pub mod forecast;
 pub mod models;
 pub mod money;
 pub mod ops;

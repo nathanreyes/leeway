@@ -590,8 +590,6 @@ fn draw_detail_footer(frame: &mut Frame, area: Rect, app: &App, detail: &SeriesD
         Span::raw(" all series  "),
         key(" h "),
         Span::raw(" help  "),
-        key(" P "),
-        Span::raw(" plans  "),
         key(" Esc "),
         Span::raw(" back  "),
         key(" , "),
@@ -1004,8 +1002,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &SeriesPageView) 
     let right = Line::from(vec![
         key(" h "),
         Span::raw(" help  "),
-        key(" P "),
-        Span::raw(" plans  "),
         key(" Esc "),
         Span::raw(" back  "),
         key(" , "),
