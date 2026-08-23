@@ -100,14 +100,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent, summaries: &[PlanSummary]) -> R
         KeyCode::Char('s') => {
             if let Some(s) = selected {
                 let today = Local::now().date_naive();
-                let suggested = crate::suggested_stamp_label(&app.conn, today)?;
-                app.open_text(
-                    format!("Stamp “{}” onto month (YYYY-MM)", s.plan.name),
-                    suggested,
-                    PromptKind::StampMonth {
-                        plan_id: s.plan.id.clone(),
-                    },
-                );
+                crate::open_stamp_review(app, &s.plan.id, &s.plan.name, today)?;
             }
         }
         // `Enter` is intentionally inert: the detail already tracks the selected plan live, so
@@ -354,7 +347,7 @@ pub fn draw(frame: &mut Frame, app: &App, summaries: &[PlanSummary], entries: &[
         ])
     };
     let nav_hints = Line::from(vec![
-        key(" Tab "),
+        key(" tab "),
         Span::raw(" pane  "),
         key(" h "),
         Span::raw(" help  "),

@@ -113,12 +113,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
             DashFocus::Header => {}
         },
 
-        // Enter opens an envelope's transactions modal; otherwise it performs the focused
-        // row's primary action. Space always keeps the lightweight primary action.
-        KeyCode::Enter if app.dash_focus == DashFocus::Envelopes => {
-            open_envelope_modal(app, view);
+        // Enter follows a month item to its shared series. Legacy one-off rows have no
+        // series, so Enter leaves them in place.
+        KeyCode::Enter
+            if matches!(
+                app.dash_focus,
+                DashFocus::Income | DashFocus::Expenses | DashFocus::Envelopes
+            ) =>
+        {
+            if let Some(series_id) = selected_series_id(app, view) {
+                app.open_series_detail(series_id);
+            }
         }
-        KeyCode::Enter | KeyCode::Char(' ') => act_on_focus(app, view)?,
+        // Space clears income/expenses or opens an envelope's transactions. Account keys
+        // keep accepting both Enter and Space.
+        KeyCode::Char(' ') => act_on_focus(app, view)?,
+        KeyCode::Enter if app.dash_focus == DashFocus::Accounts => act_on_focus(app, view)?,
 
         // `n` = create something in the focused panel.
         KeyCode::Char('n') => {
@@ -138,7 +148,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent, view: &Option<MonthView>) -> Res
         KeyCode::Char('a') => edit_amount(app, view), // amount
         KeyCode::Char('m') => cycle_mode(app, view)?, // envelope mode
         KeyCode::Char('p') => cycle_period(app, view)?, // envelope period type
-        KeyCode::Char('s') => feed_spending(app, view), // record an envelope transaction
         KeyCode::Char('x') => delete_selected(app, view), // delete this month's row
 
         // Carry balance is account-only: checking reserves cash, cards forgive deferred debt.
@@ -424,21 +433,6 @@ fn cycle_period(app: &mut App, view: &MonthView) -> Result<()> {
     Ok(())
 }
 
-/// `s`: record a transaction in the selected envelope. Automatic envelopes keep it as a
-/// record; manual envelopes also use it to calculate their consumed amount.
-fn feed_spending(app: &mut App, view: &MonthView) {
-    if let Some(e) = selected_env(app, view) {
-        app.open_text(
-            format!("Transaction label for {}", e.envelope.display_label()),
-            String::new(),
-            PromptKind::EnvelopeSpendLabel {
-                envelope_id: e.envelope.id.clone(),
-                month_id: view.month.id.clone(),
-            },
-        );
-    }
-}
-
 /// `x`: delete the selected month instance (with a confirm). A stamped row carries its
 /// series id for trend/restamp matching, but it is still this month's copy.
 fn delete_selected(app: &mut App, view: &MonthView) {
@@ -483,8 +477,8 @@ fn step_month(app: &mut App, delta: i32) {
     app.dash_acct_sel = 0;
 }
 
-/// Do the focused panel's lightweight action: settle a bill, record an envelope transaction,
-/// or open the balance-edit prompt. Enter opens an envelope's full detail screen instead.
+/// Do the focused panel's row action: settle income or a bill, open an envelope's
+/// transactions, or open the balance-edit prompt.
 fn act_on_focus(app: &mut App, view: &MonthView) -> Result<()> {
     match app.dash_focus {
         DashFocus::Income | DashFocus::Expenses => {
@@ -492,8 +486,7 @@ fn act_on_focus(app: &mut App, view: &MonthView) -> Result<()> {
                 ops::toggle_settled(&app.conn, &txn.id, txn.settled)?;
             }
         }
-        // Space records a transaction without leaving the dashboard. Enter opens details.
-        DashFocus::Envelopes => feed_spending(app, view),
+        DashFocus::Envelopes => open_envelope_modal(app, view),
         DashFocus::Accounts => {
             if let Some(acct) = view.accounts.get(app.dash_acct_sel) {
                 match acct.account_type {
@@ -697,7 +690,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
         DashFocus::Header => {
             let mut spans = Vec::new();
             if view.is_some() {
-                spans.push(key(" Tab "));
+                spans.push(key(" tab "));
                 spans.push(Span::raw(" panel  "));
             }
             spans.extend([
@@ -709,12 +702,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             Line::from(spans)
         }
         DashFocus::Income | DashFocus::Expenses => Line::from(vec![
-            key(" Tab "),
+            key(" tab "),
             Span::raw(" panel  "),
             key(" j/k "),
             Span::raw(" move  "),
-            key(" Enter "),
-            Span::raw(" paid  "),
+            key(" enter "),
+            Span::raw(" series  "),
+            key(" space "),
+            Span::raw(" clear  "),
             key(" n "),
             Span::raw(" new  "),
             key(" a "),
@@ -723,11 +718,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             Span::raw(" del"),
         ]),
         DashFocus::Envelopes => Line::from(vec![
-            key(" Tab "),
+            key(" tab "),
             Span::raw(" panel  "),
             key(" j/k "),
             Span::raw(" move  "),
-            key(" Enter "),
+            key(" enter "),
+            Span::raw(" series  "),
+            key(" space "),
             Span::raw(" txns  "),
             key(" a "),
             Span::raw(" amount  "),
@@ -735,19 +732,17 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, view: &Option<MonthView
             Span::raw(" mode  "),
             key(" p "),
             Span::raw(" period  "),
-            key(" s "),
-            Span::raw(" record  "),
             key(" n "),
             Span::raw(" new  "),
             key(" x "),
             Span::raw(" del"),
         ]),
         DashFocus::Accounts => Line::from(vec![
-            key(" Tab "),
+            key(" tab "),
             Span::raw(" panel  "),
             key(" j/k "),
             Span::raw(" move  "),
-            key(" Enter "),
+            key(" enter "),
             Span::raw(" edit  "),
             key(" n "),
             Span::raw(" new  "),
@@ -787,8 +782,10 @@ pub fn footer_hints(app: &App) -> Line<'static> {
         DashFocus::Income | DashFocus::Expenses => Line::from(vec![
             key(" j/k "),
             Span::raw(" move  "),
-            key(" Enter "),
-            Span::raw(" paid  "),
+            key(" enter "),
+            Span::raw(" series  "),
+            key(" space "),
+            Span::raw(" clear  "),
             key(" n "),
             Span::raw(" new  "),
             key(" a "),
@@ -799,7 +796,9 @@ pub fn footer_hints(app: &App) -> Line<'static> {
         DashFocus::Envelopes => Line::from(vec![
             key(" j/k "),
             Span::raw(" move  "),
-            key(" Enter "),
+            key(" enter "),
+            Span::raw(" series  "),
+            key(" space "),
             Span::raw(" txns  "),
             key(" a "),
             Span::raw(" amount  "),
@@ -807,8 +806,6 @@ pub fn footer_hints(app: &App) -> Line<'static> {
             Span::raw(" mode  "),
             key(" p "),
             Span::raw(" period  "),
-            key(" s "),
-            Span::raw(" record  "),
             key(" n "),
             Span::raw(" new  "),
             key(" x "),
@@ -817,7 +814,7 @@ pub fn footer_hints(app: &App) -> Line<'static> {
         DashFocus::Accounts => Line::from(vec![
             key(" j/k "),
             Span::raw(" move  "),
-            key(" Enter "),
+            key(" enter "),
             Span::raw(" edit  "),
             key(" n "),
             Span::raw(" new  "),
@@ -1272,7 +1269,7 @@ fn key(label: &str) -> Span<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Screen;
+    use crate::{Screen, SeriesMode};
     use chrono::NaiveDate;
     use leeway::models::Kind;
     use ratatui::Terminal;
@@ -1408,8 +1405,8 @@ mod tests {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
     }
 
-    fn spend_key() -> KeyEvent {
-        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)
+    fn space_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)
     }
 
     fn direction_key() -> KeyEvent {
@@ -1547,8 +1544,9 @@ mod tests {
         terminal.draw(|frame| draw(frame, &app, &view)).unwrap();
         let text = buffer_text(&terminal);
 
-        // Enter opens the transactions modal; amount/mode/period are edited right here.
+        // Space opens the transactions modal; amount/mode/period are edited right here.
         assert!(text.contains("txns"));
+        assert!(text.contains("space"));
         assert!(text.contains("amount"));
         assert!(text.contains("mode"));
         assert!(text.contains("period"));
@@ -1848,7 +1846,74 @@ mod tests {
     }
 
     #[test]
-    fn enter_key_opens_envelope_transactions_modal() {
+    fn enter_opens_the_focused_month_item_series() {
+        let mut app = app_with_stamped_month();
+        let month_id = month_view(&app).month.id;
+        let paycheck = ops::create_series(
+            &app.conn,
+            Kind::Transaction,
+            "Paycheck",
+            Some(Direction::In),
+            None,
+            None,
+        )
+        .unwrap();
+        ops::add_series_txn_instance(&app.conn, &month_id, &paycheck, Money::from_dollars(2000.0))
+            .unwrap();
+        let view = month_view(&app);
+        app.dash_focus = DashFocus::Income;
+
+        handle_key(&mut app, enter_key(), &Some(view)).unwrap();
+
+        match &app.screen {
+            Screen::Series { state } => {
+                assert_eq!(
+                    state.mode,
+                    SeriesMode::Detail {
+                        series_id: paycheck
+                    }
+                );
+            }
+            _ => panic!("expected income series detail"),
+        }
+
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Expenses;
+        let view = month_view(&app);
+        let rent_series = selected_series_id(&app, &view).unwrap();
+
+        handle_key(&mut app, enter_key(), &Some(view)).unwrap();
+
+        match &app.screen {
+            Screen::Series { state } => assert_eq!(
+                state.mode,
+                SeriesMode::Detail {
+                    series_id: rent_series
+                }
+            ),
+            _ => panic!("expected expense series detail"),
+        }
+
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Envelopes;
+        let view = month_view(&app);
+        let dining_series = selected_series_id(&app, &view).unwrap();
+
+        handle_key(&mut app, enter_key(), &Some(view)).unwrap();
+
+        match &app.screen {
+            Screen::Series { state } => assert_eq!(
+                state.mode,
+                SeriesMode::Detail {
+                    series_id: dining_series
+                }
+            ),
+            _ => panic!("expected envelope series detail"),
+        }
+    }
+
+    #[test]
+    fn space_opens_envelope_transactions_modal() {
         let mut app = app_with_stamped_month();
         app.dash_focus = DashFocus::Envelopes;
         let view = month_view(&app);
@@ -1860,7 +1925,7 @@ mod tests {
         let expected_id = dining.envelope.id.clone();
         let expected_month_id = view.month.id.clone();
 
-        handle_key(&mut app, enter_key(), &Some(view)).unwrap();
+        handle_key(&mut app, space_key(), &Some(view)).unwrap();
 
         match &app.modal {
             Some(Modal::Envelope(manage)) => {
@@ -1871,6 +1936,57 @@ mod tests {
             _ => panic!("expected envelope transactions modal"),
         }
         assert!(matches!(app.screen, Screen::Budget));
+    }
+
+    #[test]
+    fn space_toggles_income_and_expense_cleared_state() {
+        let mut app = app_with_stamped_month();
+        let month_id = month_view(&app).month.id;
+        let paycheck = ops::create_series(
+            &app.conn,
+            Kind::Transaction,
+            "Paycheck",
+            Some(Direction::In),
+            None,
+            None,
+        )
+        .unwrap();
+        let paycheck_id = ops::add_series_txn_instance(
+            &app.conn,
+            &month_id,
+            &paycheck,
+            Money::from_dollars(2000.0),
+        )
+        .unwrap();
+        app.dash_focus = DashFocus::Income;
+        let view = month_view(&app);
+
+        handle_key(&mut app, space_key(), &Some(view)).unwrap();
+
+        let refreshed = month_view(&app);
+        let paycheck = refreshed
+            .standalone
+            .iter()
+            .find(|txn| txn.id == paycheck_id)
+            .unwrap();
+        assert!(paycheck.settled);
+
+        let mut app = app_with_stamped_month();
+        app.dash_focus = DashFocus::Expenses;
+        let view = month_view(&app);
+        let rent = selected_txn(&app, &view).unwrap();
+        let rent_id = rent.id.clone();
+        assert!(!rent.settled);
+
+        handle_key(&mut app, space_key(), &Some(view)).unwrap();
+
+        let refreshed = month_view(&app);
+        let rent = refreshed
+            .standalone
+            .iter()
+            .find(|txn| txn.id == rent_id)
+            .unwrap();
+        assert!(rent.settled);
     }
 
     #[test]
@@ -1891,55 +2007,20 @@ mod tests {
     }
 
     #[test]
-    fn spend_key_prompts_for_envelope_transaction_label() {
+    fn s_key_does_not_bypass_the_envelope_transactions_screen() {
         let mut app = app_with_stamped_month();
         app.dash_focus = DashFocus::Envelopes;
         let view = month_view(&app);
-        let dining = view
-            .envelopes
-            .iter()
-            .find(|row| row.envelope.label == "Dining")
-            .unwrap();
-        let expected_id = dining.envelope.id.clone();
-        let expected_month_id = view.month.id.clone();
 
-        handle_key(&mut app, spend_key(), &Some(view)).unwrap();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            &Some(view),
+        )
+        .unwrap();
 
-        match app.modal {
-            Some(crate::Modal::Text(prompt)) => {
-                assert_eq!(prompt.title, "Transaction label for Dining");
-                match prompt.kind {
-                    PromptKind::EnvelopeSpendLabel {
-                        envelope_id,
-                        month_id,
-                    } => {
-                        assert_eq!(envelope_id, expected_id);
-                        assert_eq!(month_id, expected_month_id);
-                    }
-                    _ => panic!("expected envelope spending label prompt"),
-                }
-            }
-            _ => panic!("expected text prompt"),
-        }
-    }
-
-    #[test]
-    fn spend_key_allows_automatic_envelope_transactions() {
-        let mut app = app_with_stamped_month();
-        app.dash_focus = DashFocus::Envelopes;
-        let view = month_view(&app);
-        let envelope_id = view.envelopes[0].envelope.id.clone();
-        ops::set_envelope_mode(&app.conn, &envelope_id, Mode::Automatic).unwrap();
-        let automatic_view = month_view(&app);
-
-        handle_key(&mut app, spend_key(), &Some(automatic_view)).unwrap();
-
-        match app.modal {
-            Some(crate::Modal::Text(prompt)) => {
-                assert_eq!(prompt.title, "Transaction label for Dining");
-            }
-            _ => panic!("expected transaction label prompt"),
-        }
+        assert!(matches!(app.screen, Screen::Budget));
+        assert!(app.modal.is_none());
     }
 
     #[test]

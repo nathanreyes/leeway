@@ -6,7 +6,7 @@ Income lists the money you expect to arrive this month — paychecks, transfers,
 
 Each row is either still expected or already received. Because Leeway forecasts the whole month, expected income already lifts what's left; marking a row received just confirms the money landed, it doesn't change the total.
 
-The row's name belongs to its Series. Press `S` on a row to inspect or rename that shared identity; every month using it follows the new name.
+Press `enter` on a row to open its Series. Press `space` to mark it received or expected. A Series name is shared, so every month using it follows a rename.
 
 ## Example
 

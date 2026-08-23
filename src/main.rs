@@ -24,7 +24,8 @@ use anim::{ChartAnimation, SummaryAnimations};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
 use leeway::models::{
-    AccountType, CreditCardEntryMode, Direction, Kind, Mode, MonthSet, PeriodType, Series, Txn,
+    AccountType, CreditCardEntryMode, Direction, ForecastMethod, Kind, Mode, MonthSet, PeriodType,
+    PlanEntry, Series, Txn,
 };
 use leeway::money::Money;
 use leeway::sync::{self, Inspection, StorageMode, SyncStatus};
@@ -40,6 +41,7 @@ use ratatui::widgets::{
 };
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -203,8 +205,7 @@ pub enum Modal {
     Confirm(Confirm),
     Choice(Choice),
     CurrencyPicker(CurrencyPicker),
-    /// Review the concrete amounts a plan will stamp into one target month. Left/right
-    /// changes a row's remembered source; Enter saves the choices and continues.
+    /// Choose target months and each plan item's amount source in one window.
     StampReview(StampReview),
     /// Manage an envelope's transactions. Shows the envelope's identity/metrics as a
     /// read-only header; the transaction list is the only focusable surface.
@@ -386,12 +387,30 @@ pub struct CurrencyPicker {
 #[derive(Clone)]
 pub struct StampReview {
     pub plan_id: String,
-    pub label: String,
-    pub start_date: NaiveDate,
-    pub days_in_month: i64,
-    pub existing_month_id: Option<String>,
-    pub selected: usize,
-    pub rows: Vec<leeway::forecast::ResolvedPlanEntry>,
+    pub plan_name: String,
+    pub year: i32,
+    pub selected_month: usize,
+    pub selected_item: usize,
+    pub focus: StampReviewFocus,
+    pub months: BTreeSet<(i32, u32)>,
+    pub existing_months: BTreeSet<(i32, u32)>,
+    pub items: Vec<StampReviewItem>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StampReviewFocus {
+    Months,
+    Items,
+}
+
+#[derive(Clone)]
+pub struct StampReviewItem {
+    pub entry: PlanEntry,
+    pub enabled: bool,
+    pub method: ForecastMethod,
+    pub methods: Vec<ForecastMethod>,
+    pub preview_amount: Option<Money>,
+    pub preview_method: Option<ForecastMethod>,
 }
 
 /// The deferred effect a chosen option runs. Carries the ids it needs so the action is
@@ -404,17 +423,20 @@ pub enum ModalAction {
     RestampMerge {
         month_id: String,
         plan_id: String,
+        excluded_item_ids: Vec<String>,
     },
     /// Replace, but scope (wipe vs keep items outside the target plan) is decided in a
     /// follow-up choice.
     RestampReplace {
         month_id: String,
         plan_id: String,
+        excluded_item_ids: Vec<String>,
     },
     RestampReplaceScoped {
         month_id: String,
         plan_id: String,
         keep_outside_plan: bool,
+        excluded_item_ids: Vec<String>,
     },
     SetSeriesRange {
         range: SeriesTimeRange,
@@ -473,9 +495,6 @@ pub enum PromptKind {
         destination: AddDestination,
         block: BudgetBlock,
         selection: SeriesSelection,
-    },
-    StampMonth {
-        plan_id: String,
     },
     /// Navigate the dashboard to a typed `YYYY-MM` period (view only — no stamping).
     GoToMonth,
@@ -651,6 +670,19 @@ pub struct App {
 }
 
 impl App {
+    fn open_series_detail(&mut self, series_id: String) {
+        let Some(origin) = SeriesOrigin::from_screen(&self.screen) else {
+            return;
+        };
+        self.screen = Screen::Series {
+            state: SeriesScreen {
+                mode: SeriesMode::Detail { series_id },
+                origin,
+            },
+        };
+        self.status = None;
+    }
+
     fn return_from_series(&mut self) {
         let origin = match &self.screen {
             Screen::Series { state } => Some(state.origin.clone()),
@@ -1338,7 +1370,7 @@ fn draw_settings(frame: &mut Frame, app: &App, tab: SettingsTab) {
         }
     };
     let global = Line::from(vec![
-        modal_key(" Tab "),
+        modal_key(" tab "),
         Span::raw(" switch tab  "),
         modal_key(" Esc "),
         Span::raw(" back  "),
@@ -1497,7 +1529,7 @@ fn general_tab_hints() -> Line<'static> {
     Line::from(vec![
         modal_key(" j/k "),
         Span::raw(" move  "),
-        modal_key(" Enter "),
+        modal_key(" enter "),
         Span::raw(" change"),
     ])
 }
@@ -1874,81 +1906,194 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
 }
 
 fn handle_stamp_review_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let mut refresh_preview = false;
     match key.code {
         KeyCode::Esc => app.modal = None,
+        KeyCode::Tab | KeyCode::BackTab => {
+            if let Some(Modal::StampReview(review)) = &mut app.modal {
+                review.focus = match review.focus {
+                    StampReviewFocus::Months => StampReviewFocus::Items,
+                    StampReviewFocus::Items => StampReviewFocus::Months,
+                };
+            }
+        }
         KeyCode::Char('j') | KeyCode::Down => {
-            if let Some(Modal::StampReview(review)) = &mut app.modal
-                && review.selected + 1 < review.rows.len()
-            {
-                review.selected += 1;
+            if let Some(Modal::StampReview(review)) = &mut app.modal {
+                match review.focus {
+                    StampReviewFocus::Months if review.selected_month < 11 => {
+                        review.selected_month += 1;
+                        refresh_preview = true;
+                    }
+                    StampReviewFocus::Items if review.selected_item + 1 < review.items.len() => {
+                        review.selected_item += 1;
+                    }
+                    _ => {}
+                }
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
             if let Some(Modal::StampReview(review)) = &mut app.modal {
-                review.selected = review.selected.saturating_sub(1);
+                match review.focus {
+                    StampReviewFocus::Months => {
+                        review.selected_month = review.selected_month.saturating_sub(1);
+                        refresh_preview = true;
+                    }
+                    StampReviewFocus::Items => {
+                        review.selected_item = review.selected_item.saturating_sub(1);
+                    }
+                }
             }
         }
-        KeyCode::Left => cycle_stamp_method(app, -1),
-        KeyCode::Right | KeyCode::Char('f') => cycle_stamp_method(app, 1),
+        KeyCode::Left => {
+            if let Some(Modal::StampReview(review)) = &mut app.modal {
+                match review.focus {
+                    StampReviewFocus::Months => {
+                        review.year -= 1;
+                        refresh_preview = true;
+                    }
+                    StampReviewFocus::Items => {
+                        cycle_stamp_method(review, -1);
+                        refresh_preview = true;
+                    }
+                }
+            }
+        }
+        KeyCode::Right => {
+            if let Some(Modal::StampReview(review)) = &mut app.modal {
+                match review.focus {
+                    StampReviewFocus::Months => {
+                        review.year += 1;
+                        refresh_preview = true;
+                    }
+                    StampReviewFocus::Items => {
+                        cycle_stamp_method(review, 1);
+                        refresh_preview = true;
+                    }
+                }
+            }
+        }
+        KeyCode::Char('f') => {
+            if let Some(Modal::StampReview(review)) = &mut app.modal
+                && review.focus == StampReviewFocus::Items
+            {
+                cycle_stamp_method(review, 1);
+                refresh_preview = true;
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(Modal::StampReview(review)) = &mut app.modal {
+                match review.focus {
+                    StampReviewFocus::Months => {
+                        let target = (review.year, review.selected_month as u32 + 1);
+                        if !review.months.remove(&target) {
+                            review.months.insert(target);
+                        }
+                    }
+                    StampReviewFocus::Items => {
+                        if let Some(item) = review.items.get_mut(review.selected_item) {
+                            item.enabled = !item.enabled;
+                            refresh_preview = true;
+                        }
+                    }
+                }
+            }
+        }
         KeyCode::Enter => confirm_stamp_review(app)?,
         _ => {}
+    }
+    if refresh_preview {
+        refresh_stamp_preview(app)?;
     }
     Ok(())
 }
 
-fn cycle_stamp_method(app: &mut App, delta: i32) {
-    let Some(Modal::StampReview(review)) = &mut app.modal else {
+fn cycle_stamp_method(review: &mut StampReview, delta: i32) {
+    let Some(item) = review.items.get_mut(review.selected_item) else {
         return;
     };
-    let Some(row) = review.rows.get_mut(review.selected) else {
-        return;
-    };
-    if row.options.len() <= 1 {
-        let option = row.options[0];
-        row.entry.forecast_method = option.method;
-        row.amount = option.amount;
-        row.used_method = option.method;
-        return;
+    let current = if item.enabled {
+        item.methods
+            .iter()
+            .position(|method| *method == item.method)
+            .unwrap_or(0)
+            + 1
+    } else {
+        0
+    } as i32;
+    let next = (current + delta).rem_euclid(item.methods.len() as i32 + 1) as usize;
+    item.enabled = next != 0;
+    if let Some(method) = next
+        .checked_sub(1)
+        .and_then(|index| item.methods.get(index))
+    {
+        item.method = *method;
     }
-    let current = row
-        .options
-        .iter()
-        .position(|option| option.method == row.entry.forecast_method)
-        .unwrap_or(0) as i32;
-    let next = (current + delta).rem_euclid(row.options.len() as i32) as usize;
-    let option = row.options[next];
-    row.entry.forecast_method = option.method;
-    row.amount = option.amount;
-    row.used_method = option.method;
 }
 
 fn confirm_stamp_review(app: &mut App) -> Result<()> {
+    let Some(Modal::StampReview(review)) = &app.modal else {
+        return Ok(());
+    };
+    if review.months.is_empty() {
+        app.status = Some("Check at least one month".into());
+        return Ok(());
+    }
+    let mut existing = Vec::new();
+    for &(year, month) in &review.months {
+        let label = format!("{year:04}-{month:02}");
+        if let Some(month_id) = queries::month_id_for_label(&app.conn, &label)? {
+            existing.push((label, month_id));
+        }
+    }
+    if !existing.is_empty() && review.months.len() > 1 {
+        app.status = Some("Uncheck stamped months before stamping a batch".into());
+        return Ok(());
+    }
+
     let Some(Modal::StampReview(review)) = app.modal.take() else {
         return Ok(());
     };
-    for row in &review.rows {
-        ops::set_item_forecast_method(&app.conn, &row.entry.item_id, row.entry.forecast_method)?;
+    for item in &review.items {
+        ops::set_item_forecast_method(&app.conn, &item.entry.item_id, item.method)?;
     }
+    let excluded_item_ids: Vec<String> = review
+        .items
+        .iter()
+        .filter(|item| !item.enabled)
+        .map(|item| item.entry.item_id.clone())
+        .collect();
 
-    if let Some(month_id) = review.existing_month_id {
-        open_restamp_choice(app, &review.label, month_id, review.plan_id);
+    if let Some((label, month_id)) = existing.pop() {
+        let &(year, month) = review.months.first().expect("checked month");
+        app.viewed_year = year;
+        app.viewed_month = month;
+        open_restamp_choice(app, &label, month_id, review.plan_id, excluded_item_ids);
         return Ok(());
     }
 
-    ops::stamp(
-        &mut app.conn,
-        &review.plan_id,
-        &review.label,
-        review.start_date,
-        review.days_in_month,
-    )?;
+    let targets: Vec<(String, NaiveDate, i64)> = review
+        .months
+        .iter()
+        .map(|&(year, month)| {
+            (
+                format!("{year:04}-{month:02}"),
+                NaiveDate::from_ymd_opt(year, month, 1).expect("valid stamp month"),
+                ops::days_in_month(year, month),
+            )
+        })
+        .collect();
+    ops::stamp_batch_filtered(&mut app.conn, &review.plan_id, &targets, &excluded_item_ids)?;
+    let &(year, month) = review.months.last().expect("checked month");
     reset_dashboard_selections(app);
-    app.budget_target = BudgetTarget::Month {
-        year: review.start_date.year(),
-        month: review.start_date.month(),
-    };
+    app.viewed_year = year;
+    app.viewed_month = month;
+    app.budget_target = BudgetTarget::Month { year, month };
     app.screen = Screen::Budget;
-    app.status = Some(format!("Stamped {}", review.label));
+    app.status = Some(if review.months.len() == 1 {
+        format!("Stamped {year:04}-{month:02}")
+    } else {
+        format!("Stamped {} months", review.months.len())
+    });
     Ok(())
 }
 
@@ -2141,11 +2286,19 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
                 PromptKind::NewAccountName { account_type },
             );
         }
-        ModalAction::RestampMerge { month_id, plan_id } => {
-            ops::restamp_merge(&mut app.conn, &month_id, &plan_id)?;
+        ModalAction::RestampMerge {
+            month_id,
+            plan_id,
+            excluded_item_ids,
+        } => {
+            ops::restamp_merge_filtered(&mut app.conn, &month_id, &plan_id, &excluded_item_ids)?;
             finish_restamp(app, "Merged plan into the month");
         }
-        ModalAction::RestampReplace { month_id, plan_id } => {
+        ModalAction::RestampReplace {
+            month_id,
+            plan_id,
+            excluded_item_ids,
+        } => {
             if ops::month_has_items_outside_plan(&app.conn, &month_id, &plan_id)? {
                 app.open_choice(
                     "This month has items outside this plan. Replace how?",
@@ -2157,6 +2310,7 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
                                 month_id: month_id.clone(),
                                 plan_id: plan_id.clone(),
                                 keep_outside_plan: false,
+                                excluded_item_ids: excluded_item_ids.clone(),
                             }),
                         },
                         ChoiceOption {
@@ -2166,6 +2320,7 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
                                 month_id,
                                 plan_id,
                                 keep_outside_plan: true,
+                                excluded_item_ids,
                             }),
                         },
                         ChoiceOption {
@@ -2176,7 +2331,13 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
                     ],
                 );
             } else {
-                ops::restamp_replace(&mut app.conn, &month_id, &plan_id, false)?;
+                ops::restamp_replace_filtered(
+                    &mut app.conn,
+                    &month_id,
+                    &plan_id,
+                    false,
+                    &excluded_item_ids,
+                )?;
                 finish_restamp(app, "Replaced the month");
             }
         }
@@ -2184,8 +2345,15 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
             month_id,
             plan_id,
             keep_outside_plan,
+            excluded_item_ids,
         } => {
-            ops::restamp_replace(&mut app.conn, &month_id, &plan_id, keep_outside_plan)?;
+            ops::restamp_replace_filtered(
+                &mut app.conn,
+                &month_id,
+                &plan_id,
+                keep_outside_plan,
+                &excluded_item_ids,
+            )?;
             let msg = if keep_outside_plan {
                 "Replaced (kept outside-plan items)"
             } else {
@@ -2586,7 +2754,6 @@ fn submit_text(app: &mut App) -> Result<()> {
             Ok(months) => ops::set_item_active_months(&app.conn, &id, months)?,
             Err(message) => app.status = Some(message),
         },
-        PromptKind::StampMonth { plan_id } => stamp_from_input(app, &plan_id, &text)?,
         PromptKind::GoToMonth => match parse_year_month(&text) {
             Some((year, month)) => {
                 app.viewed_year = year;
@@ -2968,35 +3135,115 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-/// Parse a `YYYY-MM` month and open a review of the concrete amounts that would be stamped.
-fn stamp_from_input(app: &mut App, plan_id: &str, input: &str) -> Result<()> {
-    let Some((year, month)) = parse_year_month(input) else {
-        app.status = Some(format!("Enter a month as YYYY-MM (got “{input}”)"));
-        return Ok(());
+pub(crate) fn open_stamp_review(
+    app: &mut App,
+    plan_id: &str,
+    plan_name: &str,
+    today: NaiveDate,
+) -> Result<()> {
+    let (default_year, default_month) = if today.month() == 12 {
+        (today.year() + 1, 1)
+    } else {
+        (today.year(), today.month() + 1)
     };
-    let label = format!("{year:04}-{month:02}");
-
-    // Land the dashboard on the month we're about to stamp (or restamp), so the result is
-    // visible the moment we switch back to it — even when it's a future or past period.
-    app.viewed_year = year;
-    app.viewed_month = month;
-
-    let start = NaiveDate::from_ymd_opt(year, month, 1).expect("validated y-m");
-    let days = ops::days_in_month(year, month);
-    let rows = leeway::forecast::resolve_plan_entries(&app.conn, plan_id, start, days)?;
+    let entries = queries::load_plan_entries(&app.conn, plan_id)?;
+    let mut occurrences = HashMap::<String, usize>::new();
+    for entry in &entries {
+        *occurrences.entry(entry.series.id.clone()).or_default() += 1;
+    }
+    let items = entries
+        .into_iter()
+        .map(|entry| {
+            let supports_history = occurrences.get(&entry.series.id) == Some(&1)
+                && match entry.series.kind {
+                    Kind::Transaction => true,
+                    Kind::Envelope => entry.series.mode == Some(Mode::Manual),
+                };
+            let methods = if supports_history {
+                vec![
+                    ForecastMethod::Static,
+                    ForecastMethod::PreviousMonth,
+                    ForecastMethod::AveragePrevious3,
+                    ForecastMethod::SameMonthLastYear,
+                    ForecastMethod::OverallAverage,
+                ]
+            } else {
+                vec![ForecastMethod::Static]
+            };
+            let method = if methods.contains(&entry.forecast_method) {
+                entry.forecast_method
+            } else {
+                ForecastMethod::Static
+            };
+            StampReviewItem {
+                entry,
+                enabled: true,
+                method,
+                methods,
+                preview_amount: None,
+                preview_method: None,
+            }
+        })
+        .collect();
+    let mut months = BTreeSet::new();
+    months.insert((default_year, default_month));
+    let existing_months = queries::months(&app.conn)?
+        .into_iter()
+        .map(|month| (month.start_date.year(), month.start_date.month()))
+        .collect();
     app.modal = Some(Modal::StampReview(StampReview {
         plan_id: plan_id.to_string(),
-        label: label.clone(),
-        start_date: start,
-        days_in_month: days,
-        existing_month_id: queries::month_id_for_label(&app.conn, &label)?,
-        selected: 0,
-        rows,
+        plan_name: plan_name.to_string(),
+        year: default_year,
+        selected_month: default_month as usize - 1,
+        selected_item: 0,
+        focus: StampReviewFocus::Months,
+        months,
+        existing_months,
+        items,
     }));
+    refresh_stamp_preview(app)
+}
+
+fn refresh_stamp_preview(app: &mut App) -> Result<()> {
+    let Some(Modal::StampReview(review)) = &app.modal else {
+        return Ok(());
+    };
+    let year = review.year;
+    let month = review.selected_month as u32 + 1;
+    let plan_id = review.plan_id.clone();
+    let start = NaiveDate::from_ymd_opt(year, month, 1).expect("valid stamp preview month");
+    let resolved = leeway::forecast::resolve_plan_entries(
+        &app.conn,
+        &plan_id,
+        start,
+        ops::days_in_month(year, month),
+    )?;
+    let resolved: HashMap<String, leeway::forecast::ResolvedPlanEntry> = resolved
+        .into_iter()
+        .map(|row| (row.entry.item_id.clone(), row))
+        .collect();
+
+    let Some(Modal::StampReview(review)) = &mut app.modal else {
+        return Ok(());
+    };
+    for item in &mut review.items {
+        let selected = resolved
+            .get(&item.entry.item_id)
+            .map(|row| row.option(item.method).unwrap_or_else(|| row.options[0]));
+        item.preview_amount = selected.map(|option| option.amount);
+        item.preview_method = selected.map(|option| option.method);
+    }
     Ok(())
 }
 
-fn open_restamp_choice(app: &mut App, label: &str, month_id: String, plan_id: String) {
+fn open_restamp_choice(
+    app: &mut App,
+    label: &str,
+    month_id: String,
+    plan_id: String,
+    excluded_item_ids: Vec<String>,
+) {
     app.open_choice(
         format!("{label} is already stamped. Restamp how?"),
         vec![
@@ -3006,12 +3253,17 @@ fn open_restamp_choice(app: &mut App, label: &str, month_id: String, plan_id: St
                 action: Some(ModalAction::RestampMerge {
                     month_id: month_id.clone(),
                     plan_id: plan_id.clone(),
+                    excluded_item_ids: excluded_item_ids.clone(),
                 }),
             },
             ChoiceOption {
                 key: 'r',
                 label: "Replace (clean slate)".into(),
-                action: Some(ModalAction::RestampReplace { month_id, plan_id }),
+                action: Some(ModalAction::RestampReplace {
+                    month_id,
+                    plan_id,
+                    excluded_item_ids,
+                }),
             },
             ChoiceOption {
                 key: 'c',
@@ -3031,23 +3283,6 @@ fn parse_year_month(input: &str) -> Option<(i32, u32)> {
     } else {
         None
     }
-}
-
-/// The default month to suggest when stamping: the month after the latest stamped one,
-/// or the current calendar month on a fresh database.
-pub(crate) fn suggested_stamp_label(conn: &Connection, today: NaiveDate) -> Result<String> {
-    let (base_year, base_month) = match queries::current_month(conn)? {
-        Some(m) => {
-            // Advance one month past the latest.
-            if m.start_date.month() == 12 {
-                (m.start_date.year() + 1, 1)
-            } else {
-                (m.start_date.year(), m.start_date.month() + 1)
-            }
-        }
-        None => (today.year(), today.month()),
-    };
-    Ok(format!("{base_year:04}-{base_month:02}"))
 }
 
 // --- Modal rendering -----------------------------------------------------------
@@ -3094,13 +3329,13 @@ fn draw_modal(frame: &mut Frame, app: &App) {
             }
             if is_card_entry {
                 body.push(Line::from(Span::styled(
-                    " Tab: available credit ↔ current balance",
+                    " tab: available credit ↔ current balance",
                     Style::default().fg(Color::Gray),
                 )));
                 body.push(Line::raw(""));
             }
             body.push(Line::from(Span::styled(
-                " Enter to confirm · Esc to cancel",
+                " enter to confirm · Esc to cancel",
                 Style::default().fg(Color::DarkGray),
             )));
             frame.render_widget(Paragraph::new(body).block(block), area);
@@ -3151,13 +3386,28 @@ fn draw_modal(frame: &mut Frame, app: &App) {
 }
 
 fn draw_stamp_review(frame: &mut Frame, review: &StampReview) {
-    let area = centered_rect(82, 82, frame.area());
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+
+    let area = centered_rect(92, 88, frame.area());
     frame.render_widget(Clear, area);
-    let block = titled_block(format!(" Stamp {} ", review.label))
+    let block = titled_block(format!(" Stamp “{}” ", review.plan_name))
         .border_style(Style::default().fg(theme::CYAN));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [intro_area, list_area, footer_area] = Layout::vertical([
+    let [intro_area, body_area, footer_area] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(0),
         Constraint::Length(2),
@@ -3166,49 +3416,96 @@ fn draw_stamp_review(frame: &mut Frame, review: &StampReview) {
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " Review amounts. Historical sources use only data before this month.",
+            " Check months, then choose a source or turn an item off.",
             Style::default().fg(Color::Gray),
         ))),
         intro_area,
     );
 
-    let items: Vec<ListItem<'_>> = review
-        .rows
+    let [months_area, items_area] =
+        Layout::horizontal([Constraint::Length(30), Constraint::Min(0)])
+            .spacing(1)
+            .areas(body_area);
+
+    let month_items: Vec<ListItem<'_>> = MONTHS
         .iter()
-        .map(|row| {
-            let selected = row
-                .option(row.entry.forecast_method)
-                .unwrap_or_else(|| row.options[0]);
-            let method = if selected.method == row.entry.forecast_method {
-                row.entry.forecast_method.label().to_string()
+        .enumerate()
+        .map(|(index, name)| {
+            let target = (review.year, index as u32 + 1);
+            let checked = if review.months.contains(&target) {
+                "[x]"
             } else {
-                format!("static · {} unavailable", row.entry.forecast_method.label())
+                "[ ]"
+            };
+            let stamped = if review.existing_months.contains(&target) {
+                "  stamped"
+            } else {
+                ""
             };
             ListItem::new(Line::from(vec![
+                Span::raw(format!(" {checked} {name:<9}")),
+                Span::styled(stamped, Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+    let mut month_state = ListState::default();
+    month_state.select(Some(review.selected_month));
+    let month_list = selectable_list(month_items).block(focusable_block(
+        format!(" Months · ← {} → ", review.year),
+        review.focus == StampReviewFocus::Months,
+    ));
+    frame.render_stateful_widget(month_list, months_area, &mut month_state);
+
+    let item_rows: Vec<ListItem<'_>> = review
+        .items
+        .iter()
+        .map(|item| {
+            let marker = if item.enabled { "[x]" } else { "[ ]" };
+            let method = if !item.enabled {
+                "off".to_string()
+            } else if item.preview_method.is_none() {
+                "not in this month".to_string()
+            } else if item.preview_method == Some(item.method) {
+                item.method.label().to_string()
+            } else {
+                format!("static · {} unavailable", item.method.label())
+            };
+            let amount = item
+                .preview_amount
+                .map(|amount| format!("{amount:>12}"))
+                .unwrap_or_else(|| "            ".into());
+            ListItem::new(Line::from(vec![
                 Span::raw(format!(
-                    " {:<28}",
-                    crate::truncate(&row.entry.series.label, 27)
+                    " {marker} {:<22}",
+                    crate::truncate(&item.entry.series.label, 21)
                 )),
-                Span::styled(
-                    format!("{:>13}", selected.amount),
-                    Style::default().fg(theme::CYAN),
-                ),
+                Span::styled(amount, Style::default().fg(theme::CYAN)),
                 Span::styled(format!("  {method}"), Style::default().fg(Color::Gray)),
             ]))
         })
         .collect();
-    let mut state = ListState::default();
-    if !items.is_empty() {
-        state.select(Some(review.selected.min(items.len() - 1)));
+    let mut item_state = ListState::default();
+    if !item_rows.is_empty() {
+        item_state.select(Some(review.selected_item.min(item_rows.len() - 1)));
     }
-    frame.render_stateful_widget(selectable_list(items), list_area, &mut state);
-    render_list_scrollbar(frame, list_area, review.rows.len(), state.offset(), true);
+    let item_list = selectable_list(item_rows).block(focusable_block(
+        format!(
+            " Plan items · preview {:04}-{:02} ",
+            review.year,
+            review.selected_month + 1
+        ),
+        review.focus == StampReviewFocus::Items,
+    ));
+    frame.render_stateful_widget(item_list, items_area, &mut item_state);
+    render_list_scrollbar(
+        frame,
+        items_area,
+        review.items.len(),
+        item_state.offset(),
+        review.focus == StampReviewFocus::Items,
+    );
 
-    let footer = if review.rows.is_empty() {
-        " Enter stamp empty plan · Esc cancel"
-    } else {
-        " j/k select · ←/→ or f source · Enter continue · Esc cancel"
-    };
+    let footer = " tab pane · j/k move · space check · ←/→ year/source · enter stamp · Esc cancel";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             footer,
@@ -3246,7 +3543,7 @@ fn draw_help_modal(frame: &mut Frame, state: &help::HelpState) {
     let footer = Line::from(vec![
         modal_key(" h "),
         Span::styled(" close  ", Style::default().fg(Color::Gray)),
-        modal_key(" Tab "),
+        modal_key(" tab "),
         Span::styled(" topic  ", Style::default().fg(Color::Gray)),
         modal_key(" o "),
         Span::styled(" overview  ", Style::default().fg(Color::Gray)),
@@ -3473,7 +3770,7 @@ fn draw_series_search_modal(frame: &mut Frame, prompt: &SeriesSearch) {
             )));
         } else {
             body.push(Line::from(vec![
-                Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::styled(" enter ", Style::default().fg(Color::Black).bg(Color::Gray)),
                 Span::raw(format!(
                     " Create new {} named \"{}\"",
                     prompt.block.noun(),
@@ -3517,7 +3814,7 @@ fn draw_series_search_modal(frame: &mut Frame, prompt: &SeriesSearch) {
 
     body.push(Line::raw(""));
     body.push(Line::from(Span::styled(
-        " Enter to select/create · ↑/↓ to choose · Esc to cancel",
+        " enter to select/create · ↑/↓ to choose · Esc to cancel",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -3598,7 +3895,7 @@ fn draw_currency_picker(frame: &mut Frame, picker: &CurrencyPicker) {
 
     body.push(Line::raw(""));
     body.push(Line::from(Span::styled(
-        " Enter to select · ↑/↓ to choose · Esc to cancel",
+        " enter to select · ↑/↓ to choose · Esc to cancel",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -3996,12 +4293,19 @@ mod tests {
         .unwrap();
         let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
 
-        stamp_from_input(&mut app, &plan_id, "2026-10").unwrap();
+        open_stamp_review(
+            &mut app,
+            &plan_id,
+            "Starter",
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+        )
+        .unwrap();
         let Some(Modal::StampReview(review)) = &app.modal else {
             panic!("expected stamp review");
         };
-        assert_eq!(review.rows[0].options.len(), 3); // static, previous month, overall
+        assert_eq!(review.items[0].methods.len(), 5);
 
+        handle_stamp_review_key(&mut app, key(KeyCode::Tab)).unwrap();
         handle_stamp_review_key(&mut app, key(KeyCode::Right)).unwrap();
         handle_stamp_review_key(&mut app, key(KeyCode::Enter)).unwrap();
 
@@ -4031,17 +4335,23 @@ mod tests {
 
         // October has no recorded spending, so November falls back but keeps the saved
         // previous-month source ready for the next month that can use it.
-        stamp_from_input(&mut app, &plan_id, "2026-11").unwrap();
+        open_stamp_review(
+            &mut app,
+            &plan_id,
+            "Starter",
+            NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+        )
+        .unwrap();
         let Some(Modal::StampReview(review)) = &app.modal else {
             panic!("expected second stamp review");
         };
         assert_eq!(
-            review.rows[0].entry.forecast_method,
+            review.items[0].method,
             leeway::models::ForecastMethod::PreviousMonth
         );
         assert_eq!(
-            review.rows[0].used_method,
-            leeway::models::ForecastMethod::Static
+            review.items[0].preview_method,
+            Some(leeway::models::ForecastMethod::Static)
         );
     }
 
@@ -4057,16 +4367,142 @@ mod tests {
         )
         .unwrap();
         let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
-        stamp_from_input(&mut app, &plan_id, "2026-10").unwrap();
+        open_stamp_review(
+            &mut app,
+            &plan_id,
+            "Starter",
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+        )
+        .unwrap();
+        handle_stamp_review_key(&mut app, key(KeyCode::Tab)).unwrap();
         handle_stamp_review_key(&mut app, key(KeyCode::Right)).unwrap();
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("Stamp 2026-10"));
+        assert!(text.contains("Stamp “Starter”"));
+        assert!(text.contains("October"));
+        assert!(text.contains("stamped"));
         assert!(text.contains("previous month"));
         assert!(text.contains("50.00"));
+    }
+
+    #[test]
+    fn stamp_review_checks_next_month_and_can_stamp_a_batch() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
+        open_stamp_review(
+            &mut app,
+            &plan_id,
+            "Normal",
+            NaiveDate::from_ymd_opt(2026, 10, 15).unwrap(),
+        )
+        .unwrap();
+
+        let Some(Modal::StampReview(review)) = &app.modal else {
+            panic!("expected stamp review");
+        };
+        assert_eq!(review.months, BTreeSet::from([(2026, 11)]));
+
+        handle_stamp_review_key(&mut app, key(KeyCode::Down)).unwrap();
+        handle_stamp_review_key(&mut app, key(KeyCode::Char(' '))).unwrap();
+        handle_stamp_review_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        assert!(
+            queries::month_by_label(&app.conn, "2026-11")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            queries::month_by_label(&app.conn, "2026-12")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(app.status.as_deref(), Some("Stamped 2 months"));
+    }
+
+    #[test]
+    fn stamp_review_moves_december_to_next_january() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
+        open_stamp_review(
+            &mut app,
+            &plan_id,
+            "Normal",
+            NaiveDate::from_ymd_opt(2026, 12, 15).unwrap(),
+        )
+        .unwrap();
+
+        let Some(Modal::StampReview(review)) = &app.modal else {
+            panic!("expected stamp review");
+        };
+        assert_eq!(review.year, 2027);
+        assert_eq!(review.selected_month, 0);
+        assert_eq!(review.months, BTreeSet::from([(2027, 1)]));
+    }
+
+    #[test]
+    fn stamp_review_can_turn_a_plan_item_off_for_one_stamp() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
+        open_stamp_review(
+            &mut app,
+            &plan_id,
+            "Normal",
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+        )
+        .unwrap();
+
+        handle_stamp_review_key(&mut app, key(KeyCode::Tab)).unwrap();
+        handle_stamp_review_key(&mut app, key(KeyCode::Char(' '))).unwrap();
+        handle_stamp_review_key(&mut app, key(KeyCode::Enter)).unwrap();
+
+        let october = queries::month_by_label(&app.conn, "2026-10")
+            .unwrap()
+            .unwrap();
+        assert!(
+            queries::load_envelopes(&app.conn, &october.id)
+                .unwrap()
+                .is_empty()
+        );
+        let item = queries::load_plan_entries(&app.conn, &plan_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(item.amount, Money::from_dollars(300.0));
+    }
+
+    #[test]
+    fn restamp_from_the_stamp_window_returns_to_its_checked_month() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
+        ops::stamp(
+            &mut app.conn,
+            &plan_id,
+            "2026-10",
+            NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+            31,
+        )
+        .unwrap();
+        open_stamp_review(
+            &mut app,
+            &plan_id,
+            "Normal",
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+        )
+        .unwrap();
+
+        handle_stamp_review_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.modal, Some(Modal::Choice(_))));
+        handle_choice_key(&mut app, key(KeyCode::Char('m'))).unwrap();
+
+        assert_eq!(
+            app.budget_target,
+            BudgetTarget::Month {
+                year: 2026,
+                month: 10,
+            }
+        );
     }
 
     fn series_id_for_manage(app: &App, manage: &EnvelopeManage) -> String {
@@ -4595,7 +5031,7 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
 
-        assert!(buffer_text(&terminal).contains("Tab: available credit ↔ current balance"));
+        assert!(buffer_text(&terminal).contains("tab: available credit ↔ current balance"));
     }
 
     #[test]

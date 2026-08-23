@@ -10,4 +10,4 @@ Move through stamped months to review old budgets or plan ahead. A month you rea
 
 - `j` / `k` — move through months and plans
 - `g` — go to any month
-- `Tab` — move into the selected month's panels
+- `tab` — move into the selected month's panels

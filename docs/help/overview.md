@@ -19,7 +19,7 @@ Accounts hold your real balance today. Income and Expenses are dated money you t
 
 ## Getting around
 
-- `Tab` — move between panels
+- `tab` — move between panels
 - `Esc` — return to the budget sidebar
 - `j` / `k` — move through months and plans in the sidebar
 - `g` — go to a month while Months is selected

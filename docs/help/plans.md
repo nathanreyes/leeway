@@ -14,7 +14,9 @@ Editing a month's bills or envelopes doesn't change the plan either. You can use
 
 ## Stamp review
 
-After you choose a month, Leeway shows the amounts it will stamp. Press Enter to keep the shown amounts, or select a row and use Left/Right or `f` to choose a historical amount. Leeway remembers that source for the next stamp.
+Press `s` to open one stamp window. The left pane lists the year’s months and checks next month by default. Use Space to check more months, and Left/Right to change the shown year. The right pane lists every plan item. Use Space to turn an item off for this stamp, or Left/Right or `f` to choose static or a historical amount. `tab` switches panes; `enter` stamps every checked month.
+
+Leeway remembers each amount source, but an off choice lasts for this stamp only. Seasonal plan rules still decide which checked months include each item. A stamped month must be selected alone so Leeway can ask how to restamp it.
 
 Historical choices use settled bill and income amounts or spending recorded inside manual envelopes. Automatic envelopes stay static. If a saved source has no data for the target month, Leeway shows and uses the static amount but keeps the saved source for later.
 
@@ -45,14 +47,14 @@ Seasonal items stay out of the Summary totals, which describe an ordinary month.
 
 ## Keys
 
-Plans share the budget sidebar with months. The selected plan's Income, Expenses, Envelopes, and Summary fill the same detail area used by a month. Tab moves focus between them; these keys act on the plan while the sidebar is focused.
+Plans share the budget sidebar with months. The selected plan's Income, Expenses, Envelopes, and Summary fill the same detail area used by a month. `tab` moves focus between them; these keys act on the plan while the sidebar is focused.
 
 - `j` / `k` — move through months and plans
 - `n` — create a new plan
 - `l` — rename the selected plan
-- `s` — stamp the selected plan onto a month
+- `s` — stamp the selected plan onto one or more months
 - `x` — delete the selected plan (stamped months are kept)
-- `Tab` — move focus into the item panes
+- `tab` — move focus into the item panes
 
 With an item pane focused:
 

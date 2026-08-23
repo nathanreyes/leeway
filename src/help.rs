@@ -398,7 +398,7 @@ mod tests {
                   \n\
                   ## Keys\n\
                   \n\
-                  - `Enter` — open detail\n\
+                  - `enter` — open detail\n\
                   - `s` — record spending\n";
         let content = parse(md);
         assert_eq!(content.title, "Envelopes");
@@ -414,7 +414,7 @@ mod tests {
         assert!(matches!(&content.sections[3], HelpSection::Heading(h) if h == "Keys"));
         match &content.sections[4] {
             HelpSection::Keys(rows) => {
-                assert_eq!(rows[0], ("Enter".to_string(), "open detail".to_string()));
+                assert_eq!(rows[0], ("enter".to_string(), "open detail".to_string()));
                 assert_eq!(rows[1], ("s".to_string(), "record spending".to_string()));
             }
             _ => panic!("expected a keys table"),

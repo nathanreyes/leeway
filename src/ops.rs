@@ -75,13 +75,70 @@ pub fn stamp(
     start_date: NaiveDate,
     days_in_month: i64,
 ) -> Result<String> {
+    stamp_filtered(conn, plan_id, label, start_date, days_in_month, &[])
+}
+
+/// Stamp a plan while leaving selected plan items out of this snapshot. The plan itself
+/// stays unchanged; this is the stamp window's one-time "off" choice.
+pub fn stamp_filtered(
+    conn: &mut Connection,
+    plan_id: &str,
+    label: &str,
+    start_date: NaiveDate,
+    days_in_month: i64,
+    excluded_item_ids: &[String],
+) -> Result<String> {
     // A transaction: everything below commits together or not at all.
     let tx = conn.transaction()?;
+    let month_id = stamp_in_transaction(
+        &tx,
+        plan_id,
+        label,
+        start_date,
+        days_in_month,
+        excluded_item_ids,
+    )?;
+    tx.commit()?;
+    Ok(month_id)
+}
+
+/// Stamp several months as one write, so a failure cannot leave half the batch behind.
+pub fn stamp_batch_filtered(
+    conn: &mut Connection,
+    plan_id: &str,
+    months: &[(String, NaiveDate, i64)],
+    excluded_item_ids: &[String],
+) -> Result<Vec<String>> {
+    let tx = conn.transaction()?;
+    let mut month_ids = Vec::with_capacity(months.len());
+    for (label, start_date, days_in_month) in months {
+        month_ids.push(stamp_in_transaction(
+            &tx,
+            plan_id,
+            label,
+            *start_date,
+            *days_in_month,
+            excluded_item_ids,
+        )?);
+    }
+    tx.commit()?;
+    Ok(month_ids)
+}
+
+fn stamp_in_transaction(
+    conn: &Connection,
+    plan_id: &str,
+    label: &str,
+    start_date: NaiveDate,
+    days_in_month: i64,
+    excluded_item_ids: &[String],
+) -> Result<String> {
     let month_id = new_id();
 
-    let entries = forecast::resolve_plan_entries(&tx, plan_id, start_date, days_in_month)?;
+    let mut entries = forecast::resolve_plan_entries(conn, plan_id, start_date, days_in_month)?;
+    entries.retain(|entry| !excluded_item_ids.contains(&entry.entry.item_id));
 
-    tx.execute(
+    conn.execute(
         "INSERT INTO month (id, plan_id, label, start_date, days_in_month)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![
@@ -93,14 +150,12 @@ pub fn stamp(
         ],
     )?;
 
-    // `&tx` coerces to `&Connection`, so query/insert helpers run inside this transaction.
-    // The resolver has already removed off-season entries and chosen one concrete amount
-    // for each remaining item. The instance carries no live link to that choice.
+    // The caller owns the transaction. The resolver has already removed off-season entries
+    // and chosen one amount for each remaining item. The instance keeps no live link to it.
     for entry in entries {
-        insert_instance_from_entry(&tx, &month_id, &entry)?;
+        insert_instance_from_entry(conn, &month_id, &entry)?;
     }
 
-    tx.commit()?;
     Ok(month_id)
 }
 
@@ -165,11 +220,13 @@ fn active_entries_for_month(
     conn: &Connection,
     month_id: &str,
     plan_id: &str,
+    excluded_item_ids: &[String],
 ) -> Result<Vec<ResolvedPlanEntry>> {
     let month = queries::month_by_id(conn, month_id)?
         .with_context(|| format!("month not found: {month_id}"))?;
-    let entries =
+    let mut entries =
         forecast::resolve_plan_entries(conn, plan_id, month.start_date, month.days_in_month)?;
+    entries.retain(|entry| !excluded_item_ids.contains(&entry.entry.item_id));
     Ok(entries)
 }
 
@@ -233,8 +290,18 @@ pub fn month_has_items_outside_plan(
 /// neither inserted nor matched — and since merge never deletes, an instance already
 /// standing from an earlier stamp survives untouched.
 pub fn restamp_merge(conn: &mut Connection, month_id: &str, plan_id: &str) -> Result<()> {
+    restamp_merge_filtered(conn, month_id, plan_id, &[])
+}
+
+/// Merge a plan while honoring one-time item exclusions from the stamp window.
+pub fn restamp_merge_filtered(
+    conn: &mut Connection,
+    month_id: &str,
+    plan_id: &str,
+    excluded_item_ids: &[String],
+) -> Result<()> {
     let tx = conn.transaction()?;
-    let entries = active_entries_for_month(&tx, month_id, plan_id)?;
+    let entries = active_entries_for_month(&tx, month_id, plan_id, excluded_item_ids)?;
     let txns = queries::load_txns(&tx, month_id)?;
     let envelopes = queries::load_envelopes(&tx, month_id)?;
     let mut matched_txns: HashSet<String> = HashSet::new();
@@ -284,8 +351,19 @@ pub fn restamp_replace(
     plan_id: &str,
     keep_outside_plan: bool,
 ) -> Result<()> {
+    restamp_replace_filtered(conn, month_id, plan_id, keep_outside_plan, &[])
+}
+
+/// Replace a month while honoring one-time item exclusions from the stamp window.
+pub fn restamp_replace_filtered(
+    conn: &mut Connection,
+    month_id: &str,
+    plan_id: &str,
+    keep_outside_plan: bool,
+    excluded_item_ids: &[String],
+) -> Result<()> {
     let tx = conn.transaction()?;
-    let entries = active_entries_for_month(&tx, month_id, plan_id)?;
+    let entries = active_entries_for_month(&tx, month_id, plan_id, excluded_item_ids)?;
     let txns = queries::load_txns(&tx, month_id)?;
     let envelopes = queries::load_envelopes(&tx, month_id)?;
     let mut matched_txns: HashSet<String> = HashSet::new();
