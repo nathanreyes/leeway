@@ -190,14 +190,6 @@ pub fn handle_sidebar_key(
         KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => move_target(app, 1, months, plans, today),
         KeyCode::Char('k') | KeyCode::Up => move_target(app, -1, months, plans, today),
-        KeyCode::Char('m') => {
-            let target = BudgetTarget::Month {
-                year: app.viewed_year,
-                month: app.viewed_month,
-            };
-            select_target(app, target, plans);
-        }
-        KeyCode::Char('p') => select_last_plan(app, plans),
         KeyCode::Char('g') if matches!(app.budget_target, BudgetTarget::Month { .. }) => app
             .open_text(
                 "Go to month (YYYY-MM)",
@@ -275,18 +267,6 @@ pub fn select_target(app: &mut App, target: BudgetTarget, plans: &[PlanSummary])
     app.budget_target = target;
 }
 
-fn select_last_plan(app: &mut App, plans: &[PlanSummary]) {
-    let plan_id = app
-        .last_plan_id
-        .as_ref()
-        .filter(|id| plans.iter().any(|summary| summary.plan.id == id.as_str()))
-        .cloned()
-        .or_else(|| plans.first().map(|summary| summary.plan.id.clone()));
-    if let Some(plan_id) = plan_id {
-        select_target(app, BudgetTarget::Plan { plan_id }, plans);
-    }
-}
-
 fn parse_label(label: &str) -> Option<(i32, u32)> {
     let (year, month) = label.split_once('-')?;
     Some((year.parse().ok()?, month.parse().ok()?))
@@ -299,8 +279,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, no_plans: bool) {
                 let mut spans = vec![
                     key(" j/k "),
                     Span::raw(" budget  "),
-                    key(" p "),
-                    Span::raw(" plans  "),
                     key(" g "),
                     Span::raw(" go to month"),
                 ];
@@ -312,8 +290,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, no_plans: bool) {
             BudgetTarget::Plan { .. } => Line::from(vec![
                 key(" j/k "),
                 Span::raw(" budget  "),
-                key(" m "),
-                Span::raw(" months  "),
                 key(" n "),
                 Span::raw(" new  "),
                 key(" l "),

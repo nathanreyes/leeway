@@ -3902,7 +3902,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_shortcuts_switch_sections_and_g_opens_month_picker() {
+    fn sidebar_m_and_p_are_ignored_and_g_opens_month_picker() {
         let (mut app, _, _) = app_with_envelope_modal();
         app.modal = None;
         app.dash_focus = DashFocus::Header;
@@ -3920,10 +3920,22 @@ mod tests {
             budget::SidebarDetail::Month(view.as_ref()),
         )
         .unwrap();
-        assert!(matches!(app.budget_target, BudgetTarget::Plan { .. }));
-        assert!(app.plan_focus == PlanFocus::List);
+        assert_eq!(
+            app.budget_target,
+            BudgetTarget::Month {
+                year: 2026,
+                month: 9,
+            }
+        );
 
-        let plan = plans[app.plans_sel].plan.clone();
+        let plan = plans[0].plan.clone();
+        budget::select_target(
+            &mut app,
+            BudgetTarget::Plan {
+                plan_id: plan.id.clone(),
+            },
+            &plans,
+        );
         let entries = queries::load_plan_entries(&app.conn, &plan.id).unwrap();
         budget::handle_sidebar_key(
             &mut app,
@@ -3939,12 +3951,19 @@ mod tests {
         .unwrap();
         assert_eq!(
             app.budget_target,
-            BudgetTarget::Month {
-                year: 2026,
-                month: 9,
+            BudgetTarget::Plan {
+                plan_id: plan.id.clone(),
             }
         );
 
+        budget::select_target(
+            &mut app,
+            BudgetTarget::Month {
+                year: 2026,
+                month: 9,
+            },
+            &plans,
+        );
         budget::handle_sidebar_key(
             &mut app,
             key(KeyCode::Char('g')),

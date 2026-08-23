@@ -4,12 +4,10 @@ The Months section sets which month the budget workspace shows. Leeway works one
 
 ## How it fits
 
-Move through stamped months to review old budgets or plan ahead. A month you reach with `m` can appear before it has been stamped. Choose a plan below it and press `s` to fill it in.
+Move through stamped months to review old budgets or plan ahead. A month you reach with `g` can appear before it has been stamped. Choose a plan below it and press `s` to fill it in.
 
 ## Keys
 
 - `j` / `k` — move through months and plans
-- `m` — focus the Months section
-- `p` — focus the Plans section
 - `g` — go to any month
 - `Tab` — move into the selected month's panels

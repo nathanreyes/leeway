@@ -48,7 +48,6 @@ Seasonal items stay out of the Summary totals, which describe an ordinary month.
 Plans share the budget sidebar with months. The selected plan's Income, Expenses, Envelopes, and Summary fill the same detail area used by a month. Tab moves focus between them; these keys act on the plan while the sidebar is focused.
 
 - `j` / `k` — move through months and plans
-- `m` — return to the Months section
 - `n` — create a new plan
 - `l` — rename the selected plan
 - `s` — stamp the selected plan onto a month

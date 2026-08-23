@@ -286,7 +286,7 @@ pub fn draw(frame: &mut Frame, app: &App, summaries: &[PlanSummary], entries: &[
     let [header, body, summary_area, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(7 + seasonal_line_count(&projection) as u16),
+        Constraint::Length(6 + seasonal_line_count(&projection) as u16),
         Constraint::Length(2),
     ])
     .areas(frame.area());
@@ -384,7 +384,7 @@ pub fn draw_detail(
     let [header, body, summary_area] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
-        Constraint::Length(7 + seasonal_line_count(&projection) as u16),
+        Constraint::Length(6 + seasonal_line_count(&projection) as u16),
     ])
     .areas(area);
 
@@ -564,14 +564,6 @@ fn draw_plan_summary(frame: &mut Frame, area: Rect, projection: &PlanProjection)
         )));
     }
 
-    lines.push(Line::from(Span::styled(
-        format!(
-            "Daily envelope rates assume a {}-day month.",
-            leeway::calc::PLAN_PROJECTION_DAYS
-        ),
-        Style::default().fg(Color::DarkGray),
-    )));
-
     frame.render_widget(
         Paragraph::new(lines).block(crate::titled_block(" Summary ")),
         area,
@@ -619,8 +611,21 @@ fn draw_plan_block(
         state.select(Some(selected));
     }
 
-    let list = crate::selectable_list(rows)
-        .block(crate::selectable_block(plan_block_title(focus), focused));
+    let mut block = crate::selectable_block(plan_block_title(focus), focused);
+    let has_daily_envelopes = focus == PlanFocus::Envelopes
+        && entries.iter().any(|entry| {
+            entry_matches_focus(entry, focus) && entry.series.period_type == Some(PeriodType::Daily)
+        });
+    if has_daily_envelopes {
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(
+                " Daily envelope rates assume a {}-day month. ",
+                leeway::calc::PLAN_PROJECTION_DAYS
+            ),
+            Style::default().fg(crate::theme::MUTED),
+        )));
+    }
+    let list = crate::selectable_list(rows).block(block);
     frame.render_stateful_widget(list, area, &mut state);
     crate::render_list_scrollbar(frame, area, row_count, state.offset(), focused);
 }
@@ -814,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn plans_screen_renders_expenses_summary_and_projection_note() {
+    fn plans_screen_hides_the_projection_note_without_daily_envelopes() {
         let (app, _, entries, _) = app_with_transaction_plan();
         let summaries = queries::plan_summaries(&app.conn).unwrap();
         let backend = TestBackend::new(100, 30);
@@ -834,10 +839,47 @@ mod tests {
         assert!(text.contains("planned expenses"));
         assert!(text.contains("planned envelopes"));
         assert!(text.contains("-$1,800.00"));
-        assert!(text.contains("Daily envelope rates assume a 30-day month."));
+        assert!(!text.contains("Daily envelope rates assume a 30-day month."));
         assert!(!text.contains("planned bills"));
         // A plan with nothing seasonal says nothing about months.
         assert!(!text.contains("Mar, Jul, Nov"));
+    }
+
+    #[test]
+    fn projection_note_sits_on_the_envelopes_border_with_readable_color() {
+        let (mut app, plan, _, _) = app_with_transaction_plan();
+        let daily = ops::create_series(
+            &app.conn,
+            Kind::Envelope,
+            "Dining",
+            None,
+            Some(PeriodType::Daily),
+            Some(Mode::Automatic),
+        )
+        .unwrap();
+        ops::add_plan_item(&app.conn, &plan.id, &daily, Money::from_dollars(20.0)).unwrap();
+        let entries = queries::load_plan_entries(&app.conn, &plan.id).unwrap();
+        app.plan_focus = PlanFocus::Envelopes;
+        let backend = TestBackend::new(70, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw_plan_block(frame, frame.area(), &app, &entries, PlanFocus::Envelopes)
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let bottom = buffer.area.height - 1;
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, bottom)].symbol())
+            .collect();
+        let note = "Daily envelope rates assume a 30-day month.";
+        let start = row
+            .find(note)
+            .expect("note should sit on the bottom border") as u16;
+
+        assert_eq!(buffer[(start, bottom)].fg, crate::theme::MUTED);
     }
 
     /// Press a key and answer the prompt it opens, the way a user would.
@@ -941,7 +983,7 @@ mod tests {
         // It stays out of the headline: planned envelopes is still zero.
         assert!(text.contains("planned envelopes"));
         assert!(!text.contains("-$120.00  planned envelopes"));
-        assert!(text.contains("Daily envelope rates assume a 30-day month."));
+        assert!(!text.contains("Daily envelope rates assume a 30-day month."));
     }
 
     #[test]
