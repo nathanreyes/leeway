@@ -8,7 +8,7 @@ const repo = "https://github.com/nathanreyes/leeway";
 
 // Lines of the install session: [prompt?, text, kind]
 const lines = [
-  { p: false, t: "# prebuilt binary — no toolchain needed", k: "comment" },
+  { p: false, t: "# prebuilt binary, no toolchain needed", k: "comment" },
   { p: true,  t: "curl -LsSf https://github.com/nathanreyes/leeway/releases/latest/download/leeway-installer.sh | sh", k: "cmd" },
   { p: true,  t: "leeway", k: "cmd" },
   { p: false, t: "Creates leeway.db, seeds starter data, opens the app.", k: "out" },
@@ -28,13 +28,12 @@ const lines = [
       <p class="eyebrow">install</p>
       <h2 class="install__h">One line to install.</h2>
       <p class="install__sub">
-        Grab a self-contained binary for macOS, Linux, or Windows — no toolchain
-        required. On first run Leeway creates a local database, applies the
-        schema, seeds starter data, and opens the dashboard.
+        Install a binary for macOS, Linux, or Windows with no toolchain; the first
+        run creates the database and opens the dashboard.
       </p>
       <p class="install__next">
-        <span class="t-mauve">also →</span> <code>cargo install leeway</code> from
-        crates.io, or download a build from <a
+        <span class="t-mauve">also →</span> install from crates.io with
+        <code>cargo install leeway</code>, or download a build from <a
           href="https://github.com/nathanreyes/leeway/releases/latest"
           target="_blank"
           rel="noopener">GitHub Releases</a>.
