@@ -1,0 +1,122 @@
+---
+/*
+ * Concepts.astro — the mental model behind Leeway. This sits before Features:
+ * first explain the three core objects, then show what they make possible.
+ */
+const concepts = [
+  {
+    number: "01",
+    name: "Plan",
+    color: "mauve",
+    summary: "Define the shape of a month once.",
+    body: "A plan is a reusable template for your income, bills, and spending envelopes. Keep a baseline plan, make alternatives for lean months or big changes, and choose which one to use without disturbing your real months.",
+    question: "what should this month look like?",
+  },
+  {
+    number: "02",
+    name: "Month",
+    color: "cyan",
+    summary: "Stamp the plan into real time.",
+    body: "Stamping copies a plan into a month as an independent snapshot. From there, the month is yours to adjust as life happens. Later edits to the plan never rewrite the past, and changes in a month never leak back into the template.",
+    question: "what is left right now?",
+  },
+  {
+    number: "03",
+    name: "Series",
+    color: "green",
+    summary: "Keep the thread across every copy.",
+    body: "A series is the durable identity behind an item—Rent, Paycheck, Groceries. It connects that item across months and across different plans, even when its label or amount changes, giving you a trustworthy history to follow.",
+    question: "how has this changed over time?",
+  },
+];
+---
+
+<section id="concepts" class="concepts">
+  <div class="container">
+    <div class="concepts__intro">
+      <div>
+        <p class="eyebrow">how it works</p>
+        <h2>Plan once. Live the month.<br /><span class="serif">Keep the thread.</span></h2>
+      </div>
+      <p>
+        Leeway separates what you intend from what actually happens, without
+        losing the connection between them.
+      </p>
+    </div>
+
+    <div class="flow" aria-label="A plan is stamped into a month while series track items over time">
+      {concepts.map((concept, index) => (
+        <>
+          <article class={`concept concept--${concept.color}`}>
+            <div class="concept__top">
+              <span>{concept.number}</span>
+              <span>{concept.name}</span>
+            </div>
+            <h3>{concept.summary}</h3>
+            <p>{concept.body}</p>
+            <p class="concept__question serif">{concept.question}</p>
+          </article>
+          {index < concepts.length - 1 && (
+            <div class:list={["connector", { "connector--track": index === 1 }]} aria-hidden="true">
+              <span>{index === 0 ? "stamp" : "track"}</span>
+              <i>→</i>
+            </div>
+          )}
+        </>
+      ))}
+    </div>
+
+    <div class="boundary panel">
+      <span class="panel__title">the important boundary</span>
+      <span class="boundary__mark" aria-hidden="true">≠</span>
+      <div>
+        <h3>A stamp is a copy, not a live link.</h3>
+        <p>
+          Your plan can evolve without changing the record of months you have
+          already lived. The series identity is the only thread carried forward:
+          enough to reveal a trend, never enough to rewrite history.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .concepts { padding: 104px 0 88px; border-bottom: 1px solid var(--line-soft); }
+  .concepts__intro { display: grid; grid-template-columns: 1.3fr 1fr; gap: 48px; align-items: end; margin-bottom: 48px; }
+  .concepts__intro h2 { font-size: clamp(28px, 4.5vw, 48px); }
+  .concepts__intro h2 .serif { color: var(--mauve); font-style: italic; }
+  .concepts__intro > p { color: var(--dim); margin: 0 0 4px; max-width: 48ch; }
+
+  .flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 14px; align-items: stretch; }
+  .concept { display: flex; flex-direction: column; border: 1px solid var(--line-bright); border-radius: var(--radius); background: linear-gradient(180deg, var(--panel), var(--bg-soft)); padding: 28px 24px 24px; }
+  .concept__top { display: flex; justify-content: space-between; margin-bottom: 26px; color: var(--faint); font-size: 11px; letter-spacing: .18em; text-transform: uppercase; }
+  .concept__top span:last-child { color: var(--concept-color); }
+  .concept h3 { font-size: 18px; line-height: 1.35; margin-bottom: 14px; }
+  .concept > p { color: var(--dim); font-size: 13px; margin: 0; }
+  .concept .concept__question { color: var(--concept-color); font-size: 20px; font-style: italic; line-height: 1.15; margin-top: auto; padding-top: 28px; }
+  .concept--mauve { --concept-color: var(--mauve); }
+  .concept--cyan { --concept-color: var(--cyan); }
+  .concept--green { --concept-color: var(--green); }
+  .connector { align-self: center; color: var(--faint); text-align: center; font-size: 10px; text-transform: uppercase; letter-spacing: .12em; }
+  .connector span, .connector i { display: block; }
+  .connector i { color: var(--mauve); font-size: 22px; font-style: normal; line-height: 1; }
+  .connector--track i { color: var(--green); }
+
+  .boundary { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 28px; margin-top: 48px; padding: 34px 38px; }
+  .boundary__mark { color: var(--amber); font: italic 56px/1 var(--serif); }
+  .boundary h3 { font-size: clamp(20px, 3vw, 28px); }
+  .boundary p { color: var(--dim); font-size: 13px; max-width: 76ch; margin: 10px 0 0; }
+
+  @media (max-width: 860px) {
+    .flow { grid-template-columns: 1fr; }
+    .connector { padding: 0; }
+    .connector i { transform: rotate(90deg); width: fit-content; margin: 0 auto; }
+  }
+  @media (max-width: 620px) {
+    .concepts { padding: 72px 0 56px; }
+    .concepts__intro { grid-template-columns: 1fr; gap: 22px; margin-bottom: 36px; }
+    .boundary { grid-template-columns: 1fr; gap: 8px; padding: 30px 24px 24px; }
+    .boundary__mark { font-size: 44px; }
+  }
+</style>

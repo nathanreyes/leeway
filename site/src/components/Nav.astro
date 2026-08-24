@@ -1,16 +1,18 @@
 ---
 /* Nav.astro — minimal sticky top bar. */
 const repo = "https://github.com/nathanreyes/leeway";
+const home = Astro.url.pathname === "/";
 ---
 
 <header class="nav">
   <div class="container nav__inner">
-    <a class="brand" href="#top">
+    <a class="brand" href={home ? "#top" : "/"}>
       <span class="brand__glyph">▮</span>leeway
     </a>
     <nav class="nav__links">
-      <a href="#features">features</a>
-      <a href="#install">install</a>
+      <a href={home ? "#concepts" : "/#concepts"}>how it works</a>
+      <a href={home ? "#features" : "/#features"}>features</a>
+      <a href={home ? "#install" : "/#install"}>install</a>
       <a href={repo} target="_blank" rel="noopener">github ↗</a>
     </nav>
   </div>
