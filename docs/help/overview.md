@@ -25,5 +25,5 @@ Accounts hold your real balance today. Income and Expenses are dated money you t
 - `g` — go to a month while Months is selected
 - `h` — help for the focused panel
 - `S` — selected series, then all series
-- `,` — Storage & Sync settings
+- `,` — settings (preferences, storage, and backups)
 - `q` — quit

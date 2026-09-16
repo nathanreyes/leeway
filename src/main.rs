@@ -22,13 +22,13 @@ mod theme;
 
 use anim::{ChartAnimation, SummaryAnimations};
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Local, NaiveDate};
 use leeway::models::{
     AccountType, CreditCardEntryMode, Direction, ForecastMethod, Kind, Mode, MonthSet, PeriodType,
-    PlanEntry, Series, Txn,
+    Plan, PlanEntry, Series, Txn,
 };
 use leeway::money::Money;
-use leeway::sync::{self, Inspection, StorageMode, SyncStatus};
+use leeway::storage;
 use leeway::view::SeriesTimeRange;
 use leeway::{calc, db, ops, queries};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -42,7 +42,6 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 use rusqlite::Connection;
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub(crate) const SERIES_RENAME_GUIDANCE: &str = "Rename this item from its Series page — press S";
@@ -68,7 +67,7 @@ pub enum BudgetTarget {
 }
 
 /// The settings screen's tabs. General holds app-wide preferences (envelope-mode default,
-/// display currency); Storage holds the folder-sync controls.
+/// display currency); Storage shows local paths and creates backups.
 /// `Tab`/`Shift+Tab` cycle between them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
@@ -386,21 +385,28 @@ pub struct CurrencyPicker {
 
 #[derive(Clone)]
 pub struct StampReview {
-    pub plan_id: String,
-    pub plan_name: String,
     pub year: i32,
     pub selected_month: usize,
+    pub selected_plan: usize,
     pub selected_item: usize,
     pub focus: StampReviewFocus,
     pub months: BTreeSet<(i32, u32)>,
     pub existing_months: BTreeSet<(i32, u32)>,
+    pub plans: Vec<StampReviewPlan>,
     pub items: Vec<StampReviewItem>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum StampReviewFocus {
     Months,
+    Plans,
     Items,
+}
+
+#[derive(Clone)]
+pub struct StampReviewPlan {
+    pub plan: Plan,
+    pub selected: bool,
 }
 
 #[derive(Clone)]
@@ -445,15 +451,6 @@ pub enum ModalAction {
     /// block carries kind + direction (and "is envelope") via its existing helpers.
     BeginNewSeries {
         block: BudgetBlock,
-    },
-    EnableNewSync {
-        parent: PathBuf,
-    },
-    AdoptSyncedBudget {
-        parent: PathBuf,
-    },
-    ReplaceSyncedBudget {
-        parent: PathBuf,
     },
 }
 
@@ -559,7 +556,6 @@ pub enum PromptKind {
         month_id: String,
         label: String,
     },
-    EnableSyncPath,
 }
 
 pub enum SeriesSelection {
@@ -604,10 +600,6 @@ pub enum ConfirmAction {
     DeleteAccount {
         id: String,
     },
-    DisableSync,
-    TakeOverSync,
-    ResolveUseSynced,
-    ResolveUseLocal,
 }
 
 /// All mutable UI state. Each screen keeps its own selection index so moving between
@@ -665,8 +657,8 @@ pub struct App {
     pub modal: Option<Modal>,
     /// A transient one-liner (errors, confirmations) shown in the footer.
     pub status: Option<String>,
-    /// Folder-sync runtime is absent only in focused UI unit tests.
-    pub sync: Option<sync::Runtime>,
+    /// Local storage paths are absent in focused UI unit tests.
+    pub paths: Option<storage::AppPaths>,
 }
 
 impl App {
@@ -820,11 +812,11 @@ impl App {
 }
 
 fn main() -> Result<()> {
-    let paths = sync::AppPaths::discover()?;
+    let paths = storage::AppPaths::discover()?;
     paths.create()?;
     let mut conn = db::open(&paths.database)?;
     // Resolve the app-wide currency before anything reads or seeds money. A budget that
-    // already chose one (its own, or one adopted via sync) carries it in the `setting`
+    // already chose one carries it in the `setting`
     // table; a brand-new budget has no row yet, so we detect from the OS locale and
     // persist that choice. Setting it here means starter seeding lands in the right
     // currency and the first frame renders localized.
@@ -844,9 +836,6 @@ fn main() -> Result<()> {
     // On a fresh database this stamps the current calendar month, satisfying "if no month
     // exists, create one" for a first-ever launch.
     ops::seed_starter(&mut conn)?;
-
-    let mut sync_runtime = sync::Runtime::load(paths, &conn)?;
-    sync_runtime.reconcile_on_launch(&mut conn)?;
 
     // The app opens on the current calendar month.
     let today = Local::now().date_naive();
@@ -890,18 +879,12 @@ fn main() -> Result<()> {
         frame_now: Instant::now(),
         modal: None,
         status: None,
-        sync: Some(sync_runtime),
+        paths: Some(paths),
     };
 
     let terminal = ratatui::init();
     let result = run(terminal, &mut app);
     ratatui::restore();
-    if result.is_ok()
-        && let Some(runtime) = app.sync.as_mut()
-        && let Err(error) = runtime.shutdown()
-    {
-        return Err(error).context("publishing changes before shutdown");
-    }
     result
 }
 
@@ -909,11 +892,6 @@ fn main() -> Result<()> {
 /// then reads and routes one key.
 fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
     while !app.should_quit {
-        if let Some(runtime) = app.sync.as_mut()
-            && let Err(error) = runtime.tick(&app.conn)
-        {
-            app.status = Some(format!("Sync: {error}"));
-        }
         // Resolve "today" fresh every iteration from the local system clock. Combined with
         // `read_key`'s idle wake-up (below), this means a date that rolls over while the app
         // sits open — e.g. left running past midnight — is picked up and redrawn on its own,
@@ -976,7 +954,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                         let tick = if app.summary_anims.is_animating(now) {
                             FRAME_TICK
                         } else {
-                            sync_tick(app)
+                            IDLE_TICK
                         };
                         if let Some(key) = read_key(tick)? {
                             let contextual_series_id = view
@@ -985,7 +963,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             if app.modal.is_some() {
                                 handle_modal_key(app, key)?;
                             } else if handle_global_key_with_series(app, key, contextual_series_id)
-                                || !budget_key_allowed(app, key)
+                                || handle_budget_stamp_key(app, key, today)?
                             {
                             } else if budget::sidebar_focused(app) {
                                 budget::handle_sidebar_key(
@@ -1030,12 +1008,12 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             );
                             draw_modal(frame, app);
                         })?;
-                        if let Some(key) = read_key(sync_tick(app))? {
+                        if let Some(key) = read_key(IDLE_TICK)? {
                             let contextual_series_id = plans::selected_series_id(app, &entries);
                             if app.modal.is_some() {
                                 handle_modal_key(app, key)?;
                             } else if handle_global_key_with_series(app, key, contextual_series_id)
-                                || !budget_key_allowed(app, key)
+                                || handle_budget_stamp_key(app, key, today)?
                             {
                             } else if budget::sidebar_focused(app) {
                                 budget::handle_sidebar_key(
@@ -1084,7 +1062,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                         if let Some(key) = read_key(tick)? {
                             if app.modal.is_some() {
                                 handle_modal_key(app, key)?;
-                            } else if handle_global_key(app, key) || !budget_key_allowed(app, key) {
+                            } else if handle_global_key(app, key) {
                             } else {
                                 series::handle_detail_key(app, key, detail, today)?;
                             }
@@ -1121,7 +1099,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                                 // Search is a text-entry mode: it must own every key (including
                                 // would-be global jump/quit keys) so they remain literal input.
                                 series::handle_key(app, key, &view, today)?;
-                            } else if handle_global_key(app, key) || !budget_key_allowed(app, key) {
+                            } else if handle_global_key(app, key) {
                             } else {
                                 series::handle_key(app, key, &view, today)?;
                             }
@@ -1137,7 +1115,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     draw_settings(frame, app, tab);
                     draw_modal(frame, app);
                 })?;
-                if let Some(key) = read_key(sync_tick(app))? {
+                if let Some(key) = read_key(IDLE_TICK)? {
                     if app.modal.is_some() {
                         handle_modal_key(app, key)?;
                     } else if handle_global_key(app, key) {
@@ -1157,57 +1135,35 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 /// updates within a minute of midnight, at negligible idle cost.
 const IDLE_TICK: Duration = Duration::from_secs(60);
 const FRAME_TICK: Duration = Duration::from_millis(33);
-const SYNC_TICK: Duration = Duration::from_millis(250);
-
-fn sync_tick(app: &App) -> Duration {
-    if app
-        .sync
-        .as_ref()
-        .is_some_and(|runtime| runtime.config.mode == StorageMode::FolderSync)
-    {
-        SYNC_TICK
+/// Input timeout for the Series screen: the fast frame tick while the chart is
+/// mid-tween (so the bars keep moving with no keypresses), otherwise the usual
+/// idle cadence.
+fn series_tick(app: &App, now: Instant) -> Duration {
+    if app.series_chart_anim.is_animating(now) {
+        FRAME_TICK
     } else {
         IDLE_TICK
     }
 }
 
-/// Input timeout for the Series screen: the fast frame tick while the chart is
-/// mid-tween (so the bars keep moving with no keypresses), otherwise the usual
-/// sync/idle cadence.
-fn series_tick(app: &App, now: Instant) -> Duration {
-    if app.series_chart_anim.is_animating(now) {
-        FRAME_TICK
-    } else {
-        sync_tick(app)
+fn handle_budget_stamp_key(app: &mut App, key: KeyEvent, today: NaiveDate) -> Result<bool> {
+    if key.code != KeyCode::Char('s') {
+        return Ok(false);
     }
+    let (target_month, selected_plan_id) = match &app.budget_target {
+        BudgetTarget::Month { year, month } => ((*year, *month), None),
+        BudgetTarget::Plan { plan_id } => (next_month(today), Some(plan_id.clone())),
+    };
+    open_stamp_review(app, target_month, selected_plan_id.as_deref())?;
+    Ok(true)
 }
 
-fn budget_key_allowed(app: &mut App, key: KeyEvent) -> bool {
-    let can_edit = app.sync.as_ref().is_none_or(sync::Runtime::can_edit);
-    if can_edit {
-        return true;
+fn next_month(date: NaiveDate) -> (i32, u32) {
+    if date.month() == 12 {
+        (date.year() + 1, 1)
+    } else {
+        (date.year(), date.month() + 1)
     }
-    let navigation = matches!(
-        key.code,
-        KeyCode::Esc
-            | KeyCode::Tab
-            | KeyCode::BackTab
-            | KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::PageUp
-            | KeyCode::PageDown
-            | KeyCode::Char('j')
-            | KeyCode::Char('k')
-            | KeyCode::Char('/')
-            | KeyCode::Char('f')
-            | KeyCode::Char('t')
-    );
-    if !navigation {
-        app.status = Some("Read-only while sync needs attention — open Settings with ,".into());
-    }
-    navigation
 }
 
 /// Read one key *press*. Returns `None` for releases, resizes, mouse, or an idle timeout —
@@ -1303,46 +1259,16 @@ fn handle_general_tab_key(app: &mut App, key: KeyEvent) -> Result<()> {
 }
 
 fn handle_storage_tab_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let mode = app
-        .sync
-        .as_ref()
-        .map(|runtime| runtime.config.mode.clone())
-        .unwrap_or(StorageMode::LocalOnly);
-    let is_read_only = app
-        .sync
-        .as_ref()
-        .is_some_and(|runtime| matches!(runtime.status, SyncStatus::ReadOnly { .. }));
-    let needs_choice = app
-        .sync
-        .as_ref()
-        .is_some_and(|runtime| matches!(runtime.status, SyncStatus::ChooseVersion { .. }));
-    match key.code {
-        KeyCode::Char('e') if mode == StorageMode::LocalOnly => app.open_text_with_help(
-            "Synchronized parent folder",
-            "~/",
-            vec![
-                "Choose the parent folder managed by Dropbox, iCloud Drive, OneDrive,".into(),
-                "Syncthing, or another file-sync service. Leeway creates Leeway/ inside it.".into(),
-            ],
-            PromptKind::EnableSyncPath,
-        ),
-        KeyCode::Char('d') if mode == StorageMode::FolderSync => app.open_confirm(
-            "Disable folder sync? Synchronized files will be left unchanged.",
-            ConfirmAction::DisableSync,
-        ),
-        KeyCode::Char('t') if mode == StorageMode::FolderSync && is_read_only => app.open_confirm(
-            "Take over editing from the previous session?",
-            ConfirmAction::TakeOverSync,
-        ),
-        KeyCode::Char('u') if mode == StorageMode::FolderSync && needs_choice => app.open_confirm(
-            "Use the synced folder version? This computer's version will be backed up.",
-            ConfirmAction::ResolveUseSynced,
-        ),
-        KeyCode::Char('l') if mode == StorageMode::FolderSync && needs_choice => app.open_confirm(
-            "Use this computer's version? The synced folder version will be backed up.",
-            ConfirmAction::ResolveUseLocal,
-        ),
-        _ => {}
+    if key.code == KeyCode::Char('b') {
+        let result = app
+            .paths
+            .as_ref()
+            .context("storage paths are unavailable")
+            .and_then(|paths| storage::archive_connection(&app.conn, &paths.recovery));
+        app.status = Some(match result {
+            Ok(path) => format!("Backup saved: {}", path.display()),
+            Err(error) => format!("Backup failed: {error:#}"),
+        });
     }
     Ok(())
 }
@@ -1366,7 +1292,7 @@ fn draw_settings(frame: &mut Frame, app: &App, tab: SettingsTab) {
         }
         SettingsTab::Storage => {
             draw_storage_tab(frame, body, app);
-            storage_tab_hints(app)
+            storage_tab_hints()
         }
     };
     let global = Line::from(vec![
@@ -1458,65 +1384,29 @@ fn draw_general_tab(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// The Storage tab: sync status and the configured folder when folder sync is enabled.
+/// The Storage tab shows where this machine keeps the budget and backups.
 fn draw_storage_tab(frame: &mut Frame, area: Rect, app: &App) {
-    let mut lines = Vec::new();
-    if let Some(runtime) = app.sync.as_ref() {
+    let mut lines = vec![storage_detail_line(
+        "Status",
+        "Stored on this machine",
+        Color::White,
+    )];
+    if let Some(paths) = &app.paths {
         lines.push(storage_detail_line(
-            "Status",
-            runtime.status.label(),
-            sync_status_color(&runtime.status),
+            "Database",
+            paths.database.display().to_string(),
+            Color::White,
         ));
-        match &runtime.status {
-            SyncStatus::SavedLocally { message } | SyncStatus::Attention { message } => {
-                lines.push(storage_detail_line("Detail", message, Color::White))
-            }
-            SyncStatus::ChooseVersion {
-                folder_device,
-                folder_updated_at_ms,
-            } => {
-                lines.push(storage_detail_line(
-                    "Detail",
-                    "Changes were found on this computer and in the synced folder.",
-                    Color::White,
-                ));
-                lines.push(storage_detail_line(
-                    "This computer",
-                    database_modified_label(&runtime.paths().database),
-                    Color::White,
-                ));
-                lines.push(storage_detail_line(
-                    "Synced folder",
-                    format!(
-                        "{} · {}",
-                        format_sync_time(*folder_updated_at_ms),
-                        folder_device
-                    ),
-                    Color::White,
-                ));
-            }
-            SyncStatus::LocalOnly
-            | SyncStatus::Published { .. }
-            | SyncStatus::Publishing
-            | SyncStatus::ReadOnly { .. } => {}
-        }
-        if let Some(parent) = runtime.config.sync_parent.as_ref() {
-            lines.push(storage_detail_line(
-                "Sync folder",
-                parent.join(sync::SYNC_DIR_NAME).display().to_string(),
-                Color::White,
-            ));
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::raw(match runtime.config.mode {
-            StorageMode::LocalOnly => {
-                " Folder sync is off. Your budget remains in the managed local database."
-            }
-            StorageMode::FolderSync => {
-                " Changes save here first, then Leeway updates the folder automatically."
-            }
-        }));
+        lines.push(storage_detail_line(
+            "Backups",
+            paths.recovery.display().to_string(),
+            Color::White,
+        ));
     }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(
+        " Run Leeway on one machine and connect over SSH to use it from other devices.",
+    ));
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -1534,49 +1424,8 @@ fn general_tab_hints() -> Line<'static> {
     ])
 }
 
-fn storage_tab_hints(app: &App) -> Line<'static> {
-    let mode = app
-        .sync
-        .as_ref()
-        .map(|runtime| runtime.config.mode.clone())
-        .unwrap_or(StorageMode::LocalOnly);
-    let mut actions = Vec::new();
-    let status = app.sync.as_ref().map(|runtime| &runtime.status);
-    match mode {
-        StorageMode::LocalOnly => actions.extend([modal_key(" e "), Span::raw(" enable sync")]),
-        StorageMode::FolderSync => {
-            match status {
-                Some(SyncStatus::ChooseVersion { .. }) => actions.extend([
-                    modal_key(" u "),
-                    Span::raw(" use synced folder  "),
-                    modal_key(" l "),
-                    Span::raw(" use this computer  "),
-                ]),
-                Some(SyncStatus::ReadOnly { .. }) => {
-                    actions.extend([modal_key(" t "), Span::raw(" take over  ")]);
-                }
-                _ => {}
-            }
-            actions.extend([modal_key(" d "), Span::raw(" disable")]);
-        }
-    }
-    Line::from(actions)
-}
-
-fn format_sync_time(timestamp_ms: i64) -> String {
-    Local
-        .timestamp_millis_opt(timestamp_ms)
-        .single()
-        .map(|time| time.format("%b %-d, %-I:%M %p").to_string())
-        .unwrap_or_else(|| "Unknown time".into())
-}
-
-fn database_modified_label(path: &std::path::Path) -> String {
-    std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .map(DateTime::<Local>::from)
-        .map(|time| time.format("%b %-d, %-I:%M %p").to_string())
-        .unwrap_or_else(|_| "Current local data".into())
+fn storage_tab_hints() -> Line<'static> {
+    Line::from(vec![modal_key(" b "), Span::raw(" back up now")])
 }
 
 const STORAGE_LABEL_WIDTH: usize = 17;
@@ -1590,16 +1439,6 @@ fn storage_detail_line(label: &str, value: impl Into<String>, value_color: Color
         ),
         Span::styled(value.into(), Style::default().fg(value_color)),
     ])
-}
-
-fn sync_status_color(status: &SyncStatus) -> Color {
-    match status {
-        SyncStatus::Published { .. } => theme::GREEN,
-        SyncStatus::Publishing => theme::CYAN,
-        SyncStatus::LocalOnly => Color::Gray,
-        SyncStatus::SavedLocally { .. } | SyncStatus::ReadOnly { .. } => Color::Yellow,
-        SyncStatus::ChooseVersion { .. } | SyncStatus::Attention { .. } => Color::Red,
-    }
 }
 
 /// Keys that mean the same thing on *every* page, checked ahead of the page's own handler.
@@ -1911,9 +1750,14 @@ fn handle_stamp_review_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Esc => app.modal = None,
         KeyCode::Tab | KeyCode::BackTab => {
             if let Some(Modal::StampReview(review)) = &mut app.modal {
-                review.focus = match review.focus {
-                    StampReviewFocus::Months => StampReviewFocus::Items,
-                    StampReviewFocus::Items => StampReviewFocus::Months,
+                review.focus = match (review.focus, key.code) {
+                    (StampReviewFocus::Months, KeyCode::Tab) => StampReviewFocus::Plans,
+                    (StampReviewFocus::Plans, KeyCode::Tab) => StampReviewFocus::Items,
+                    (StampReviewFocus::Items, KeyCode::Tab) => StampReviewFocus::Months,
+                    (StampReviewFocus::Months, KeyCode::BackTab) => StampReviewFocus::Items,
+                    (StampReviewFocus::Plans, KeyCode::BackTab) => StampReviewFocus::Months,
+                    (StampReviewFocus::Items, KeyCode::BackTab) => StampReviewFocus::Plans,
+                    _ => review.focus,
                 };
             }
         }
@@ -1923,6 +1767,9 @@ fn handle_stamp_review_key(app: &mut App, key: KeyEvent) -> Result<()> {
                     StampReviewFocus::Months if review.selected_month < 11 => {
                         review.selected_month += 1;
                         refresh_preview = true;
+                    }
+                    StampReviewFocus::Plans if review.selected_plan + 1 < review.plans.len() => {
+                        review.selected_plan += 1;
                     }
                     StampReviewFocus::Items if review.selected_item + 1 < review.items.len() => {
                         review.selected_item += 1;
@@ -1938,6 +1785,9 @@ fn handle_stamp_review_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         review.selected_month = review.selected_month.saturating_sub(1);
                         refresh_preview = true;
                     }
+                    StampReviewFocus::Plans => {
+                        review.selected_plan = review.selected_plan.saturating_sub(1);
+                    }
                     StampReviewFocus::Items => {
                         review.selected_item = review.selected_item.saturating_sub(1);
                     }
@@ -1951,6 +1801,7 @@ fn handle_stamp_review_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         review.year -= 1;
                         refresh_preview = true;
                     }
+                    StampReviewFocus::Plans => {}
                     StampReviewFocus::Items => {
                         cycle_stamp_method(review, -1);
                         refresh_preview = true;
@@ -1965,6 +1816,7 @@ fn handle_stamp_review_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         review.year += 1;
                         refresh_preview = true;
                     }
+                    StampReviewFocus::Plans => {}
                     StampReviewFocus::Items => {
                         cycle_stamp_method(review, 1);
                         refresh_preview = true;
@@ -1989,6 +1841,12 @@ fn handle_stamp_review_key(app: &mut App, key: KeyEvent) -> Result<()> {
                             review.months.insert(target);
                         }
                     }
+                    StampReviewFocus::Plans => {
+                        if let Some(plan) = review.plans.get_mut(review.selected_plan) {
+                            plan.selected = !plan.selected;
+                            refresh_preview = true;
+                        }
+                    }
                     StampReviewFocus::Items => {
                         if let Some(item) = review.items.get_mut(review.selected_item) {
                             item.enabled = !item.enabled;
@@ -2002,6 +1860,7 @@ fn handle_stamp_review_key(app: &mut App, key: KeyEvent) -> Result<()> {
         _ => {}
     }
     if refresh_preview {
+        refresh_stamp_review_items(app)?;
         refresh_stamp_preview(app)?;
     }
     Ok(())
@@ -2038,6 +1897,16 @@ fn confirm_stamp_review(app: &mut App) -> Result<()> {
         app.status = Some("Check at least one month".into());
         return Ok(());
     }
+    let selected_plan_ids: Vec<String> = review
+        .plans
+        .iter()
+        .filter(|plan| plan.selected)
+        .map(|plan| plan.plan.id.clone())
+        .collect();
+    if selected_plan_ids.is_empty() {
+        app.status = Some("Check at least one plan".into());
+        return Ok(());
+    }
     let mut existing = Vec::new();
     for &(year, month) in &review.months {
         let label = format!("{year:04}-{month:02}");
@@ -2047,6 +1916,10 @@ fn confirm_stamp_review(app: &mut App) -> Result<()> {
     }
     if !existing.is_empty() && review.months.len() > 1 {
         app.status = Some("Uncheck stamped months before stamping a batch".into());
+        return Ok(());
+    }
+    if !existing.is_empty() && selected_plan_ids.len() > 1 {
+        app.status = Some("Select one plan to restamp a month".into());
         return Ok(());
     }
 
@@ -2067,7 +1940,13 @@ fn confirm_stamp_review(app: &mut App) -> Result<()> {
         let &(year, month) = review.months.first().expect("checked month");
         app.viewed_year = year;
         app.viewed_month = month;
-        open_restamp_choice(app, &label, month_id, review.plan_id, excluded_item_ids);
+        open_restamp_choice(
+            app,
+            &label,
+            month_id,
+            selected_plan_ids[0].clone(),
+            excluded_item_ids,
+        );
         return Ok(());
     }
 
@@ -2082,7 +1961,19 @@ fn confirm_stamp_review(app: &mut App) -> Result<()> {
             )
         })
         .collect();
-    ops::stamp_batch_filtered(&mut app.conn, &review.plan_id, &targets, &excluded_item_ids)?;
+    let plans: Vec<(String, Vec<String>)> = selected_plan_ids
+        .into_iter()
+        .map(|plan_id| {
+            let excluded = review
+                .items
+                .iter()
+                .filter(|item| item.entry.plan_id == plan_id && !item.enabled)
+                .map(|item| item.entry.item_id.clone())
+                .collect();
+            (plan_id, excluded)
+        })
+        .collect();
+    ops::stamp_plans_batch_filtered(&mut app.conn, &plans, &targets)?;
     let &(year, month) = review.months.last().expect("checked month");
     reset_dashboard_selections(app);
     app.viewed_year = year;
@@ -2098,8 +1989,8 @@ fn confirm_stamp_review(app: &mut App) -> Result<()> {
 }
 
 /// Keys while the currency chooser is open: ↑/↓ (or j/k) move, Enter selects and
-/// persists, Esc cancels. Selecting writes the choice to the `setting` table (so it
-/// syncs) and updates the active currency, which every amount reads on the next frame.
+/// persists, Esc cancels. Selecting saves the choice and updates the active currency
+/// for the next frame.
 fn handle_currency_picker_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let count = leeway::currency::CURRENCIES.len();
     match key.code {
@@ -2372,45 +2263,6 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
                 PromptKind::NewSeries { block },
             );
         }
-        ModalAction::EnableNewSync { parent } => {
-            let result = (|| {
-                let runtime = app.sync.as_mut().context("sync runtime is unavailable")?;
-                runtime.enable_new(&parent)?;
-                runtime.publish_now()
-            })();
-            report_sync_result(
-                app,
-                result,
-                "Folder sync enabled — publishing initial snapshot",
-            );
-        }
-        ModalAction::AdoptSyncedBudget { parent } => {
-            let result = app
-                .sync
-                .as_mut()
-                .context("sync runtime is unavailable")
-                .and_then(|runtime| runtime.enable_existing(&parent, &mut app.conn));
-            if result.is_ok() {
-                reset_dashboard_selections(app);
-            }
-            report_sync_result(
-                app,
-                result,
-                "Using synchronized budget; prior local data was archived",
-            );
-        }
-        ModalAction::ReplaceSyncedBudget { parent } => {
-            let result = (|| {
-                let runtime = app.sync.as_mut().context("sync runtime is unavailable")?;
-                runtime.replace_existing(&parent)?;
-                runtime.publish_now()
-            })();
-            report_sync_result(
-                app,
-                result,
-                "Publishing this computer's budget as the selected version",
-            );
-        }
     }
     Ok(())
 }
@@ -2423,13 +2275,6 @@ fn finish_restamp(app: &mut App, message: &str) {
     };
     app.screen = Screen::Budget;
     app.status = Some(message.to_string());
-}
-
-fn report_sync_result(app: &mut App, result: Result<()>, success: &str) {
-    app.status = Some(match result {
-        Ok(()) => success.into(),
-        Err(error) => format!("Sync: {error:#}"),
-    });
 }
 
 /// Reopen the envelope-management modal after a nested sub-prompt (txn amount/label/add or
@@ -2967,57 +2812,6 @@ fn submit_text(app: &mut App) -> Result<()> {
                 );
             }
         },
-        PromptKind::EnableSyncPath => {
-            if text.is_empty() {
-                app.status = Some("Enter a synchronized parent folder".into());
-            } else {
-                let inspection =
-                    sync::expand_home(PathBuf::from(&text).as_path()).and_then(|parent| {
-                        sync::inspect_parent(&parent).map(|inspection| (parent, inspection))
-                    });
-                match inspection {
-                    Ok((parent, Inspection::Empty { .. })) => {
-                        run_modal_action(app, ModalAction::EnableNewSync { parent })?
-                    }
-                    Ok((parent, Inspection::Existing { revision, .. })) => app.open_choice(
-                        format!(
-                            "Synced revision {} from {} is valid. Which budget should win?",
-                            revision.revision_id, revision.device_label
-                        ),
-                        vec![
-                            ChoiceOption {
-                                key: 'u',
-                                label: "Use synced budget (recommended)".into(),
-                                action: Some(ModalAction::AdoptSyncedBudget {
-                                    parent: parent.clone(),
-                                }),
-                            },
-                            ChoiceOption {
-                                key: 'r',
-                                label: "Replace synced budget with this computer".into(),
-                                action: Some(ModalAction::ReplaceSyncedBudget { parent }),
-                            },
-                            ChoiceOption {
-                                key: 'c',
-                                label: "Cancel".into(),
-                                action: None,
-                            },
-                        ],
-                    ),
-                    Err(error) => {
-                        app.status = Some(format!("Sync: {error:#}"));
-                        app.open_text_prompt(
-                            "Synchronized parent folder",
-                            text,
-                            Vec::new(),
-                            false,
-                            PromptKind::EnableSyncPath,
-                            None,
-                        );
-                    }
-                }
-            }
-        }
     }
     if app.modal.is_none() {
         restore_envelope_modal(app, return_to_envelope_modal);
@@ -3063,57 +2857,6 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                             app.status = Some("Account is used by transactions".into());
                         }
                     }
-                    ConfirmAction::DisableSync => {
-                        let result = app
-                            .sync
-                            .as_mut()
-                            .context("sync runtime is unavailable")
-                            .and_then(sync::Runtime::disable);
-                        report_sync_result(
-                            app,
-                            result,
-                            "Folder sync disabled; synchronized files were kept",
-                        );
-                    }
-                    ConfirmAction::TakeOverSync => {
-                        let result = app
-                            .sync
-                            .as_mut()
-                            .context("sync runtime is unavailable")
-                            .and_then(sync::Runtime::takeover);
-                        report_sync_result(
-                            app,
-                            result,
-                            "Editing ownership taken over on this computer",
-                        );
-                    }
-                    ConfirmAction::ResolveUseSynced => {
-                        let result = app
-                            .sync
-                            .as_mut()
-                            .context("sync runtime is unavailable")
-                            .and_then(|runtime| runtime.resolve_conflict(&mut app.conn, false));
-                        if result.is_ok() {
-                            reset_dashboard_selections(app);
-                        }
-                        report_sync_result(
-                            app,
-                            result,
-                            "Synchronized version selected; both candidates were preserved",
-                        );
-                    }
-                    ConfirmAction::ResolveUseLocal => {
-                        let result = app
-                            .sync
-                            .as_mut()
-                            .context("sync runtime is unavailable")
-                            .and_then(|runtime| runtime.resolve_conflict(&mut app.conn, true));
-                        report_sync_result(
-                            app,
-                            result,
-                            "This computer's version selected; both candidates were preserved",
-                        );
-                    }
                 }
                 if app.modal.is_none() {
                     restore_envelope_modal(app, return_to);
@@ -3137,23 +2880,63 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
 pub(crate) fn open_stamp_review(
     app: &mut App,
-    plan_id: &str,
-    plan_name: &str,
-    today: NaiveDate,
+    target_month: (i32, u32),
+    selected_plan_id: Option<&str>,
 ) -> Result<()> {
-    let (default_year, default_month) = if today.month() == 12 {
-        (today.year() + 1, 1)
-    } else {
-        (today.year(), today.month() + 1)
-    };
-    let entries = queries::load_plan_entries(&app.conn, plan_id)?;
-    let mut occurrences = HashMap::<String, usize>::new();
-    for entry in &entries {
-        *occurrences.entry(entry.series.id.clone()).or_default() += 1;
-    }
-    let items = entries
+    let (year, month) = target_month;
+    let plans: Vec<StampReviewPlan> = queries::plans(&app.conn)?
         .into_iter()
-        .map(|entry| {
+        .map(|plan| StampReviewPlan {
+            selected: selected_plan_id == Some(plan.id.as_str()),
+            plan,
+        })
+        .collect();
+    let selected_plan = selected_plan_id
+        .and_then(|id| plans.iter().position(|plan| plan.plan.id == id))
+        .unwrap_or(0);
+    let existing_months = queries::months(&app.conn)?
+        .into_iter()
+        .map(|month| (month.start_date.year(), month.start_date.month()))
+        .collect();
+    app.modal = Some(Modal::StampReview(StampReview {
+        year,
+        selected_month: month as usize - 1,
+        selected_plan,
+        selected_item: 0,
+        focus: StampReviewFocus::Months,
+        months: BTreeSet::from([target_month]),
+        existing_months,
+        plans,
+        items: Vec::new(),
+    }));
+    refresh_stamp_review_items(app)?;
+    refresh_stamp_preview(app)
+}
+
+fn refresh_stamp_review_items(app: &mut App) -> Result<()> {
+    let Some(Modal::StampReview(review)) = &app.modal else {
+        return Ok(());
+    };
+    let selected_plan_ids: Vec<String> = review
+        .plans
+        .iter()
+        .filter(|plan| plan.selected)
+        .map(|plan| plan.plan.id.clone())
+        .collect();
+    let prior: HashMap<String, (bool, ForecastMethod)> = review
+        .items
+        .iter()
+        .map(|item| (item.entry.item_id.clone(), (item.enabled, item.method)))
+        .collect();
+
+    let mut items = Vec::new();
+    for plan_id in selected_plan_ids {
+        let entries = queries::load_plan_entries(&app.conn, &plan_id)?;
+        let mut occurrences = HashMap::<String, usize>::new();
+        for entry in &entries {
+            *occurrences.entry(entry.series.id.clone()).or_default() += 1;
+        }
+        items.extend(entries.into_iter().map(|entry| {
             let supports_history = occurrences.get(&entry.series.id) == Some(&1)
                 && match entry.series.kind {
                     Kind::Transaction => true,
@@ -3170,39 +2953,32 @@ pub(crate) fn open_stamp_review(
             } else {
                 vec![ForecastMethod::Static]
             };
-            let method = if methods.contains(&entry.forecast_method) {
-                entry.forecast_method
+            let (enabled, saved_method) = prior
+                .get(&entry.item_id)
+                .copied()
+                .unwrap_or((true, entry.forecast_method));
+            let method = if methods.contains(&saved_method) {
+                saved_method
             } else {
                 ForecastMethod::Static
             };
             StampReviewItem {
                 entry,
-                enabled: true,
+                enabled,
                 method,
                 methods,
                 preview_amount: None,
                 preview_method: None,
             }
-        })
-        .collect();
-    let mut months = BTreeSet::new();
-    months.insert((default_year, default_month));
-    let existing_months = queries::months(&app.conn)?
-        .into_iter()
-        .map(|month| (month.start_date.year(), month.start_date.month()))
-        .collect();
-    app.modal = Some(Modal::StampReview(StampReview {
-        plan_id: plan_id.to_string(),
-        plan_name: plan_name.to_string(),
-        year: default_year,
-        selected_month: default_month as usize - 1,
-        selected_item: 0,
-        focus: StampReviewFocus::Months,
-        months,
-        existing_months,
-        items,
-    }));
-    refresh_stamp_preview(app)
+        }));
+    }
+
+    let Some(Modal::StampReview(review)) = &mut app.modal else {
+        return Ok(());
+    };
+    review.items = items;
+    clamp(&mut review.selected_item, review.items.len());
+    Ok(())
 }
 
 fn refresh_stamp_preview(app: &mut App) -> Result<()> {
@@ -3211,18 +2987,26 @@ fn refresh_stamp_preview(app: &mut App) -> Result<()> {
     };
     let year = review.year;
     let month = review.selected_month as u32 + 1;
-    let plan_id = review.plan_id.clone();
-    let start = NaiveDate::from_ymd_opt(year, month, 1).expect("valid stamp preview month");
-    let resolved = leeway::forecast::resolve_plan_entries(
-        &app.conn,
-        &plan_id,
-        start,
-        ops::days_in_month(year, month),
-    )?;
-    let resolved: HashMap<String, leeway::forecast::ResolvedPlanEntry> = resolved
-        .into_iter()
-        .map(|row| (row.entry.item_id.clone(), row))
+    let plan_ids: Vec<String> = review
+        .plans
+        .iter()
+        .filter(|plan| plan.selected)
+        .map(|plan| plan.plan.id.clone())
         .collect();
+    let start = NaiveDate::from_ymd_opt(year, month, 1).expect("valid stamp preview month");
+    let mut resolved = HashMap::new();
+    for plan_id in plan_ids {
+        resolved.extend(
+            leeway::forecast::resolve_plan_entries(
+                &app.conn,
+                &plan_id,
+                start,
+                ops::days_in_month(year, month),
+            )?
+            .into_iter()
+            .map(|row| (row.entry.item_id.clone(), row)),
+        );
+    }
 
     let Some(Modal::StampReview(review)) = &mut app.modal else {
         return Ok(());
@@ -3401,10 +3185,9 @@ fn draw_stamp_review(frame: &mut Frame, review: &StampReview) {
         "December",
     ];
 
-    let area = centered_rect(92, 88, frame.area());
+    let area = centered_rect(96, 88, frame.area());
     frame.render_widget(Clear, area);
-    let block = titled_block(format!(" Stamp “{}” ", review.plan_name))
-        .border_style(Style::default().fg(theme::CYAN));
+    let block = titled_block(" Stamp plans ").border_style(Style::default().fg(theme::CYAN));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [intro_area, body_area, footer_area] = Layout::vertical([
@@ -3416,16 +3199,24 @@ fn draw_stamp_review(frame: &mut Frame, review: &StampReview) {
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " Check months, then choose a source or turn an item off.",
+            " Check months and plans, then choose a source or turn an item off.",
             Style::default().fg(Color::Gray),
         ))),
         intro_area,
     );
 
-    let [months_area, items_area] =
-        Layout::horizontal([Constraint::Length(30), Constraint::Min(0)])
-            .spacing(1)
-            .areas(body_area);
+    let (months_width, plans_width) = if body_area.width >= 130 {
+        (32, 26)
+    } else {
+        (27, 16)
+    };
+    let [months_area, plans_area, items_area] = Layout::horizontal([
+        Constraint::Length(months_width),
+        Constraint::Length(plans_width),
+        Constraint::Min(0),
+    ])
+    .spacing(1)
+    .areas(body_area);
 
     let month_items: Vec<ListItem<'_>> = MONTHS
         .iter()
@@ -3456,6 +3247,42 @@ fn draw_stamp_review(frame: &mut Frame, review: &StampReview) {
     ));
     frame.render_stateful_widget(month_list, months_area, &mut month_state);
 
+    let plan_rows: Vec<ListItem<'_>> = if review.plans.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            " No plans",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        let plan_name_width = plans_area.width.saturating_sub(7) as usize;
+        review
+            .plans
+            .iter()
+            .map(|plan| {
+                let marker = if plan.selected { "[x]" } else { "[ ]" };
+                ListItem::new(format!(
+                    " {marker} {}",
+                    crate::truncate(&plan.plan.name, plan_name_width)
+                ))
+            })
+            .collect()
+    };
+    let mut plan_state = ListState::default();
+    if !review.plans.is_empty() {
+        plan_state.select(Some(review.selected_plan.min(review.plans.len() - 1)));
+    }
+    let plan_list = selectable_list(plan_rows).block(focusable_block(
+        " Plans ",
+        review.focus == StampReviewFocus::Plans,
+    ));
+    frame.render_stateful_widget(plan_list, plans_area, &mut plan_state);
+    render_list_scrollbar(
+        frame,
+        plans_area,
+        review.plans.len(),
+        plan_state.offset(),
+        review.focus == StampReviewFocus::Plans,
+    );
+
     let item_rows: Vec<ListItem<'_>> = review
         .items
         .iter()
@@ -3476,8 +3303,8 @@ fn draw_stamp_review(frame: &mut Frame, review: &StampReview) {
                 .unwrap_or_else(|| "            ".into());
             ListItem::new(Line::from(vec![
                 Span::raw(format!(
-                    " {marker} {:<22}",
-                    crate::truncate(&item.entry.series.label, 21)
+                    " {marker} {:<14}",
+                    crate::truncate(&item.entry.series.label, 13)
                 )),
                 Span::styled(amount, Style::default().fg(theme::CYAN)),
                 Span::styled(format!("  {method}"), Style::default().fg(Color::Gray)),
@@ -3919,8 +3746,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// The standard two-row screen footer: the focused control's own hints on the top row,
 /// and the always-present global legend on the bottom row with any transient status
 /// message right-aligned beside it. Splitting them onto two rows is what keeps the global
-/// legend visible even while a status message (e.g. the folder-sync status, which is shown
-/// continuously) occupies the status slot — previously the status clobbered the legend.
+/// legend visible while a status message occupies the status slot.
 ///
 /// `area` must be at least two rows tall (screens reserve `Constraint::Length(2)`).
 pub(crate) fn draw_screen_footer(
@@ -3978,11 +3804,7 @@ pub(crate) fn draw_split_status_footer(
 }
 
 pub(crate) fn footer_status(app: &App) -> Option<String> {
-    app.status.clone().or_else(|| {
-        app.sync.as_ref().and_then(|runtime| {
-            (runtime.config.mode == StorageMode::FolderSync).then(|| runtime.status.label())
-        })
-    })
+    app.status.clone()
 }
 
 /// Truncate a label to `max` chars with an ellipsis so columns don't overflow.
@@ -4100,7 +3922,7 @@ mod tests {
             frame_now: Instant::now(),
             modal: Some(Modal::Envelope(manage.clone())),
             status: None,
-            sync: None,
+            paths: None,
         };
 
         (app, manage, envelope.id)
@@ -4293,18 +4115,13 @@ mod tests {
         .unwrap();
         let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
 
-        open_stamp_review(
-            &mut app,
-            &plan_id,
-            "Starter",
-            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-        )
-        .unwrap();
+        open_stamp_review(&mut app, (2026, 10), Some(&plan_id)).unwrap();
         let Some(Modal::StampReview(review)) = &app.modal else {
             panic!("expected stamp review");
         };
         assert_eq!(review.items[0].methods.len(), 5);
 
+        handle_stamp_review_key(&mut app, key(KeyCode::Tab)).unwrap();
         handle_stamp_review_key(&mut app, key(KeyCode::Tab)).unwrap();
         handle_stamp_review_key(&mut app, key(KeyCode::Right)).unwrap();
         handle_stamp_review_key(&mut app, key(KeyCode::Enter)).unwrap();
@@ -4335,13 +4152,7 @@ mod tests {
 
         // October has no recorded spending, so November falls back but keeps the saved
         // previous-month source ready for the next month that can use it.
-        open_stamp_review(
-            &mut app,
-            &plan_id,
-            "Starter",
-            NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
-        )
-        .unwrap();
+        open_stamp_review(&mut app, (2026, 11), Some(&plan_id)).unwrap();
         let Some(Modal::StampReview(review)) = &app.modal else {
             panic!("expected second stamp review");
         };
@@ -4356,6 +4167,119 @@ mod tests {
     }
 
     #[test]
+    fn stamp_hotkey_uses_the_target_month_and_starts_with_no_plans() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        app.modal = None;
+        app.budget_target = BudgetTarget::Month {
+            year: 2027,
+            month: 2,
+        };
+
+        for focus in [
+            DashFocus::Header,
+            DashFocus::Income,
+            DashFocus::Expenses,
+            DashFocus::Envelopes,
+            DashFocus::Accounts,
+        ] {
+            app.dash_focus = focus;
+            assert!(
+                handle_budget_stamp_key(
+                    &mut app,
+                    key(KeyCode::Char('s')),
+                    NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+                )
+                .unwrap()
+            );
+            let Some(Modal::StampReview(review)) = &app.modal else {
+                panic!("expected stamp review");
+            };
+            assert_eq!(review.months, BTreeSet::from([(2027, 2)]));
+            assert!(review.plans.iter().all(|plan| !plan.selected));
+            app.modal = None;
+        }
+    }
+
+    #[test]
+    fn stamp_hotkey_uses_the_next_month_and_focused_plan_from_any_plan_pane() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        app.modal = None;
+        let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
+        app.budget_target = BudgetTarget::Plan {
+            plan_id: plan_id.clone(),
+        };
+
+        for focus in [
+            PlanFocus::List,
+            PlanFocus::Income,
+            PlanFocus::Expenses,
+            PlanFocus::Envelopes,
+        ] {
+            app.plan_focus = focus;
+            handle_budget_stamp_key(
+                &mut app,
+                key(KeyCode::Char('s')),
+                NaiveDate::from_ymd_opt(2026, 11, 15).unwrap(),
+            )
+            .unwrap();
+            let Some(Modal::StampReview(review)) = &app.modal else {
+                panic!("expected stamp review");
+            };
+            assert_eq!(review.months, BTreeSet::from([(2026, 12)]));
+            assert_eq!(
+                review
+                    .plans
+                    .iter()
+                    .filter(|plan| plan.selected)
+                    .map(|plan| plan.plan.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec![plan_id.as_str()]
+            );
+            app.modal = None;
+        }
+    }
+
+    #[test]
+    fn stamp_review_stamps_items_from_multiple_plans() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        let second_plan = ops::create_plan(&app.conn, "Travel").unwrap();
+        let flight = ops::create_series(
+            &app.conn,
+            Kind::Transaction,
+            "Flight",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        ops::add_plan_item(&app.conn, &second_plan, &flight, Money::from_dollars(500.0)).unwrap();
+
+        open_stamp_review(&mut app, (2026, 10), None).unwrap();
+        let Some(Modal::StampReview(review)) = &mut app.modal else {
+            panic!("expected stamp review");
+        };
+        review.focus = StampReviewFocus::Plans;
+
+        handle_stamp_review_key(&mut app, key(KeyCode::Char(' '))).unwrap();
+        handle_stamp_review_key(&mut app, key(KeyCode::Down)).unwrap();
+        handle_stamp_review_key(&mut app, key(KeyCode::Char(' '))).unwrap();
+        let Some(Modal::StampReview(review)) = &app.modal else {
+            panic!("expected stamp review");
+        };
+        assert_eq!(review.items.len(), 2);
+
+        handle_stamp_review_key(&mut app, key(KeyCode::Enter)).unwrap();
+        let month = queries::month_by_label(&app.conn, "2026-10")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            queries::load_envelopes(&app.conn, &month.id).unwrap().len(),
+            1
+        );
+        assert_eq!(queries::load_txns(&app.conn, &month.id).unwrap().len(), 1);
+    }
+
+    #[test]
     fn stamp_review_renders_the_saved_source_and_amount() {
         let (mut app, manage, _) = app_with_envelope_modal();
         ops::add_envelope_spending(
@@ -4367,13 +4291,8 @@ mod tests {
         )
         .unwrap();
         let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
-        open_stamp_review(
-            &mut app,
-            &plan_id,
-            "Starter",
-            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-        )
-        .unwrap();
+        open_stamp_review(&mut app, (2026, 10), Some(&plan_id)).unwrap();
+        handle_stamp_review_key(&mut app, key(KeyCode::Tab)).unwrap();
         handle_stamp_review_key(&mut app, key(KeyCode::Tab)).unwrap();
         handle_stamp_review_key(&mut app, key(KeyCode::Right)).unwrap();
 
@@ -4381,7 +4300,7 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw_modal(frame, &app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("Stamp “Starter”"));
+        assert!(text.contains("Stamp plans"));
         assert!(text.contains("October"));
         assert!(text.contains("stamped"));
         assert!(text.contains("previous month"));
@@ -4392,13 +4311,7 @@ mod tests {
     fn stamp_review_checks_next_month_and_can_stamp_a_batch() {
         let (mut app, _, _) = app_with_envelope_modal();
         let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
-        open_stamp_review(
-            &mut app,
-            &plan_id,
-            "Normal",
-            NaiveDate::from_ymd_opt(2026, 10, 15).unwrap(),
-        )
-        .unwrap();
+        open_stamp_review(&mut app, (2026, 11), Some(&plan_id)).unwrap();
 
         let Some(Modal::StampReview(review)) = &app.modal else {
             panic!("expected stamp review");
@@ -4426,13 +4339,7 @@ mod tests {
     fn stamp_review_moves_december_to_next_january() {
         let (mut app, _, _) = app_with_envelope_modal();
         let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
-        open_stamp_review(
-            &mut app,
-            &plan_id,
-            "Normal",
-            NaiveDate::from_ymd_opt(2026, 12, 15).unwrap(),
-        )
-        .unwrap();
+        open_stamp_review(&mut app, (2027, 1), Some(&plan_id)).unwrap();
 
         let Some(Modal::StampReview(review)) = &app.modal else {
             panic!("expected stamp review");
@@ -4446,14 +4353,9 @@ mod tests {
     fn stamp_review_can_turn_a_plan_item_off_for_one_stamp() {
         let (mut app, _, _) = app_with_envelope_modal();
         let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
-        open_stamp_review(
-            &mut app,
-            &plan_id,
-            "Normal",
-            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-        )
-        .unwrap();
+        open_stamp_review(&mut app, (2026, 10), Some(&plan_id)).unwrap();
 
+        handle_stamp_review_key(&mut app, key(KeyCode::Tab)).unwrap();
         handle_stamp_review_key(&mut app, key(KeyCode::Tab)).unwrap();
         handle_stamp_review_key(&mut app, key(KeyCode::Char(' '))).unwrap();
         handle_stamp_review_key(&mut app, key(KeyCode::Enter)).unwrap();
@@ -4484,13 +4386,7 @@ mod tests {
             31,
         )
         .unwrap();
-        open_stamp_review(
-            &mut app,
-            &plan_id,
-            "Normal",
-            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-        )
-        .unwrap();
+        open_stamp_review(&mut app, (2026, 10), Some(&plan_id)).unwrap();
 
         handle_stamp_review_key(&mut app, key(KeyCode::Enter)).unwrap();
         assert!(matches!(app.modal, Some(Modal::Choice(_))));
@@ -4525,23 +4421,6 @@ mod tests {
             } => {}
             _ => panic!("expected Settings (General) with the dashboard return address"),
         }
-    }
-
-    #[test]
-    fn invalid_sync_path_stays_in_the_prompt_instead_of_quitting() {
-        let (mut app, _, _) = app_with_envelope_modal();
-        app.open_text(
-            "Synchronized parent folder",
-            format!("/definitely-missing-leeway-{}", Uuid::new_v4()),
-            PromptKind::EnableSyncPath,
-        );
-        submit_text(&mut app).unwrap();
-        assert!(matches!(app.modal, Some(Modal::Text(_))));
-        assert!(
-            app.status
-                .as_deref()
-                .is_some_and(|status| status.starts_with("Sync:"))
-        );
     }
 
     #[test]
@@ -4808,81 +4687,59 @@ mod tests {
         assert_eq!(transactions[0].amount, Money::from_dollars(12.5));
     }
 
-    fn app_with_sync_screen() -> App {
+    fn app_with_storage_screen() -> App {
         let (mut app, _, _) = app_with_envelope_modal();
-        let data_dir = std::env::temp_dir().join(format!("leeway-storage-ui-{}", Uuid::new_v4()));
-        let paths = sync::AppPaths::in_dir(data_dir);
-        let mut runtime = sync::Runtime::load(paths, &app.conn).unwrap();
-        runtime.device.label = "Nathans-MacBook-Pro".into();
-        runtime.config.mode = StorageMode::FolderSync;
-        runtime.config.sync_parent = Some(PathBuf::from("/Users/nathan/dropbox"));
-        runtime.status = SyncStatus::ReadOnly {
-            owner: "Other-MacBook".into(),
-        };
+        app.paths = Some(storage::AppPaths::in_dir(
+            std::env::temp_dir().join(format!("leeway-storage-ui-{}", Uuid::new_v4())),
+        ));
         app.screen = Screen::Settings {
             tab: SettingsTab::Storage,
             origin: SeriesOrigin::Budget,
         };
         app.status = None;
-        app.sync = Some(runtime);
         app
     }
 
     #[test]
-    fn storage_sync_details_show_only_status_and_sync_folder() {
-        let app = app_with_sync_screen();
-        let backend = ratatui::backend::TestBackend::new(100, 24);
+    fn storage_shows_local_paths_and_backup_action() {
+        let app = app_with_storage_screen();
+        let backend = ratatui::backend::TestBackend::new(120, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| draw_settings(frame, &app, SettingsTab::Storage))
             .unwrap();
-
         let text = buffer_text(&terminal);
-        assert!(text.contains(" Status           View only — Other-MacBook is editing"));
-        assert!(text.contains(" Sync folder      /Users/nathan/dropbox/Leeway"));
-        assert!(!text.contains(" Device "));
-        assert!(!text.contains(" Local database"));
-        assert!(!text.contains(" Legacy database"));
-        assert!(!text.contains(" import legacy"));
+        assert!(text.contains("Stored on this machine"));
+        assert!(text.contains("leeway.db"));
+        assert!(text.contains("recovery"));
+        assert!(text.contains("back up now"));
+        assert!(!text.contains("enable sync"));
+    }
+
+    #[test]
+    fn storage_backup_saves_the_current_budget() {
+        let mut app = app_with_storage_screen();
+        handle_storage_tab_key(&mut app, key(KeyCode::Char('b'))).unwrap();
+        let paths = app.paths.as_ref().unwrap();
+        let backup = std::fs::read_dir(&paths.recovery)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let restored = db::open(&backup).unwrap();
         assert_eq!(
-            text.matches("View only — Other-MacBook is editing").count(),
-            1
+            queries::months(&restored).unwrap().len(),
+            queries::months(&app.conn).unwrap().len()
         );
-        assert!(text.contains("take over"));
-        assert!(!text.contains("publish"));
-        assert!(!text.contains("use synced folder"));
+        assert!(app.status.as_ref().unwrap().starts_with("Backup saved:"));
+        drop(restored);
+        std::fs::remove_dir_all(&paths.data_dir).unwrap();
     }
 
     #[test]
-    fn storage_version_choice_explains_the_decision_without_revision_internals() {
-        let mut app = app_with_sync_screen();
-        app.sync.as_mut().unwrap().status = SyncStatus::ChooseVersion {
-            folder_device: "Other-MacBook".into(),
-            folder_updated_at_ms: 1_783_999_786_511,
-        };
-        let backend = ratatui::backend::TestBackend::new(110, 24);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| draw_settings(frame, &app, SettingsTab::Storage))
-            .unwrap();
-
-        let text = buffer_text(&terminal);
-        assert!(text.contains("Choose a version"));
-        assert!(text.contains("Changes were found on this computer and in the synced folder."));
-        assert!(text.contains("This computer"));
-        assert!(text.contains("Synced folder"));
-        assert!(text.contains("Other-MacBook"));
-        assert!(text.contains("use synced folder"));
-        assert!(text.contains("use this computer"));
-        assert!(!text.contains("1783999786511"));
-        assert!(!text.contains("publish"));
-        assert!(!text.contains("take over"));
-        assert!(!text.contains("keep both"));
-    }
-
-    #[test]
-    fn storage_sync_screen_survives_a_narrow_frame() {
-        let app = app_with_sync_screen();
+    fn storage_screen_survives_a_narrow_frame() {
+        let app = app_with_storage_screen();
         let backend = ratatui::backend::TestBackend::new(32, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
@@ -4892,7 +4749,7 @@ mod tests {
 
     #[test]
     fn tab_cycles_between_settings_tabs() {
-        let mut app = app_with_sync_screen();
+        let mut app = app_with_storage_screen();
         app.screen = Screen::Settings {
             tab: SettingsTab::General,
             origin: SeriesOrigin::Budget,
@@ -4915,7 +4772,7 @@ mod tests {
 
     #[test]
     fn general_tab_shows_all_settings_and_keeps_the_global_legend() {
-        let app = app_with_sync_screen();
+        let app = app_with_storage_screen();
         let backend = ratatui::backend::TestBackend::new(100, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
@@ -4933,15 +4790,14 @@ mod tests {
         assert!(text.contains("Credit card entry"));
         assert!(text.contains("Available credit"));
         assert!(text.contains("Display currency"));
-        // The global legend stays visible even though this app is in FolderSync (whose
-        // continuous status would otherwise clobber a single-row footer's right side).
+        // Keep the global legend visible below the settings.
         assert!(text.contains("switch tab"));
         assert!(text.contains("quit"));
     }
 
     #[test]
     fn general_tab_enter_toggles_the_default_envelope_mode() {
-        let mut app = app_with_sync_screen();
+        let mut app = app_with_storage_screen();
         app.settings_general_sel = 0; // EnvelopeMode row
         let before = queries::default_mode(&app.conn).unwrap();
         handle_general_tab_key(&mut app, key(KeyCode::Enter)).unwrap();
@@ -4952,7 +4808,7 @@ mod tests {
 
     #[test]
     fn general_tab_enter_on_currency_row_opens_the_picker() {
-        let mut app = app_with_sync_screen();
+        let mut app = app_with_storage_screen();
         app.settings_general_sel = 2; // Currency row
         handle_general_tab_key(&mut app, key(KeyCode::Enter)).unwrap();
         assert!(matches!(app.modal, Some(Modal::CurrencyPicker(_))));
@@ -4960,7 +4816,7 @@ mod tests {
 
     #[test]
     fn general_tab_toggles_the_credit_card_entry_preference() {
-        let mut app = app_with_sync_screen();
+        let mut app = app_with_storage_screen();
         app.settings_general_sel = 1; // CreditCardEntry row
         assert_eq!(
             queries::credit_card_entry_mode(&app.conn).unwrap(),
@@ -4978,7 +4834,7 @@ mod tests {
 
     #[test]
     fn tab_switches_card_prompt_mode_and_preserves_the_stored_value() {
-        let mut app = app_with_sync_screen();
+        let mut app = app_with_storage_screen();
         let limit = Money(100_000);
         let available = Money(70_000);
         let id = ops::create_credit_card_account(&app.conn, "Travel", limit, available).unwrap();
@@ -5016,7 +4872,7 @@ mod tests {
 
     #[test]
     fn card_prompt_explains_the_tab_shortcut() {
-        let mut app = app_with_sync_screen();
+        let mut app = app_with_storage_screen();
         app.open_text_replace_on_type(
             "Available credit for Travel",
             amount_edit_string(Money(70_000)),
@@ -5038,7 +4894,7 @@ mod tests {
     fn currency_picker_lists_currencies_with_samples() {
         // Render-only: opening + drawing the picker reads the active currency but
         // never mutates the shared global, so this stays safe under parallel tests.
-        let mut app = app_with_sync_screen();
+        let mut app = app_with_storage_screen();
         app.open_currency_picker();
         let backend = ratatui::backend::TestBackend::new(80, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -5058,7 +4914,7 @@ mod tests {
 
     #[test]
     fn currency_picker_scrolls_a_window_on_a_short_terminal() {
-        let mut app = app_with_sync_screen();
+        let mut app = app_with_storage_screen();
         app.open_currency_picker();
         // A terminal too short to hold the whole list falls back to a scrolling window with
         // a "more" indicator, rather than overflowing the dialog.

@@ -1351,7 +1351,7 @@ mod tests {
             frame_now: std::time::Instant::now(),
             modal: None,
             status: None,
-            sync: None,
+            paths: None,
         }
     }
 

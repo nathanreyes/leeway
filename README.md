@@ -60,7 +60,7 @@ cargo run          # run in place
 cargo install --path .   # or install the checkout as a command
 ```
 
-On first run, Leeway creates `leeway.db` in the current working directory,
+On first run, Leeway creates `leeway.db` in its app data directory (see Data below),
 applies the database schema, seeds starter data if the database is empty, and
 opens the dashboard for the current month.
 
@@ -98,10 +98,46 @@ or plan amounts change.
 
 ## Data
 
-Leeway stores data in a local SQLite database named `leeway.db` by default.
-The file is ignored by git and stays on your machine. Money values are stored as
-integer cents, and the app derives the dashboard totals from the stored account,
-transaction, envelope, plan, month, and series records.
+Leeway stores your budget in a local SQLite database:
+
+| System | Database path |
+| --- | --- |
+| macOS | `~/Library/Application Support/Leeway/leeway.db` |
+| Linux | `$XDG_DATA_HOME/leeway/leeway.db`, or `~/.local/share/leeway/leeway.db` when unset |
+| Windows | `%APPDATA%\Leeway\leeway.db` |
+
+Open Settings with `,`, then select Storage to see the paths for this machine.
+Press `b` to save a backup in the `recovery` folder beside the database. You can
+create a backup while Leeway runs. Copy these backups to another machine or
+backup service for protection if the host fails. Leeway keeps backups until you
+delete them.
+
+To restore a backup, quit every Leeway instance on the host, keep a copy of the
+current database, then replace `leeway.db` with the backup and restart Leeway.
+See [the remote access guide](docs/remote-access.md) to move a budget to a host.
+
+Money values use integer minor units of the chosen currency. Leeway derives the
+dashboard totals from the stored budget records.
+
+## Remote access over SSH
+
+Run Leeway on one machine and connect from your other devices. Install Leeway
+and tmux on the host, set up SSH access, then run:
+
+```sh
+ssh -t your-host 'tmux new-session -A -s leeway leeway'
+```
+
+This starts Leeway or reconnects to the same session. tmux keeps it running if
+SSH disconnects. The host must stay on and reachable; remote use needs a network
+connection. Leeway also works locally without SSH.
+
+Folder sync is no longer supported. Existing installs keep their local database
+at the same path. Leeway ignores old sync settings and leaves shared snapshots
+and recovery backups untouched. It does not fetch newer data from a sync folder.
+Before you switch, choose the device with the budget you want to keep.
+
+See [remote access and moving your budget](docs/remote-access.md) for setup steps.
 
 ## Documentation
 

@@ -15,14 +15,13 @@ use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-/// Mint a fresh random id. UUIDs (not autoincrement) keep the file portable and let a
-/// future multi-device sync merge without primary-key collisions.
+/// Create a random UUID for a new row.
 fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
 
 /// Persist the app-wide display currency into the `setting` table (upsert). Because
-/// the row lives in the database, the choice syncs with the budget. The caller is
+/// the row lives in the database, backups retain the choice. The caller is
 /// responsible for updating the in-process active currency (`currency::set_active`).
 pub fn set_currency(conn: &Connection, currency: Currency) -> Result<()> {
     conn.execute(
@@ -125,6 +124,47 @@ pub fn stamp_batch_filtered(
     Ok(month_ids)
 }
 
+/// Stamp several plans into several new months as one write. Each plan contributes all of
+/// its enabled entries to each month.
+pub fn stamp_plans_batch_filtered(
+    conn: &mut Connection,
+    plans: &[(String, Vec<String>)],
+    months: &[(String, NaiveDate, i64)],
+) -> Result<Vec<String>> {
+    if plans.is_empty() {
+        anyhow::bail!("select at least one plan");
+    }
+    let tx = conn.transaction()?;
+    let mut month_ids = Vec::with_capacity(months.len());
+    for (label, start_date, days_in_month) in months {
+        let month_id = new_id();
+        tx.execute(
+            "INSERT INTO month (id, plan_id, label, start_date, days_in_month)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                month_id,
+                plans.first().map(|(plan_id, _)| plan_id),
+                label,
+                start_date.format("%Y-%m-%d").to_string(),
+                days_in_month,
+            ],
+        )?;
+        for (plan_id, excluded_item_ids) in plans {
+            insert_plan_instances(
+                &tx,
+                &month_id,
+                plan_id,
+                *start_date,
+                *days_in_month,
+                excluded_item_ids,
+            )?;
+        }
+        month_ids.push(month_id);
+    }
+    tx.commit()?;
+    Ok(month_ids)
+}
+
 fn stamp_in_transaction(
     conn: &Connection,
     plan_id: &str,
@@ -134,9 +174,6 @@ fn stamp_in_transaction(
     excluded_item_ids: &[String],
 ) -> Result<String> {
     let month_id = new_id();
-
-    let mut entries = forecast::resolve_plan_entries(conn, plan_id, start_date, days_in_month)?;
-    entries.retain(|entry| !excluded_item_ids.contains(&entry.entry.item_id));
 
     conn.execute(
         "INSERT INTO month (id, plan_id, label, start_date, days_in_month)
@@ -150,13 +187,35 @@ fn stamp_in_transaction(
         ],
     )?;
 
+    insert_plan_instances(
+        conn,
+        &month_id,
+        plan_id,
+        start_date,
+        days_in_month,
+        excluded_item_ids,
+    )?;
+
+    Ok(month_id)
+}
+
+fn insert_plan_instances(
+    conn: &Connection,
+    month_id: &str,
+    plan_id: &str,
+    start_date: NaiveDate,
+    days_in_month: i64,
+    excluded_item_ids: &[String],
+) -> Result<()> {
+    let mut entries = forecast::resolve_plan_entries(conn, plan_id, start_date, days_in_month)?;
+    entries.retain(|entry| !excluded_item_ids.contains(&entry.entry.item_id));
+
     // The caller owns the transaction. The resolver has already removed off-season entries
     // and chosen one amount for each remaining item. The instance keeps no live link to it.
     for entry in entries {
-        insert_instance_from_entry(conn, &month_id, &entry)?;
+        insert_instance_from_entry(conn, month_id, &entry)?;
     }
-
-    Ok(month_id)
+    Ok(())
 }
 
 /// Insert one fresh instance (envelope or standalone txn) for a plan entry into a month.

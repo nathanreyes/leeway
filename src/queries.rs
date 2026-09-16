@@ -62,8 +62,7 @@ pub enum CurrencySetting {
 }
 
 /// Read the `currency` setting as a three-state value (from the `setting` table's
-/// `currency` key). The value travels with the database, so a synced budget carries
-/// its currency to every device. Callers that only need the recognized currency and
+/// `currency` key). Callers that only need the recognized currency and
 /// can fall back on anything else should use [`currency`] instead.
 pub fn currency_setting(conn: &Connection) -> Result<CurrencySetting> {
     let value: Option<String> = conn
@@ -86,25 +85,12 @@ pub fn currency_setting(conn: &Connection) -> Result<CurrencySetting> {
 /// The app-wide display currency (from the `setting` table's `currency` key).
 /// Returns `None` when the key is absent (a fresh budget that hasn't chosen one
 /// yet) or names a code we don't recognize, so the caller can fall back to
-/// locale detection. The value travels with the database, so a synced budget
-/// carries its currency to every device.
+/// locale detection.
 pub fn currency(conn: &Connection) -> Result<Option<Currency>> {
     Ok(match currency_setting(conn)? {
         CurrencySetting::Known(chosen) => Some(chosen),
         CurrencySetting::Unset | CurrencySetting::Unknown(_) => None,
     })
-}
-
-/// Re-apply the app-wide active currency from the database. Called after a sync
-/// operation swaps in a different budget's data, so the adopted budget's currency
-/// takes effect without a restart. A budget with no currency row leaves the current
-/// choice untouched — we don't re-detect from this device's locale for data that
-/// belongs to another device.
-pub fn apply_active_currency(conn: &Connection) -> Result<()> {
-    if let Some(chosen) = currency(conn)? {
-        currency::set_active(chosen);
-    }
-    Ok(())
 }
 
 pub fn load_accounts(conn: &Connection) -> Result<Vec<Account>> {
@@ -304,8 +290,8 @@ pub fn get_plan(conn: &Connection, plan_id: &str) -> Result<Option<Plan>> {
     }
 }
 
-/// All entries in a plan (plan_item JOIN series), envelopes first then transactions, each
-/// alphabetical — a stable order so the editor's selection doesn't jump as you rename.
+/// All entries in a plan, with envelopes by label and transactions by direction,
+/// largest amount first, then label, matching the month view.
 pub fn load_plan_entries(conn: &Connection, plan_id: &str) -> Result<Vec<PlanEntry>> {
     let mut stmt = conn.prepare(
         "SELECT pi.id AS item_id, pi.plan_id AS plan_id, pi.amount_cents AS amount_cents,
@@ -314,7 +300,9 @@ pub fn load_plan_entries(conn: &Connection, plan_id: &str) -> Result<Vec<PlanEnt
                 s.direction AS direction, s.period_type AS period_type, s.mode AS mode
          FROM plan_item pi JOIN series s ON s.id = pi.series_id
          WHERE pi.plan_id = ?1
-         ORDER BY s.kind, s.label, pi.id",
+         ORDER BY s.kind, s.direction DESC,
+                  CASE WHEN s.kind = 'transaction' THEN pi.amount_cents END DESC,
+                  s.label, pi.id",
     )?;
     let rows = stmt
         .query_map([plan_id], map_plan_entry)?

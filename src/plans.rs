@@ -100,7 +100,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent, summaries: &[PlanSummary]) -> R
         KeyCode::Char('s') => {
             if let Some(s) = selected {
                 let today = Local::now().date_naive();
-                crate::open_stamp_review(app, &s.plan.id, &s.plan.name, today)?;
+                crate::open_stamp_review(app, crate::next_month(today), Some(&s.plan.id))?;
             }
         }
         // `Enter` is intentionally inert: the detail already tracks the selected plan live, so
@@ -786,7 +786,7 @@ mod tests {
             frame_now: std::time::Instant::now(),
             modal: None,
             status: None,
-            sync: None,
+            paths: None,
         };
 
         (app, plan, entries, rent_series_id)

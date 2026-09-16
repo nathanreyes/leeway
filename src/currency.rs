@@ -9,8 +9,7 @@
 //!      format (`CURRENCIES`).
 //!   2. The process-global "active" currency the `Money` `Display`/parse edge
 //!      reads. It is set once at startup from the `setting` table (or, on a fresh
-//!      budget, detected from the OS locale) and again whenever a synced budget is
-//!      adopted or the user picks a different currency.
+//!      budget, detected from the OS locale) and when the user picks a different currency.
 //!
 //! Keeping formatting *conventions* (symbol, minor-unit digits, decimal and
 //! grouping separators, symbol placement) on the currency lets the same integer
@@ -172,8 +171,7 @@ pub fn active() -> Currency {
     *ACTIVE.read().expect("currency lock poisoned")
 }
 
-/// Set the app-wide currency. Called at startup, after adopting a synced budget,
-/// and when the user picks a different currency. Formatting is a pure read of this
+/// Set the app-wide currency at startup and when the user changes it. Formatting reads this
 /// value, so a change takes effect on the next render with no other bookkeeping.
 pub fn set_active(currency: Currency) {
     *ACTIVE.write().expect("currency lock poisoned") = currency;

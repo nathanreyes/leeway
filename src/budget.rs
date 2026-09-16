@@ -309,6 +309,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, no_plans: bool) {
     let global = Line::from(vec![
         key(" tab "),
         Span::raw(" panel  "),
+        key(" s "),
+        Span::raw(" stamp  "),
         key(" h "),
         Span::raw(" help  "),
         key(" S "),

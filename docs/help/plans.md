@@ -14,9 +14,9 @@ Editing a month's bills or envelopes doesn't change the plan either. You can use
 
 ## Stamp review
 
-Press `s` to open one stamp window. The left pane lists the year’s months and checks next month by default. Use Space to check more months, and Left/Right to change the shown year. The right pane lists every plan item. Use Space to turn an item off for this stamp, or Left/Right or `f` to choose static or a historical amount. `tab` switches panes; `enter` stamps every checked month.
+Press `s` from any budget panel to open the stamp window. The month pane checks the focused month, or next month when a plan is focused. The plan pane checks the focused plan, or starts empty when a month is focused. Use Space to check more months and plans. The item pane lists items from all checked plans. Use Space to turn an item off for this stamp, or Left/Right or `f` to choose static or a historical amount. `tab` switches panes; `enter` stamps every checked plan into every checked month.
 
-Leeway remembers each amount source, but an off choice lasts for this stamp only. Seasonal plan rules still decide which checked months include each item. A stamped month must be selected alone so Leeway can ask how to restamp it.
+Leeway remembers each amount source, but an off choice lasts for this stamp only. Seasonal plan rules still decide which checked months include each item. A stamped month and one plan must be selected alone so Leeway can ask how to restamp it.
 
 Historical choices use settled bill and income amounts or spending recorded inside manual envelopes. Automatic envelopes stay static. If a saved source has no data for the target month, Leeway shows and uses the static amount but keeps the saved source for later.
 
