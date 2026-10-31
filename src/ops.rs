@@ -220,7 +220,7 @@ fn insert_plan_instances(
 
 /// Insert one fresh instance (envelope or standalone txn) for a plan entry into a month.
 /// The intrinsic fields come from the shared `series`; the amount from this plan's item.
-/// `stamped_amount == amount` at stamp time. Shared by fresh stamp, merge, and replace.
+/// `stamped_amount == amount` at stamp time. Shared by fresh stamp and restamp.
 fn insert_instance_from_entry(
     conn: &Connection,
     month_id: &str,
@@ -271,10 +271,10 @@ fn insert_instance_from_entry(
     Ok(())
 }
 
-// --- Restamp: Merge / Replace --------------------------------------------------
+// --- Restamp -------------------------------------------------------------------
 
-/// Resolve the plan entries that apply to an already-stamped month. Both restamp paths
-/// derive the target date and day count from the same `month` row.
+/// Resolve the plan entries that apply to an already-stamped month, deriving the target
+/// date and day count from its `month` row.
 fn active_entries_for_month(
     conn: &Connection,
     month_id: &str,
@@ -290,7 +290,7 @@ fn active_entries_for_month(
 }
 
 /// Legacy predicate for seriesless hand-entered data — standalone one-offs,
-/// manual-envelope spending, OR an ad-hoc envelope. The active Replace UI uses
+/// manual-envelope spending, OR an ad-hoc envelope. The restamp UI uses
 /// `month_has_items_outside_plan` because series-backed month additions are now normal.
 pub fn month_has_handentered(conn: &Connection, month_id: &str) -> Result<bool> {
     // Two `series_id IS NULL` checks, one per table — a hand-entered txn or an ad-hoc
@@ -304,9 +304,9 @@ pub fn month_has_handentered(conn: &Connection, month_id: &str) -> Result<bool> 
     Ok(has)
 }
 
-/// Does this month contain data outside the target plan? This is the Replace guard in the
-/// universal-series model: rows are preserved or wiped based on plan membership, not on
-/// whether they carry a series id.
+/// Does this month contain data outside the target plan? This decides whether restamp
+/// offers to remove items the plan doesn't have. Membership is by plan entry, not by
+/// whether a row carries a series id; envelope spending follows its envelope.
 pub fn month_has_items_outside_plan(
     conn: &Connection,
     month_id: &str,
@@ -316,12 +316,13 @@ pub fn month_has_items_outside_plan(
     let mut remaining = occurrence_counts(&entries);
 
     for txn in queries::load_txns(conn, month_id)? {
+        if txn.envelope_id.is_some() {
+            // Spending belongs to its envelope; only the envelope can be outside the plan.
+            continue;
+        }
         let Some(series_id) = txn.series_id.as_deref() else {
             return Ok(true);
         };
-        if txn.envelope_id.is_some() {
-            return Ok(true);
-        }
         if !consume_occurrence(&mut remaining, Kind::Transaction, series_id) {
             return Ok(true);
         }
@@ -339,24 +340,33 @@ pub fn month_has_items_outside_plan(
     Ok(false)
 }
 
-/// Merge a plan into an existing month: additive, refreshing the planned baseline.
-/// - A matching **unsettled** instance is refreshed to the plan's values.
+/// Restamp a plan into an existing month, refreshing the planned baseline.
+/// - A matching envelope is refreshed in place, so its spending stays linked.
+/// - A matching **unsettled** transaction is refreshed to the plan's values.
 /// - A matching **settled** transaction is left untouched (it holds a real actual).
 /// - A plan entry with no instance is inserted.
 ///
-/// Nothing is ever deleted. Repeated occurrences of a series are matched in stable row
-/// order. An item the plan doesn't run in this month is simply not an entry here, so it is
-/// neither inserted nor matched — and since merge never deletes, an instance already
-/// standing from an earlier stamp survives untouched.
-pub fn restamp_merge(conn: &mut Connection, month_id: &str, plan_id: &str) -> Result<()> {
-    restamp_merge_filtered(conn, month_id, plan_id, &[])
-}
-
-/// Merge a plan while honoring one-time item exclusions from the stamp window.
-pub fn restamp_merge_filtered(
+/// Repeated occurrences of a series are matched in stable row order. With
+/// `remove_unplanned`, rows the plan doesn't have are deleted: unmatched standalone
+/// transactions (settled or not) and unmatched envelopes with their spending. An item the
+/// plan doesn't run in this month is not an entry here, so it counts as one the plan
+/// doesn't have — that is how a seasonal envelope stamped into the wrong month is cleaned
+/// up. Without the option nothing is deleted.
+pub fn restamp(
     conn: &mut Connection,
     month_id: &str,
     plan_id: &str,
+    remove_unplanned: bool,
+) -> Result<()> {
+    restamp_filtered(conn, month_id, plan_id, remove_unplanned, &[])
+}
+
+/// Restamp a month while honoring one-time item exclusions from the stamp window.
+pub fn restamp_filtered(
+    conn: &mut Connection,
+    month_id: &str,
+    plan_id: &str,
+    remove_unplanned: bool,
     excluded_item_ids: &[String],
 ) -> Result<()> {
     let tx = conn.transaction()?;
@@ -390,79 +400,17 @@ pub fn restamp_merge_filtered(
             }
         }
     }
-    tx.execute(
-        "UPDATE month SET plan_id = ?1 WHERE id = ?2",
-        rusqlite::params![plan_id, month_id],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
 
-/// Replace a month from a plan (clean slate). Instances whose series is in the target plan
-/// are reset in place (amount & stamped reset, unsettled, coded fields refreshed) —
-/// resetting rather than delete+recreate keeps instance ids stable so manual-envelope
-/// spending stays linked. Rows outside the target plan are wiped unless
-/// `keep_outside_plan`. An item the plan doesn't run in this month counts as outside it, so
-/// a seasonal envelope stamped into the wrong month is cleaned up by a replace.
-pub fn restamp_replace(
-    conn: &mut Connection,
-    month_id: &str,
-    plan_id: &str,
-    keep_outside_plan: bool,
-) -> Result<()> {
-    restamp_replace_filtered(conn, month_id, plan_id, keep_outside_plan, &[])
-}
-
-/// Replace a month while honoring one-time item exclusions from the stamp window.
-pub fn restamp_replace_filtered(
-    conn: &mut Connection,
-    month_id: &str,
-    plan_id: &str,
-    keep_outside_plan: bool,
-    excluded_item_ids: &[String],
-) -> Result<()> {
-    let tx = conn.transaction()?;
-    let entries = active_entries_for_month(&tx, month_id, plan_id, excluded_item_ids)?;
-    let txns = queries::load_txns(&tx, month_id)?;
-    let envelopes = queries::load_envelopes(&tx, month_id)?;
-    let mut matched_txns: HashSet<String> = HashSet::new();
-    let mut matched_envelopes: HashSet<String> = HashSet::new();
-
-    for entry in &entries {
-        match entry.entry.series.kind {
-            Kind::Envelope => {
-                if let Some(envelope) =
-                    next_matching_envelope(&envelopes, &matched_envelopes, &entry.entry.series.id)
-                {
-                    matched_envelopes.insert(envelope.id.clone());
-                    refresh_envelope(&tx, &envelope.id, entry)?;
-                } else {
-                    insert_instance_from_entry(&tx, month_id, entry)?;
-                }
-            }
-            Kind::Transaction => {
-                if let Some(txn) = next_matching_txn(&txns, &matched_txns, &entry.entry.series.id) {
-                    matched_txns.insert(txn.id.clone());
-                    refresh_txn(&tx, &txn.id, entry)?;
-                } else {
-                    insert_instance_from_entry(&tx, month_id, entry)?;
-                }
-            }
-        }
-    }
-
-    if !keep_outside_plan {
+    if remove_unplanned {
+        // Spending is never matched itself; it lives or dies with its envelope.
         for txn in &txns {
-            if !matched_txns.contains(&txn.id) {
+            if txn.envelope_id.is_none() && !matched_txns.contains(&txn.id) {
                 tx.execute("DELETE FROM txn WHERE id = ?1", [&txn.id])?;
             }
         }
         for envelope in &envelopes {
             if !matched_envelopes.contains(&envelope.id) {
-                tx.execute(
-                    "UPDATE txn SET envelope_id = NULL WHERE envelope_id = ?1",
-                    [&envelope.id],
-                )?;
+                tx.execute("DELETE FROM txn WHERE envelope_id = ?1", [&envelope.id])?;
                 tx.execute("DELETE FROM envelope WHERE id = ?1", [&envelope.id])?;
             }
         }
@@ -545,14 +493,14 @@ fn refresh_envelope(conn: &Connection, id: &str, resolved: &ResolvedPlanEntry) -
     Ok(())
 }
 
-/// Reset a standalone txn instance to a plan entry's planned values, unsettling it.
+/// Reset an unsettled standalone txn instance to a plan entry's planned values.
 fn refresh_txn(conn: &Connection, id: &str, resolved: &ResolvedPlanEntry) -> Result<()> {
     let entry = &resolved.entry;
     let s = &entry.series;
     conn.execute(
         "UPDATE txn
          SET amount_cents = ?1, stamped_amount_cents = ?2, label = ?3,
-             direction = ?4, settled = 0, date_paid = NULL
+             direction = ?4
          WHERE id = ?5",
         rusqlite::params![
             resolved.amount,
@@ -1660,41 +1608,41 @@ mod tests {
     }
 
     #[test]
-    fn merge_neither_adds_nor_removes_an_out_of_season_item() {
+    fn restamp_neither_adds_nor_removes_an_out_of_season_item() {
         let (mut conn, plan_id, gifts) = seasonal_plan();
         let april = NaiveDate::from_ymd_opt(2027, 4, 1).unwrap();
         let month_id = stamp(&mut conn, &plan_id, "2027-04", april, 30).unwrap();
 
-        // Merging the plan into an off-season month does not bring the seasonal item in.
-        restamp_merge(&mut conn, &month_id, &plan_id).unwrap();
+        // Restamping an off-season month does not bring the seasonal item in.
+        restamp(&mut conn, &month_id, &plan_id, false).unwrap();
         assert!(
             queries::load_envelopes(&conn, &month_id)
                 .unwrap()
                 .is_empty()
         );
 
-        // And once one is there by hand, merge leaves it alone — merge never deletes.
+        // And once one is there by hand, a plain restamp leaves it alone — it never deletes.
         add_series_envelope_instance(&conn, &month_id, &gifts, Money::from_dollars(80.0)).unwrap();
-        restamp_merge(&mut conn, &month_id, &plan_id).unwrap();
+        restamp(&mut conn, &month_id, &plan_id, false).unwrap();
         let envelopes = queries::load_envelopes(&conn, &month_id).unwrap();
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].amount, Money::from_dollars(80.0));
     }
 
     #[test]
-    fn replace_treats_an_out_of_season_item_as_outside_the_plan() {
+    fn removal_treats_an_out_of_season_item_as_outside_the_plan() {
         let (mut conn, plan_id, gifts) = seasonal_plan();
         let april = NaiveDate::from_ymd_opt(2027, 4, 1).unwrap();
         let month_id = stamp(&mut conn, &plan_id, "2027-04", april, 30).unwrap();
         add_series_envelope_instance(&conn, &month_id, &gifts, Money::from_dollars(80.0)).unwrap();
 
-        // Keeping outside-plan rows keeps it, because April isn't one of its months.
-        restamp_replace(&mut conn, &month_id, &plan_id, true).unwrap();
+        // Without removal it stays, because April isn't one of its months.
+        restamp(&mut conn, &month_id, &plan_id, false).unwrap();
         assert_eq!(queries::load_envelopes(&conn, &month_id).unwrap().len(), 1);
 
-        // A clean slate wipes it — this is how a gift envelope stamped into the wrong
-        // month gets cleaned up.
-        restamp_replace(&mut conn, &month_id, &plan_id, false).unwrap();
+        // With removal it goes — this is how a gift envelope stamped into the wrong month
+        // gets cleaned up.
+        restamp(&mut conn, &month_id, &plan_id, true).unwrap();
         assert!(
             queries::load_envelopes(&conn, &month_id)
                 .unwrap()
@@ -1703,7 +1651,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_still_refreshes_an_in_season_item() {
+    fn restamp_refreshes_an_in_season_item() {
         let (mut conn, plan_id, _) = seasonal_plan();
         let july = NaiveDate::from_ymd_opt(2027, 7, 1).unwrap();
         let month_id = stamp(&mut conn, &plan_id, "2027-07", july, 31).unwrap();
@@ -1711,7 +1659,7 @@ mod tests {
         let envelope = queries::load_envelopes(&conn, &month_id).unwrap().remove(0);
         set_envelope_amount(&conn, &envelope.id, Money::from_dollars(5.0)).unwrap();
 
-        restamp_replace(&mut conn, &month_id, &plan_id, false).unwrap();
+        restamp(&mut conn, &month_id, &plan_id, true).unwrap();
         let envelopes = queries::load_envelopes(&conn, &month_id).unwrap();
         assert_eq!(envelopes.len(), 1);
         assert_eq!(
@@ -1851,7 +1799,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_plan_series_continuity_on_merge() {
+    fn cross_plan_series_continuity_on_restamp() {
         let mut conn = db::open_in_memory().unwrap();
         // One shared Rent series, included in two different plans at different amounts.
         let rent = create_series(
@@ -1871,8 +1819,8 @@ mod tests {
         let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
         let month_id = stamp(&mut conn, &plan_a, "2026-09", start, 30).unwrap();
 
-        // Merge a DIFFERENT plan into the month — matching is by the shared series id.
-        restamp_merge(&mut conn, &month_id, &plan_b).unwrap();
+        // Restamp a DIFFERENT plan into the month — matching is by the shared series id.
+        restamp(&mut conn, &month_id, &plan_b, false).unwrap();
 
         let txns = queries::load_txns(&conn, &month_id).unwrap();
         let rent_rows: Vec<_> = txns
@@ -1892,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_protects_settled_refreshes_unsettled_and_adds_new() {
+    fn restamp_protects_settled_refreshes_unsettled_and_adds_new() {
         let mut conn = db::open_in_memory().unwrap();
         let plan = create_plan(&conn, "P").unwrap();
         let rent = create_series(
@@ -1941,7 +1889,7 @@ mod tests {
         .unwrap();
         add_plan_item(&conn, &plan, &water, Money::from_dollars(40.0)).unwrap();
 
-        restamp_merge(&mut conn, &month_id, &plan).unwrap();
+        restamp(&mut conn, &month_id, &plan, false).unwrap();
 
         let after = queries::load_txns(&conn, &month_id).unwrap();
         let get = |sid: &str| {
@@ -1969,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_wipes_or_keeps_handentered() {
+    fn restamp_removes_or_keeps_handentered() {
         // Helper builds a month with a bill, a manual envelope, a one-off, and manual spending.
         fn setup() -> (Connection, String, String, String) {
             let mut conn = db::open_in_memory().unwrap();
@@ -1998,7 +1946,7 @@ mod tests {
             let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
             let month_id = stamp(&mut conn, &plan, "2026-09", start, 30).unwrap();
 
-            // Settle Rent so we can confirm Replace unsettles it.
+            // Settle Rent so we can confirm a restamp leaves it paid.
             let rent_txn_id = {
                 let txns = queries::load_txns(&conn, &month_id).unwrap();
                 txns.iter()
@@ -2035,23 +1983,23 @@ mod tests {
             (conn, plan, month_id, dining_env_id)
         }
 
-        // Full wipe: hand-entered gone; Rent reset & unsettled.
+        // Removal: the one-off goes; Rent stays paid; spending in the kept Dining envelope
+        // stays linked.
         {
-            let (mut conn, plan, month_id, _dining) = setup();
-            restamp_replace(&mut conn, &month_id, &plan, false).unwrap();
+            let (mut conn, plan, month_id, dining) = setup();
+            restamp(&mut conn, &month_id, &plan, true).unwrap();
             let txns = queries::load_txns(&conn, &month_id).unwrap();
-            assert!(
-                txns.iter().all(|t| t.series_id.is_some()),
-                "all one-offs + manual spending wiped"
-            );
+            assert!(txns.iter().all(|t| t.id != "oneoff"), "one-off removed");
             let rent = txns.iter().find(|t| t.label == "Rent").unwrap();
-            assert!(!rent.settled, "Replace unsettles plan items");
+            assert!(rent.settled, "restamp never unsettles");
+            let spend = txns.iter().find(|t| t.id == "spend").unwrap();
+            assert_eq!(spend.envelope_id.as_deref(), Some(dining.as_str()));
         }
 
         // Keep hand-entered: one-off stays; manual spending stays linked to its envelope.
         {
             let (mut conn, plan, month_id, dining) = setup();
-            restamp_replace(&mut conn, &month_id, &plan, true).unwrap();
+            restamp(&mut conn, &month_id, &plan, false).unwrap();
             let txns = queries::load_txns(&conn, &month_id).unwrap();
             assert!(txns.iter().any(|t| t.id == "oneoff"), "one-off kept");
             let spend = txns.iter().find(|t| t.id == "spend").unwrap();
@@ -2061,6 +2009,177 @@ mod tests {
                 "spending still linked"
             );
         }
+    }
+
+    /// A plan with Rent (bill) and Dining (manual envelope), stamped into Sept 2026.
+    fn rent_and_dining_month() -> (Connection, String, String, String, String) {
+        let mut conn = db::open_in_memory().unwrap();
+        let plan = create_plan(&conn, "P").unwrap();
+        let rent = create_series(
+            &conn,
+            Kind::Transaction,
+            "Rent",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        add_plan_item(&conn, &plan, &rent, Money::from_dollars(1000.0)).unwrap();
+        let dining = create_series(
+            &conn,
+            Kind::Envelope,
+            "Dining",
+            None,
+            Some(PeriodType::Monthly),
+            Some(Mode::Manual),
+        )
+        .unwrap();
+        add_plan_item(&conn, &plan, &dining, Money::from_dollars(300.0)).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let month_id = stamp(&mut conn, &plan, "2026-09", start, 30).unwrap();
+        let rent_txn = queries::load_txns(&conn, &month_id).unwrap().remove(0).id;
+        let dining_env = queries::load_envelopes(&conn, &month_id)
+            .unwrap()
+            .remove(0)
+            .id;
+        (conn, plan, month_id, rent_txn, dining_env)
+    }
+
+    #[test]
+    fn restamp_leaves_settled_rows_unchanged() {
+        for remove_unplanned in [false, true] {
+            let (mut conn, plan, month_id, rent_txn, _) = rent_and_dining_month();
+            mark_paid(
+                &conn,
+                &rent_txn,
+                Money::from_dollars(987.0),
+                Some("2026-09-03"),
+            )
+            .unwrap();
+            let rent_item = queries::load_plan_entries(&conn, &plan)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.series.label == "Rent")
+                .unwrap()
+                .item_id;
+            set_item_amount(&conn, &rent_item, Money::from_dollars(1100.0)).unwrap();
+            let before = queries::load_txns(&conn, &month_id)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.id == rent_txn)
+                .unwrap();
+
+            restamp(&mut conn, &month_id, &plan, remove_unplanned).unwrap();
+
+            let after = queries::load_txns(&conn, &month_id).unwrap();
+            let rent: Vec<_> = after.iter().filter(|t| t.label == "Rent").collect();
+            assert_eq!(rent.len(), 1, "matched, not re-inserted");
+            let rent = rent[0];
+            assert_eq!(rent.id, before.id);
+            assert!(rent.settled);
+            assert_eq!(rent.amount, Money::from_dollars(987.0));
+            assert_eq!(rent.stamped_amount, before.stamped_amount);
+            assert_eq!(rent.date_paid, before.date_paid);
+        }
+    }
+
+    #[test]
+    fn spending_in_a_kept_envelope_survives_removal() {
+        let (mut conn, plan, month_id, _, dining_env) = rent_and_dining_month();
+        let spend = add_envelope_spending(
+            &conn,
+            &month_id,
+            &dining_env,
+            "Lunch",
+            Money::from_dollars(25.0),
+        )
+        .unwrap();
+        assert!(
+            !month_has_items_outside_plan(&conn, &month_id, &plan).unwrap(),
+            "spending alone is not outside the plan"
+        );
+
+        restamp(&mut conn, &month_id, &plan, true).unwrap();
+
+        let envs = queries::load_envelopes(&conn, &month_id).unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].id, dining_env, "refreshed in place");
+        let lunch = queries::load_txns(&conn, &month_id)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == spend)
+            .unwrap();
+        assert_eq!(lunch.envelope_id.as_deref(), Some(dining_env.as_str()));
+        assert_eq!(lunch.amount, Money::from_dollars(25.0));
+    }
+
+    #[test]
+    fn removal_deletes_only_unmatched_rows() {
+        let (mut conn, plan, month_id, rent_txn, dining_env) = rent_and_dining_month();
+        mark_paid(&conn, &rent_txn, Money::from_dollars(1000.0), None).unwrap();
+        let lunch = add_envelope_spending(
+            &conn,
+            &month_id,
+            &dining_env,
+            "Lunch",
+            Money::from_dollars(25.0),
+        )
+        .unwrap();
+
+        // Rows the plan doesn't have: a paid one-off, a series-backed bill, and an ad-hoc
+        // envelope with its own spending.
+        let gift = add_oneoff_txn(
+            &conn,
+            &month_id,
+            "Gift",
+            Direction::Out,
+            Money::from_dollars(50.0),
+        )
+        .unwrap();
+        mark_paid(&conn, &gift, Money::from_dollars(50.0), None).unwrap();
+        let concert = create_series(
+            &conn,
+            Kind::Transaction,
+            "Concert",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        add_series_txn_instance(&conn, &month_id, &concert, Money::from_dollars(120.0)).unwrap();
+        let fun = add_oneoff_envelope(
+            &conn,
+            &month_id,
+            "Fun",
+            Money::from_dollars(200.0),
+            PeriodType::Monthly,
+            Mode::Manual,
+        )
+        .unwrap();
+        add_envelope_spending(&conn, &month_id, &fun, "Movie", Money::from_dollars(15.0)).unwrap();
+        assert!(month_has_items_outside_plan(&conn, &month_id, &plan).unwrap());
+
+        restamp(&mut conn, &month_id, &plan, true).unwrap();
+
+        let mut txn_ids: Vec<_> = queries::load_txns(&conn, &month_id)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        txn_ids.sort();
+        let mut expected = vec![rent_txn, lunch];
+        expected.sort();
+        assert_eq!(
+            txn_ids, expected,
+            "only the plan bill and kept spending remain"
+        );
+        let env_ids: Vec<_> = queries::load_envelopes(&conn, &month_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(env_ids, vec![dining_env]);
+        assert!(!month_has_items_outside_plan(&conn, &month_id, &plan).unwrap());
     }
 
     #[test]
@@ -2364,7 +2483,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_can_wipe_or_keep_series_backed_items_outside_plan() {
+    fn restamp_can_remove_or_keep_series_backed_items_outside_plan() {
         fn setup() -> (Connection, String, String, String) {
             let mut conn = db::open_in_memory().unwrap();
             let plan = create_plan(&conn, "P").unwrap();
@@ -2397,18 +2516,18 @@ mod tests {
 
         {
             let (mut conn, plan, month_id, concert) = setup();
-            restamp_replace(&mut conn, &month_id, &plan, false).unwrap();
+            restamp(&mut conn, &month_id, &plan, true).unwrap();
             let txns = queries::load_txns(&conn, &month_id).unwrap();
             assert!(
                 txns.iter()
                     .all(|t| t.series_id.as_deref() != Some(concert.as_str())),
-                "outside-plan series wiped"
+                "outside-plan series removed"
             );
         }
 
         {
             let (mut conn, plan, month_id, concert) = setup();
-            restamp_replace(&mut conn, &month_id, &plan, true).unwrap();
+            restamp(&mut conn, &month_id, &plan, false).unwrap();
             let txns = queries::load_txns(&conn, &month_id).unwrap();
             assert!(
                 txns.iter()
@@ -2419,7 +2538,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_adds_repeated_plan_occurrences_without_collapsing_series() {
+    fn restamp_adds_repeated_plan_occurrences_without_collapsing_series() {
         let mut conn = db::open_in_memory().unwrap();
         let plan = create_plan(&conn, "P").unwrap();
         let paycheck = create_series(
@@ -2437,7 +2556,7 @@ mod tests {
         let month_id = stamp(&mut conn, &plan, "2026-09", start, 30).unwrap();
         add_plan_item(&conn, &plan, &paycheck, Money::from_dollars(4500.0)).unwrap();
 
-        restamp_merge(&mut conn, &month_id, &plan).unwrap();
+        restamp(&mut conn, &month_id, &plan, false).unwrap();
 
         let mut amounts = queries::load_txns(&conn, &month_id)
             .unwrap()
@@ -2453,7 +2572,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_matches_repeated_occurrences_and_can_keep_extras() {
+    fn restamp_matches_repeated_occurrences_and_can_remove_extras() {
         fn setup() -> (Connection, String, String, String) {
             let mut conn = db::open_in_memory().unwrap();
             let plan = create_plan(&conn, "P").unwrap();
@@ -2477,19 +2596,19 @@ mod tests {
         {
             let (mut conn, plan, month_id, paycheck) = setup();
             assert!(month_has_items_outside_plan(&conn, &month_id, &plan).unwrap());
-            restamp_replace(&mut conn, &month_id, &plan, false).unwrap();
+            restamp(&mut conn, &month_id, &plan, true).unwrap();
             let rows = queries::load_txns(&conn, &month_id)
                 .unwrap()
                 .into_iter()
                 .filter(|t| t.series_id.as_deref() == Some(paycheck.as_str()))
                 .collect::<Vec<_>>();
-            assert_eq!(rows.len(), 1, "extra occurrence wiped");
+            assert_eq!(rows.len(), 1, "extra occurrence removed");
             assert_eq!(rows[0].amount, Money::from_dollars(5000.0));
         }
 
         {
             let (mut conn, plan, month_id, paycheck) = setup();
-            restamp_replace(&mut conn, &month_id, &plan, true).unwrap();
+            restamp(&mut conn, &month_id, &plan, false).unwrap();
             let rows = queries::load_txns(&conn, &month_id)
                 .unwrap()
                 .into_iter()
@@ -2612,7 +2731,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_wipes_or_keeps_adhoc_envelope() {
+    fn restamp_removes_or_keeps_adhoc_envelope() {
         // Build a month with one plan bill plus an ad-hoc manual envelope that has spending.
         fn setup() -> (Connection, String, String, String) {
             let mut conn = db::open_in_memory().unwrap();
@@ -2650,16 +2769,19 @@ mod tests {
             (conn, plan, month_id, env_id)
         }
 
-        // Wipe: the ad-hoc envelope and its spending are both gone; the plan bill survives.
+        // Removal: the ad-hoc envelope and its spending are both gone; the plan bill survives.
         {
             let (mut conn, plan, month_id, env_id) = setup();
-            restamp_replace(&mut conn, &month_id, &plan, false).unwrap();
+            restamp(&mut conn, &month_id, &plan, true).unwrap();
             let envs = queries::load_envelopes(&conn, &month_id).unwrap();
-            assert!(envs.iter().all(|e| e.id != env_id), "ad-hoc envelope wiped");
+            assert!(
+                envs.iter().all(|e| e.id != env_id),
+                "ad-hoc envelope removed"
+            );
             let txns = queries::load_txns(&conn, &month_id).unwrap();
             assert!(
                 txns.iter().all(|t| t.envelope_id.is_none()),
-                "its spending wiped too"
+                "its spending removed too"
             );
             assert!(txns.iter().any(|t| t.label == "Rent"), "plan bill kept");
         }
@@ -2667,7 +2789,7 @@ mod tests {
         // Keep: the ad-hoc envelope and its spending both remain, still linked.
         {
             let (mut conn, plan, month_id, env_id) = setup();
-            restamp_replace(&mut conn, &month_id, &plan, true).unwrap();
+            restamp(&mut conn, &month_id, &plan, false).unwrap();
             let envs = queries::load_envelopes(&conn, &month_id).unwrap();
             assert!(envs.iter().any(|e| e.id == env_id), "ad-hoc envelope kept");
             let txns = queries::load_txns(&conn, &month_id).unwrap();

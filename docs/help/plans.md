@@ -20,6 +20,12 @@ Leeway remembers each amount source, but an off choice lasts for this stamp only
 
 Historical choices use settled bill and income amounts or spending recorded inside manual envelopes. Automatic envelopes stay static. If a saved source has no data for the target month, Leeway shows and uses the static amount but keeps the saved source for later.
 
+## Restamping
+
+Stamping a month that already has a plan restamps it. Unpaid items and envelopes match the plan's amounts again, and plan items the month lacks are added. Paid items stay paid at the amount you paid, and spending stays in its envelope.
+
+Press `r` to restamp. If the month has items the plan doesn't, `x` restamps and removes them too: those bills, income, and envelopes with their spending. Removing a paid item doesn't change what's left.
+
 ## Seasonal items
 
 Some money is just as regular but doesn't land every month: birthday gifts, school fees, an annual premium. Focus an item and press `M` to say which months it runs in — `mar,jul,nov`, `jun-aug`, or `all` to go back to every month.

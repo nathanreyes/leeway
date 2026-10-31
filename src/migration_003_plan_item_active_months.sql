@@ -11,7 +11,7 @@
 -- reason `amount_cents` does: it answers "what does THIS plan do with the item", and series
 -- edits reach every plan at once.
 --
--- Stamping is the only reader. `ops::stamp` (and both restamp paths) skip items whose mask
+-- Stamping is the only reader. `ops::stamp` (and `ops::restamp`) skip items whose mask
 -- excludes the month being stamped; the resulting `envelope`/`txn` rows copy nothing about
 -- seasonality, because an instance already belongs to exactly one month.
 ALTER TABLE plan_item ADD COLUMN active_months INTEGER

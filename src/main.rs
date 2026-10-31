@@ -197,7 +197,7 @@ impl SeriesFilter {
 }
 
 /// A floating dialog that captures input while open. Free text (names, amounts, a month
-/// to stamp), a destructive-action confirm, or a hotkey menu (Merge/Replace/Cancel).
+/// to stamp), a destructive-action confirm, or a hotkey menu (Restamp/Cancel).
 pub enum Modal {
     Text(TextPrompt),
     SeriesSearch(SeriesSearch),
@@ -426,22 +426,10 @@ pub enum ModalAction {
     BeginNewAccount {
         account_type: AccountType,
     },
-    RestampMerge {
+    Restamp {
         month_id: String,
         plan_id: String,
-        excluded_item_ids: Vec<String>,
-    },
-    /// Replace, but scope (wipe vs keep items outside the target plan) is decided in a
-    /// follow-up choice.
-    RestampReplace {
-        month_id: String,
-        plan_id: String,
-        excluded_item_ids: Vec<String>,
-    },
-    RestampReplaceScoped {
-        month_id: String,
-        plan_id: String,
-        keep_outside_plan: bool,
+        remove_unplanned: bool,
         excluded_item_ids: Vec<String>,
     },
     SetSeriesRange {
@@ -1946,7 +1934,7 @@ fn confirm_stamp_review(app: &mut App) -> Result<()> {
             month_id,
             selected_plan_ids[0].clone(),
             excluded_item_ids,
-        );
+        )?;
         return Ok(());
     }
 
@@ -2162,8 +2150,7 @@ fn handle_choice_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-/// Execute a chosen restamp action. Replace fans out into a scope choice when the month
-/// has rows outside the target plan, so we never silently wipe them.
+/// Execute a chosen modal action.
 fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
     match action {
         ModalAction::BeginNewAccount { account_type } => {
@@ -2177,78 +2164,23 @@ fn run_modal_action(app: &mut App, action: ModalAction) -> Result<()> {
                 PromptKind::NewAccountName { account_type },
             );
         }
-        ModalAction::RestampMerge {
+        ModalAction::Restamp {
             month_id,
             plan_id,
+            remove_unplanned,
             excluded_item_ids,
         } => {
-            ops::restamp_merge_filtered(&mut app.conn, &month_id, &plan_id, &excluded_item_ids)?;
-            finish_restamp(app, "Merged plan into the month");
-        }
-        ModalAction::RestampReplace {
-            month_id,
-            plan_id,
-            excluded_item_ids,
-        } => {
-            if ops::month_has_items_outside_plan(&app.conn, &month_id, &plan_id)? {
-                app.open_choice(
-                    "This month has items outside this plan. Replace how?",
-                    vec![
-                        ChoiceOption {
-                            key: 'w',
-                            label: "Wipe outside-plan items".into(),
-                            action: Some(ModalAction::RestampReplaceScoped {
-                                month_id: month_id.clone(),
-                                plan_id: plan_id.clone(),
-                                keep_outside_plan: false,
-                                excluded_item_ids: excluded_item_ids.clone(),
-                            }),
-                        },
-                        ChoiceOption {
-                            key: 'k',
-                            label: "Keep outside-plan items".into(),
-                            action: Some(ModalAction::RestampReplaceScoped {
-                                month_id,
-                                plan_id,
-                                keep_outside_plan: true,
-                                excluded_item_ids,
-                            }),
-                        },
-                        ChoiceOption {
-                            key: 'c',
-                            label: "Cancel".into(),
-                            action: None,
-                        },
-                    ],
-                );
-            } else {
-                ops::restamp_replace_filtered(
-                    &mut app.conn,
-                    &month_id,
-                    &plan_id,
-                    false,
-                    &excluded_item_ids,
-                )?;
-                finish_restamp(app, "Replaced the month");
-            }
-        }
-        ModalAction::RestampReplaceScoped {
-            month_id,
-            plan_id,
-            keep_outside_plan,
-            excluded_item_ids,
-        } => {
-            ops::restamp_replace_filtered(
+            ops::restamp_filtered(
                 &mut app.conn,
                 &month_id,
                 &plan_id,
-                keep_outside_plan,
+                remove_unplanned,
                 &excluded_item_ids,
             )?;
-            let msg = if keep_outside_plan {
-                "Replaced (kept outside-plan items)"
+            let msg = if remove_unplanned {
+                "Restamped and removed items the plan doesn't have"
             } else {
-                "Replaced the month"
+                "Restamped the month"
             };
             finish_restamp(app, msg);
         }
@@ -3021,41 +2953,41 @@ fn refresh_stamp_preview(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// Offer a restamp of an already-stamped month. Removing items the plan doesn't have is
+/// a separate key, shown only when there is something to remove, so it never happens by
+/// default.
 fn open_restamp_choice(
     app: &mut App,
     label: &str,
     month_id: String,
     plan_id: String,
     excluded_item_ids: Vec<String>,
-) {
-    app.open_choice(
-        format!("{label} is already stamped. Restamp how?"),
-        vec![
-            ChoiceOption {
-                key: 'm',
-                label: "Merge (additive; refresh planned)".into(),
-                action: Some(ModalAction::RestampMerge {
-                    month_id: month_id.clone(),
-                    plan_id: plan_id.clone(),
-                    excluded_item_ids: excluded_item_ids.clone(),
-                }),
-            },
-            ChoiceOption {
-                key: 'r',
-                label: "Replace (clean slate)".into(),
-                action: Some(ModalAction::RestampReplace {
-                    month_id,
-                    plan_id,
-                    excluded_item_ids,
-                }),
-            },
-            ChoiceOption {
-                key: 'c',
-                label: "Cancel".into(),
-                action: None,
-            },
-        ],
-    );
+) -> Result<()> {
+    let restamp = |remove_unplanned| ModalAction::Restamp {
+        month_id: month_id.clone(),
+        plan_id: plan_id.clone(),
+        remove_unplanned,
+        excluded_item_ids: excluded_item_ids.clone(),
+    };
+    let mut options = vec![ChoiceOption {
+        key: 'r',
+        label: "Restamp (paid items stay paid)".into(),
+        action: Some(restamp(false)),
+    }];
+    if ops::month_has_items_outside_plan(&app.conn, &month_id, &plan_id)? {
+        options.push(ChoiceOption {
+            key: 'x',
+            label: "Restamp and remove items not in the plan".into(),
+            action: Some(restamp(true)),
+        });
+    }
+    options.push(ChoiceOption {
+        key: 'c',
+        label: "Cancel".into(),
+        action: None,
+    });
+    app.open_choice(format!("{label} is already stamped. Restamp it?"), options);
+    Ok(())
 }
 
 fn parse_year_month(input: &str) -> Option<(i32, u32)> {
@@ -4390,7 +4322,7 @@ mod tests {
 
         handle_stamp_review_key(&mut app, key(KeyCode::Enter)).unwrap();
         assert!(matches!(app.modal, Some(Modal::Choice(_))));
-        handle_choice_key(&mut app, key(KeyCode::Char('m'))).unwrap();
+        handle_choice_key(&mut app, key(KeyCode::Char('r'))).unwrap();
 
         assert_eq!(
             app.budget_target,
@@ -4399,6 +4331,44 @@ mod tests {
                 month: 10,
             }
         );
+    }
+
+    #[test]
+    fn restamp_offers_removal_only_when_the_month_has_extras() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        let plan_id = queries::plans(&app.conn).unwrap()[0].id.clone();
+        let month_id = ops::stamp(
+            &mut app.conn,
+            &plan_id,
+            "2026-10",
+            NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+            31,
+        )
+        .unwrap();
+        let keys = |app: &App| match &app.modal {
+            Some(Modal::Choice(choice)) => choice.options.iter().map(|o| o.key).collect(),
+            _ => Vec::new(),
+        };
+
+        open_stamp_review(&mut app, (2026, 10), Some(&plan_id)).unwrap();
+        handle_stamp_review_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert_eq!(keys(&app), vec!['r', 'c']);
+
+        let gift = ops::add_oneoff_txn(
+            &app.conn,
+            &month_id,
+            "Gift",
+            Direction::Out,
+            Money::from_dollars(50.0),
+        )
+        .unwrap();
+        open_stamp_review(&mut app, (2026, 10), Some(&plan_id)).unwrap();
+        handle_stamp_review_key(&mut app, key(KeyCode::Enter)).unwrap();
+        assert_eq!(keys(&app), vec!['r', 'x', 'c']);
+
+        handle_choice_key(&mut app, key(KeyCode::Char('x'))).unwrap();
+        let txns = queries::load_txns(&app.conn, &month_id).unwrap();
+        assert!(txns.iter().all(|t| t.id != gift), "extra removed");
     }
 
     fn series_id_for_manage(app: &App, manage: &EnvelopeManage) -> String {

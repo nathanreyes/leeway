@@ -23,7 +23,7 @@ onboarding flow will change as the project matures.
 - Automatic envelopes that release budget over time.
 - Manual envelopes for spending you want to enter directly.
 - Shared series identities for recurring items and long-term trends.
-- Restamping support for refreshing a month from a plan.
+- Restamping to refresh a month from a plan without touching paid items.
 
 ## Installation
 
@@ -91,6 +91,10 @@ Common dashboard keys:
 
 Plans are reusable templates. Stamp a plan into a month to create an independent
 monthly snapshot. Editing a plan later does not rewrite past months.
+
+Stamp a month again to restamp it. Unpaid items return to the plan's amounts,
+missing plan items are added, and paid items stay paid. You can also choose to
+remove items the plan doesn't have.
 
 Series are the durable identities behind recurring budget items. They let
 Leeway connect "Rent" or "Groceries" across months and plans even when labels

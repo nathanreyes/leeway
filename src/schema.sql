@@ -88,8 +88,8 @@ CREATE TABLE month (
 -- `series_id` is also NULLABLE, and NULL carries meaning: an **ad-hoc** envelope — one the
 -- user added straight into this month rather than by stamping a plan. This mirrors `txn`,
 -- where a NULL `series_id` has always marked hand-entered rows. So "did this come from a
--- plan?" is answered the same way for both tables: `series_id IS NOT NULL`. Restamp/Replace
--- treats a NULL-series envelope exactly like a hand-entered txn (kept or wiped together).
+-- plan?" is answered the same way for both tables: `series_id IS NOT NULL`. Restamp
+-- treats a NULL-series envelope exactly like a hand-entered txn (kept or removed together).
 --
 -- `mode` is NOT NULL: it is frozen at stamp time from the (already-concrete) series mode
 -- and never re-resolved, so a stamped month can never change behavior under the user.
