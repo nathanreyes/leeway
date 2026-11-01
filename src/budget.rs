@@ -4,9 +4,9 @@
 use crate::{App, BudgetTarget, DashFocus, PlanFocus, PromptKind};
 use anyhow::Result;
 use chrono::{Datelike, NaiveDate};
-use leeway::models::{Month, Plan, PlanEntry};
-use leeway::queries::PlanSummary;
-use leeway::view::MonthView;
+use leeway_core::models::{Month, Plan, PlanEntry};
+use leeway_core::queries::PlanSummary;
+use leeway_core::view::MonthView;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -334,7 +334,7 @@ fn key(label: &str) -> Span<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leeway::models::Plan;
+    use leeway_core::models::Plan;
 
     #[test]
     fn label_parser_accepts_sidebar_months() {

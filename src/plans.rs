@@ -10,10 +10,10 @@
 use crate::{AddDestination, App, BudgetBlock, ConfirmAction, PlanFocus, PromptKind};
 use anyhow::Result;
 use chrono::Local;
-use leeway::calc::PlanProjection;
-use leeway::models::{Direction, Kind, Mode, PeriodType, Plan, PlanEntry};
-use leeway::money::Money;
-use leeway::queries::PlanSummary;
+use leeway_core::calc::PlanProjection;
+use leeway_core::models::{Direction, Kind, Mode, PeriodType, Plan, PlanEntry};
+use leeway_core::money::Money;
+use leeway_core::queries::PlanSummary;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -275,7 +275,7 @@ fn budget_block_for_focus(focus: PlanFocus) -> BudgetBlock {
 pub fn draw(frame: &mut Frame, app: &App, summaries: &[PlanSummary], entries: &[PlanEntry]) {
     // The summary grows only when the plan has seasonal items to list, so a plan without
     // them keeps the layout it has always had.
-    let projection = leeway::calc::project_plan(entries);
+    let projection = leeway_core::calc::project_plan(entries);
     let [header, body, summary_area, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
@@ -373,7 +373,7 @@ pub fn draw_detail(
     plan: Option<&Plan>,
     entries: &[PlanEntry],
 ) {
-    let projection = leeway::calc::project_plan(entries);
+    let projection = leeway_core::calc::project_plan(entries);
     let [header, body, summary_area] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
@@ -613,7 +613,7 @@ fn draw_plan_block(
         block = block.title_bottom(Line::from(Span::styled(
             format!(
                 " Daily envelope rates assume a {}-day month. ",
-                leeway::calc::PLAN_PROJECTION_DAYS
+                leeway_core::calc::PLAN_PROJECTION_DAYS
             ),
             Style::default().fg(crate::theme::MUTED),
         )));
@@ -712,9 +712,9 @@ fn key(label: &str) -> Span<'static> {
 mod tests {
     use super::*;
     use crate::Screen;
-    use leeway::money::Money;
-    use leeway::ops;
-    use leeway::queries;
+    use leeway_core::money::Money;
+    use leeway_core::ops;
+    use leeway_core::queries;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyModifiers;
@@ -724,7 +724,7 @@ mod tests {
     fn open_test_conn() -> Connection {
         let mut path = std::env::temp_dir();
         path.push(format!("leeway-plans-{}.db", Uuid::new_v4()));
-        leeway::db::open(&path).unwrap()
+        leeway_core::db::open(&path).unwrap()
     }
 
     fn app_with_transaction_plan() -> (App, Plan, Vec<PlanEntry>, String) {
@@ -768,7 +768,7 @@ mod tests {
             series_sel: 0,
             series_search: String::new(),
             series_search_active: false,
-            series_range: leeway::view::SeriesTimeRange::Last12Stamped,
+            series_range: leeway_core::view::SeriesTimeRange::Last12Stamped,
             series_filter: crate::SeriesFilter::Both,
             plan_focus: PlanFocus::Expenses,
             editor_income_sel: 0,
@@ -903,7 +903,7 @@ mod tests {
         let entry = reloaded.iter().find(|e| e.item_id == item_id).unwrap();
         assert_eq!(
             entry.active_months,
-            leeway::models::MonthSet::parse("mar,jul,nov").unwrap()
+            leeway_core::models::MonthSet::parse("mar,jul,nov").unwrap()
         );
 
         // Reopening prefills what was saved, so editing is a tweak rather than a retype.
@@ -924,7 +924,7 @@ mod tests {
         let entry = reloaded.iter().find(|e| e.item_id == item_id).unwrap();
         assert_eq!(
             entry.active_months,
-            leeway::models::MonthSet::parse("mar,jul,nov").unwrap()
+            leeway_core::models::MonthSet::parse("mar,jul,nov").unwrap()
         );
 
         // And "all" puts it back to every month.
@@ -945,8 +945,8 @@ mod tests {
             Kind::Envelope,
             "Kid gifts",
             None,
-            Some(leeway::models::PeriodType::Monthly),
-            Some(leeway::models::Mode::Automatic),
+            Some(leeway_core::models::PeriodType::Monthly),
+            Some(leeway_core::models::Mode::Automatic),
         )
         .unwrap();
         let item =
@@ -954,7 +954,7 @@ mod tests {
         ops::set_item_active_months(
             &app.conn,
             &item,
-            leeway::models::MonthSet::parse("mar,jul,nov").unwrap(),
+            leeway_core::models::MonthSet::parse("mar,jul,nov").unwrap(),
         )
         .unwrap();
 

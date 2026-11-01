@@ -12,7 +12,7 @@ version tag (`vX.Y.Z`):
   binaries for macOS (arm64/x64), Linux x86_64-gnu, and Windows x86_64, and
   publishes a GitHub Release with archives, checksums, and the curl installer.
 - **Publish to crates.io** (`.github/workflows/publish-crates.yml`) — runs
-  `cargo publish --locked` to push the crate.
+  `cargo publish --workspace --locked` to push `leeway-core`, then `leeway`.
 
 This skill performs a release end-to-end. Follow the steps in order and **stop
 immediately if any preflight check fails** — do not push a broken or duplicate
@@ -20,7 +20,9 @@ release.
 
 ## Facts about this repo
 
-- Crate/binary name: `leeway`. Manifest: `Cargo.toml` at the repo root.
+- Crate/binary name: `leeway`. Manifest: `Cargo.toml` at the repo root, which is also
+  the workspace root. The library crate `leeway-core` (`crates/leeway-core`) releases
+  with it under the same version.
 - `origin` uses SSH (`git@github.com:nathanreyes/leeway.git`) — required so the
   push is allowed to touch `.github/workflows/`.
 - Default branch: `master`. Tag format: `vX.Y.Z` (leading `v`).
@@ -39,7 +41,7 @@ The invocation may include a version argument:
 
 ### 1. Determine the target version
 
-- Read the current version from `[package]` in `Cargo.toml`.
+- Read the current version from `[workspace.package]` in `Cargo.toml`.
 - Compute the new version from the argument (default `patch`).
 - State clearly to the user: `current → new` and the tag that will be pushed.
 
@@ -57,8 +59,9 @@ Run these checks. If one fails, report it and stop; do not proceed.
   `git ls-remote --tags origin vX.Y.Z` returns the tag.
 - **Version not already on crates.io** — this is permanent and can never be
   republished. Check the sparse index:
-  `curl -s https://index.crates.io/le/ew/leeway` and confirm no line has
-  `"vers":"X.Y.Z"`.
+  `curl -s https://index.crates.io/le/ew/leeway` and
+  `curl -s https://index.crates.io/le/ew/leeway-core`, and confirm neither has a
+  line with `"vers":"X.Y.Z"`.
 
 ### 3. Draft the release description
 
@@ -86,12 +89,15 @@ description to the user before continuing so the release contents are clear.
 
 ### 4. Bump the version
 
-- Edit `version = "..."` under `[package]` in `Cargo.toml` to the new version.
-- **Sync `Cargo.lock`** (critical — CI runs `cargo publish --locked`): run
-  `cargo check` so Cargo rewrites the `leeway` entry in `Cargo.lock` to the new
-  version. Then verify with `git diff Cargo.lock` that the *only* change is the
-  `leeway` package's `version` line — if other dependency versions changed, stop
-  and investigate rather than committing an unintended dependency bump.
+- In `Cargo.toml`, set the new version in two places: `version = "..."` under
+  `[workspace.package]`, and the `version` in the `leeway-core` line under
+  `[workspace.dependencies]`.
+- **Sync `Cargo.lock`** (critical — CI runs `cargo publish --workspace --locked`):
+  run `cargo check` so Cargo rewrites the `leeway` and `leeway-core` entries in
+  `Cargo.lock` to the new version. Then verify with `git diff Cargo.lock` that the
+  *only* changes are those two packages' `version` lines — if other dependency
+  versions changed, stop and investigate rather than committing an unintended
+  dependency bump.
 
 ### 5. Commit and tag
 

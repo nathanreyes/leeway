@@ -1,27 +1,45 @@
-[package]
-name = "leeway"
+[workspace]
+members = [".", "crates/leeway-core"]
+
+# Both crates release together under one version. A release bumps this line and
+# the matching `leeway-core` version under [workspace.dependencies].
+[workspace.package]
 version = "0.1.10"
 edition = "2024"
-description = "A local-first terminal budgeting app focused on what's left."
 repository = "https://github.com/nathanreyes/leeway"
-readme = "README.md"
 license = "MIT OR Apache-2.0"
 homepage = "https://get-leeway.com"
+
+[workspace.dependencies]
+leeway-core = { path = "crates/leeway-core", version = "0.1.10" }
+anyhow = "1.0.103"
+chrono = "0.4.45"
+rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
+uuid = { version = "1.23.4", features = ["v4"] }
+
+[package]
+name = "leeway"
+version.workspace = true
+edition.workspace = true
+description = "A local-first terminal budgeting app focused on what's left."
+repository.workspace = true
+readme = "README.md"
+license.workspace = true
+homepage.workspace = true
 # Keep the published crate to the buildable app. docs/help/*.md are embedded
 # via include_str! and MUST stay; the marketing site, knowledge base, and
 # design docs are not needed to build leeway.
 exclude = ["site/", "knowledge/", "docs/plans/"]
 
 [dependencies]
-anyhow = "1.0.103"
-chrono = "0.4.45"
+leeway-core.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
 crossterm = "0.29.0"
 ratatui = "0.30.2"
-rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
-rusqlite_migration = "2.6.0"
-sys-locale = "0.3.2"
+rusqlite.workspace = true
 thiserror = "2.0.18"
-uuid = { version = "1.23.4", features = ["v4"] }
+uuid.workspace = true
 
 # The profile that 'dist' will build with
 [profile.dist]

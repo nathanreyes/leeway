@@ -646,11 +646,22 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossterm",
+ "leeway-core",
  "ratatui",
+ "rusqlite",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "leeway-core"
+version = "0.1.10"
+dependencies = [
+ "anyhow",
+ "chrono",
  "rusqlite",
  "rusqlite_migration",
  "sys-locale",
- "thiserror 2.0.18",
  "uuid",
 ]
 

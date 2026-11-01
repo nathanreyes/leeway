@@ -3,12 +3,12 @@
 use crate::{App, BudgetBlock, ChoiceOption, ConfirmAction, ModalAction, PromptKind, SeriesFilter};
 use anyhow::Result;
 use chrono::{Datelike, NaiveDate};
-use leeway::models::{Kind, Mode, PeriodType};
-use leeway::money::Money;
-use leeway::view::{
+use leeway_core::models::{Kind, Mode, PeriodType};
+use leeway_core::money::Money;
+use leeway_core::view::{
     SeriesDetailView, SeriesGroup, SeriesPageView, SeriesTimeRange, SeriesTrendPoint,
 };
-use leeway::{ops, queries};
+use leeway_core::{ops, queries};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -1156,7 +1156,7 @@ fn month_name_from_number(month: &str) -> &str {
 }
 
 fn compact_money(value: Money) -> String {
-    let currency = leeway::currency::active();
+    let currency = leeway_core::currency::active();
     let sign = if value.cents() < 0 { "-" } else { "" };
     // Work in whole major units (dollars/yen/...) so the k/m thresholds hold across
     // currencies regardless of how many minor-unit digits they carry.

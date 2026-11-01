@@ -9,11 +9,11 @@ use crate::{
     anim::{SummaryAnimations, SummaryTerm, display_cents},
 };
 use anyhow::Result;
-use leeway::calc;
-use leeway::models::{AccountType, CreditCardEntryMode, Direction, Mode, PeriodType};
-use leeway::money::Money;
-use leeway::ops;
-use leeway::view::{EnvelopeRow, MonthView};
+use leeway_core::calc;
+use leeway_core::models::{AccountType, CreditCardEntryMode, Direction, Mode, PeriodType};
+use leeway_core::money::Money;
+use leeway_core::ops;
+use leeway_core::view::{EnvelopeRow, MonthView};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -209,7 +209,7 @@ fn previous_dash_focus(current: DashFocus, is_current_month: bool) -> DashFocus 
 }
 
 /// The currently-selected standalone transaction, if an income/expense panel is focused.
-fn selected_txn<'v>(app: &App, view: &'v MonthView) -> Option<&'v leeway::models::Txn> {
+fn selected_txn<'v>(app: &App, view: &'v MonthView) -> Option<&'v leeway_core::models::Txn> {
     match app.dash_focus {
         DashFocus::Income => selected_txn_by_direction(view, Direction::In, app.dash_income_sel),
         DashFocus::Expenses => {
@@ -223,7 +223,7 @@ fn selected_txn_by_direction(
     view: &MonthView,
     direction: Direction,
     selected: usize,
-) -> Option<&leeway::models::Txn> {
+) -> Option<&leeway_core::models::Txn> {
     view.standalone
         .iter()
         .filter(|txn| txn.direction == direction)
@@ -385,7 +385,7 @@ fn edit_amount(app: &mut App, view: &MonthView) {
     } else if let Some(e) = selected_env(app, view) {
         app.open_text_replace_on_type(
             "Envelope amount (dollars)",
-            crate::amount_edit_string(leeway::calc::envelope_period_amount(
+            crate::amount_edit_string(leeway_core::calc::envelope_period_amount(
                 e.envelope.amount,
                 e.envelope.period_type,
                 view.month.days_in_month,
@@ -501,7 +501,7 @@ fn act_on_focus(app: &mut App, view: &MonthView) -> Result<()> {
                     // Credit cards store available credit internally, but the preferred
                     // input can be either that figure or the derived current balance.
                     AccountType::CreditCard => {
-                        let mode = leeway::queries::credit_card_entry_mode(&app.conn)
+                        let mode = leeway_core::queries::credit_card_entry_mode(&app.conn)
                             .unwrap_or(CreditCardEntryMode::AvailableCredit);
                         let limit = acct.credit_limit.unwrap_or(Money::ZERO);
                         let available = acct.available_credit.unwrap_or(Money::ZERO);
@@ -1271,7 +1271,7 @@ mod tests {
     use super::*;
     use crate::{Screen, SeriesMode};
     use chrono::NaiveDate;
-    use leeway::models::Kind;
+    use leeway_core::models::Kind;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyModifiers;
@@ -1281,7 +1281,7 @@ mod tests {
     fn open_test_conn() -> Connection {
         let mut path = std::env::temp_dir();
         path.push(format!("leeway-dashboard-{}.db", Uuid::new_v4()));
-        leeway::db::open(&path).unwrap()
+        leeway_core::db::open(&path).unwrap()
     }
 
     fn app_with_stamped_month() -> App {
@@ -1333,7 +1333,7 @@ mod tests {
             series_sel: 0,
             series_search: String::new(),
             series_search_active: false,
-            series_range: leeway::view::SeriesTimeRange::Last12Stamped,
+            series_range: leeway_core::view::SeriesTimeRange::Last12Stamped,
             series_filter: crate::SeriesFilter::Both,
             plan_focus: crate::PlanFocus::Income,
             editor_income_sel: 0,

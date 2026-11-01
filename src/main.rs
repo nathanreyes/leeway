@@ -23,14 +23,14 @@ mod theme;
 use anim::{ChartAnimation, SummaryAnimations};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Local, NaiveDate};
-use leeway::models::{
+use leeway_core::models::{
     AccountType, CreditCardEntryMode, Direction, ForecastMethod, Kind, Mode, MonthSet, PeriodType,
     Plan, PlanEntry, Series, Txn,
 };
-use leeway::money::Money;
-use leeway::storage;
-use leeway::view::SeriesTimeRange;
-use leeway::{calc, db, ops, queries};
+use leeway_core::money::Money;
+use leeway_core::storage;
+use leeway_core::view::SeriesTimeRange;
+use leeway_core::{calc, db, ops, queries};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -783,8 +783,8 @@ impl App {
 
     /// Open the currency chooser, pre-selecting the currency that's currently active.
     fn open_currency_picker(&mut self) {
-        let active = leeway::currency::active();
-        let selected = leeway::currency::CURRENCIES
+        let active = leeway_core::currency::active();
+        let selected = leeway_core::currency::CURRENCIES
             .iter()
             .position(|c| c.code == active.code)
             .unwrap_or(0);
@@ -811,16 +811,16 @@ fn main() -> Result<()> {
     let currency = match queries::currency_setting(&conn)? {
         queries::CurrencySetting::Known(chosen) => chosen,
         queries::CurrencySetting::Unset => {
-            let detected = leeway::currency::detect_from_locale();
+            let detected = leeway_core::currency::detect_from_locale();
             ops::set_currency(&conn, detected)?;
             detected
         }
         // A newer app version stored a currency this build doesn't recognize. Leave the
         // row untouched — overwriting it would destroy the user's choice on downgrade —
         // and just pick a locale default for this session's display.
-        queries::CurrencySetting::Unknown(_) => leeway::currency::detect_from_locale(),
+        queries::CurrencySetting::Unknown(_) => leeway_core::currency::detect_from_locale(),
     };
-    leeway::currency::set_active(currency);
+    leeway_core::currency::set_active(currency);
     // On a fresh database this stamps the current calendar month, satisfying "if no month
     // exists, create one" for a first-ever launch.
     ops::seed_starter(&mut conn)?;
@@ -917,7 +917,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                     BudgetTarget::Month { year, month } => {
                         app.viewed_year = year;
                         app.viewed_month = month;
-                        let view = leeway::view::MonthView::build_for(
+                        let view = leeway_core::view::MonthView::build_for(
                             &app.conn,
                             today,
                             app.viewed_year,
@@ -1025,7 +1025,7 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 
             Screen::Series { state } => {
                 let state = state.clone();
-                let view = leeway::view::SeriesPageView::build(&app.conn, today, app.series_range)?;
+                let view = leeway_core::view::SeriesPageView::build(&app.conn, today, app.series_range)?;
                 match state.mode {
                     SeriesMode::Detail { series_id } => {
                         let Some(detail) = series::detail_by_id(&view, &series_id) else {
@@ -1330,7 +1330,7 @@ fn draw_general_tab(frame: &mut Frame, area: Rect, app: &App) {
     };
     let card_entry_mode =
         queries::credit_card_entry_mode(&app.conn).unwrap_or(CreditCardEntryMode::AvailableCredit);
-    let currency = leeway::currency::active();
+    let currency = leeway_core::currency::active();
     let rows = [
         ("New-envelope default", mode_label.to_string()),
         ("Credit card entry", card_entry_mode.label().to_string()),
@@ -1564,13 +1564,13 @@ fn reset_editor_selections(app: &mut App) {
     app.editor_env_sel = 0;
 }
 
-fn reconcile_month_selection(app: &mut App, view: &leeway::view::MonthView) {
+fn reconcile_month_selection(app: &mut App, view: &leeway_core::view::MonthView) {
     if let Some(target) = app.pending_dash_txn.take()
         && let Some(txn) = view.standalone.iter().find(|txn| txn.id == target)
     {
         app.dash_focus = match txn.direction {
-            leeway::models::Direction::In => DashFocus::Income,
-            leeway::models::Direction::Out => DashFocus::Expenses,
+            leeway_core::models::Direction::In => DashFocus::Income,
+            leeway_core::models::Direction::Out => DashFocus::Expenses,
         };
         if let Some(index) = dashboard_txn_index(view, &target, app.dash_focus) {
             match app.dash_focus {
@@ -1618,7 +1618,7 @@ fn reconcile_month_selection(app: &mut App, view: &leeway::view::MonthView) {
     clamp(&mut app.dash_env_sel, view.envelopes.len());
 }
 
-fn reconcile_plan_selection(app: &mut App, entries: &[leeway::models::PlanEntry]) {
+fn reconcile_plan_selection(app: &mut App, entries: &[leeway_core::models::PlanEntry]) {
     if let Some(target) = app.pending_select.take()
         && let Some(entry) = entries.iter().find(|entry| entry.item_id == target)
     {
@@ -1646,7 +1646,7 @@ fn reconcile_plan_selection(app: &mut App, entries: &[leeway::models::PlanEntry]
     );
 }
 
-fn dashboard_txn_count(view: &leeway::view::MonthView, focus: DashFocus) -> usize {
+fn dashboard_txn_count(view: &leeway_core::view::MonthView, focus: DashFocus) -> usize {
     view.standalone
         .iter()
         .filter(|txn| dashboard_txn_matches(txn, focus))
@@ -1654,7 +1654,7 @@ fn dashboard_txn_count(view: &leeway::view::MonthView, focus: DashFocus) -> usiz
 }
 
 fn dashboard_txn_index(
-    view: &leeway::view::MonthView,
+    view: &leeway_core::view::MonthView,
     txn_id: &str,
     focus: DashFocus,
 ) -> Option<usize> {
@@ -1664,15 +1664,15 @@ fn dashboard_txn_index(
         .position(|txn| txn.id == txn_id)
 }
 
-fn dashboard_txn_matches(txn: &leeway::models::Txn, focus: DashFocus) -> bool {
+fn dashboard_txn_matches(txn: &leeway_core::models::Txn, focus: DashFocus) -> bool {
     matches!(
         (focus, txn.direction),
-        (DashFocus::Income, leeway::models::Direction::In)
-            | (DashFocus::Expenses, leeway::models::Direction::Out)
+        (DashFocus::Income, leeway_core::models::Direction::In)
+            | (DashFocus::Expenses, leeway_core::models::Direction::Out)
     )
 }
 
-fn plan_entry_count(entries: &[leeway::models::PlanEntry], focus: PlanFocus) -> usize {
+fn plan_entry_count(entries: &[leeway_core::models::PlanEntry], focus: PlanFocus) -> usize {
     entries
         .iter()
         .filter(|entry| plan_entry_matches(entry, focus))
@@ -1680,7 +1680,7 @@ fn plan_entry_count(entries: &[leeway::models::PlanEntry], focus: PlanFocus) -> 
 }
 
 fn plan_entry_index(
-    entries: &[leeway::models::PlanEntry],
+    entries: &[leeway_core::models::PlanEntry],
     item_id: &str,
     focus: PlanFocus,
 ) -> Option<usize> {
@@ -1690,29 +1690,29 @@ fn plan_entry_index(
         .position(|entry| entry.item_id == item_id)
 }
 
-fn plan_focus_for_entry(entry: &leeway::models::PlanEntry) -> PlanFocus {
+fn plan_focus_for_entry(entry: &leeway_core::models::PlanEntry) -> PlanFocus {
     match entry.series.kind {
-        leeway::models::Kind::Envelope => PlanFocus::Envelopes,
-        leeway::models::Kind::Transaction => match entry.series.direction {
-            Some(leeway::models::Direction::In) => PlanFocus::Income,
+        leeway_core::models::Kind::Envelope => PlanFocus::Envelopes,
+        leeway_core::models::Kind::Transaction => match entry.series.direction {
+            Some(leeway_core::models::Direction::In) => PlanFocus::Income,
             _ => PlanFocus::Expenses,
         },
     }
 }
 
-fn plan_entry_matches(entry: &leeway::models::PlanEntry, focus: PlanFocus) -> bool {
+fn plan_entry_matches(entry: &leeway_core::models::PlanEntry, focus: PlanFocus) -> bool {
     match focus {
         // The master list holds no plan items.
         PlanFocus::List => false,
         PlanFocus::Income => {
-            entry.series.kind == leeway::models::Kind::Transaction
-                && entry.series.direction == Some(leeway::models::Direction::In)
+            entry.series.kind == leeway_core::models::Kind::Transaction
+                && entry.series.direction == Some(leeway_core::models::Direction::In)
         }
         PlanFocus::Expenses => {
-            entry.series.kind == leeway::models::Kind::Transaction
-                && entry.series.direction != Some(leeway::models::Direction::In)
+            entry.series.kind == leeway_core::models::Kind::Transaction
+                && entry.series.direction != Some(leeway_core::models::Direction::In)
         }
-        PlanFocus::Envelopes => entry.series.kind == leeway::models::Kind::Envelope,
+        PlanFocus::Envelopes => entry.series.kind == leeway_core::models::Kind::Envelope,
     }
 }
 
@@ -1980,14 +1980,14 @@ fn confirm_stamp_review(app: &mut App) -> Result<()> {
 /// persists, Esc cancels. Selecting saves the choice and updates the active currency
 /// for the next frame.
 fn handle_currency_picker_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let count = leeway::currency::CURRENCIES.len();
+    let count = leeway_core::currency::CURRENCIES.len();
     match key.code {
         KeyCode::Esc => app.modal = None,
         KeyCode::Enter => {
             if let Some(Modal::CurrencyPicker(picker)) = &app.modal {
-                let chosen = leeway::currency::CURRENCIES[picker.selected.min(count - 1)];
+                let chosen = leeway_core::currency::CURRENCIES[picker.selected.min(count - 1)];
                 ops::set_currency(&app.conn, chosen)?;
-                leeway::currency::set_active(chosen);
+                leeway_core::currency::set_active(chosen);
                 app.modal = None;
                 app.status = Some(format!(
                     "Currency set to {} ({})",
@@ -2116,7 +2116,7 @@ fn handle_envelope_modal_key(app: &mut App, key: KeyEvent) -> Result<()> {
 fn load_detail_envelope(
     app: &App,
     manage: &EnvelopeManage,
-) -> Result<Option<leeway::models::Envelope>> {
+) -> Result<Option<leeway_core::models::Envelope>> {
     Ok(queries::load_envelopes(&app.conn, &manage.month_id)?
         .into_iter()
         .find(|envelope| envelope.id == manage.envelope_id))
@@ -2929,7 +2929,7 @@ fn refresh_stamp_preview(app: &mut App) -> Result<()> {
     let mut resolved = HashMap::new();
     for plan_id in plan_ids {
         resolved.extend(
-            leeway::forecast::resolve_plan_entries(
+            leeway_core::forecast::resolve_plan_entries(
                 &app.conn,
                 &plan_id,
                 start,
@@ -3584,7 +3584,7 @@ fn draw_series_search_modal(frame: &mut Frame, prompt: &SeriesSearch) {
 /// its code and a sample amount formatted in that currency so the effect is visible
 /// before choosing. Mirrors the series-search modal's selection styling.
 fn draw_currency_picker(frame: &mut Frame, picker: &CurrencyPicker) {
-    let currencies = leeway::currency::CURRENCIES;
+    let currencies = leeway_core::currency::CURRENCIES;
     let n = currencies.len();
     let selected = picker.selected.min(n.saturating_sub(1));
 
@@ -3754,7 +3754,7 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 /// prompt: no symbol or grouping (so it round-trips through `Money::parse_dollars`),
 /// but honoring the active currency's minor-unit digits and decimal separator.
 pub(crate) fn amount_edit_string(m: Money) -> String {
-    let currency = leeway::currency::active();
+    let currency = leeway_core::currency::active();
     let sign = if m.cents() < 0 { "-" } else { "" };
     let abs = m.cents().unsigned_abs() as i64;
     let scale = currency.scale();
@@ -3879,7 +3879,7 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
         let months = queries::months(&app.conn).unwrap();
         let plans = queries::plan_summaries(&app.conn).unwrap();
-        let view = leeway::view::MonthView::build_for(&app.conn, today, 2026, 9).unwrap();
+        let view = leeway_core::view::MonthView::build_for(&app.conn, today, 2026, 9).unwrap();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 32)).unwrap();
 
@@ -3960,7 +3960,7 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
         let months = queries::months(&app.conn).unwrap();
         let plans = queries::plan_summaries(&app.conn).unwrap();
-        let view = leeway::view::MonthView::build_for(&app.conn, today, 2026, 9).unwrap();
+        let view = leeway_core::view::MonthView::build_for(&app.conn, today, 2026, 9).unwrap();
 
         budget::handle_sidebar_key(
             &mut app,
@@ -4072,7 +4072,7 @@ mod tests {
             .remove(0);
         assert_eq!(
             entry.forecast_method,
-            leeway::models::ForecastMethod::PreviousMonth
+            leeway_core::models::ForecastMethod::PreviousMonth
         );
         let october = queries::month_by_label(&app.conn, "2026-10")
             .unwrap()
@@ -4090,11 +4090,11 @@ mod tests {
         };
         assert_eq!(
             review.items[0].method,
-            leeway::models::ForecastMethod::PreviousMonth
+            leeway_core::models::ForecastMethod::PreviousMonth
         );
         assert_eq!(
             review.items[0].preview_method,
-            Some(leeway::models::ForecastMethod::Static)
+            Some(leeway_core::models::ForecastMethod::Static)
         );
     }
 
@@ -4482,7 +4482,7 @@ mod tests {
         handle_global_key_with_series(&mut app, key(KeyCode::Char('S')), Some(series_id.clone()));
         let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
         let view =
-            leeway::view::SeriesPageView::build(&app.conn, today, SeriesTimeRange::Last12Stamped)
+            leeway_core::view::SeriesPageView::build(&app.conn, today, SeriesTimeRange::Last12Stamped)
                 .unwrap();
         let detail = series::detail_by_id(&view, &series_id).unwrap();
 
@@ -4510,7 +4510,7 @@ mod tests {
         let series_id = series_id_for_manage(&app, &envelope_detail);
         let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
         let view =
-            leeway::view::SeriesPageView::build(&app.conn, today, SeriesTimeRange::Last12Stamped)
+            leeway_core::view::SeriesPageView::build(&app.conn, today, SeriesTimeRange::Last12Stamped)
                 .unwrap();
         app.series_filter = SeriesFilter::AdHoc;
         app.series_search = "not dining".into();
@@ -4877,7 +4877,7 @@ mod tests {
         assert!(text.contains("€"));
         // A normal terminal is tall enough to show every currency at once, so the list is
         // not artificially truncated: the last entry is visible and there's no "more" cue.
-        let last = leeway::currency::CURRENCIES.last().unwrap();
+        let last = leeway_core::currency::CURRENCIES.last().unwrap();
         assert!(text.contains(last.code));
         assert!(!text.contains("more"));
     }

@@ -1,0 +1,20 @@
+[package]
+name = "leeway-core"
+version.workspace = true
+edition.workspace = true
+description = "The budget model, SQLite storage and calculations behind Leeway, with no UI."
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+rusqlite_migration = "2.6.0"
+sys-locale = "0.3.2"
+uuid.workspace = true
+
+# A library has no binary for dist to ship.
+[package.metadata.dist]
+dist = false
