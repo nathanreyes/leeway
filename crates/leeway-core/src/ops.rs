@@ -29,6 +29,24 @@ pub fn month_id(label: &str) -> String {
     Uuid::new_v5(&LEEWAY_NAMESPACE, format!("month:{label}").as_bytes()).to_string()
 }
 
+/// The id of the row that stamping makes for plan item `item_id` in `month_id`. Every device
+/// derives the same id, so a month stamped offline on two devices holds one copy of each item
+/// once they sync. Restamp can need a second row for an item whose row now stands for another
+/// occurrence of its series; that row gets a random id.
+fn stamped_id(conn: &Connection, table: &str, month_id: &str, item_id: &str) -> Result<String> {
+    let id = Uuid::new_v5(
+        &LEEWAY_NAMESPACE,
+        format!("stamp:{month_id}:{item_id}").as_bytes(),
+    )
+    .to_string();
+    let taken: bool = conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id = ?1)"),
+        [&id],
+        |r| r.get(0),
+    )?;
+    Ok(if taken { new_id() } else { id })
+}
+
 /// Persist the app-wide display currency into the `setting` table (upsert). Because
 /// the row lives in the database, backups retain the choice. The caller is
 /// responsible for updating the in-process active currency (`currency::set_active`).
@@ -246,7 +264,7 @@ fn insert_instance_from_entry(
                     stamped_amount_cents, period_type, mode)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
-                    new_id(),
+                    stamped_id(conn, "envelope", month_id, &entry.item_id)?,
                     month_id,
                     s.id, // series_id = the durable series identity
                     s.label,
@@ -266,7 +284,7 @@ fn insert_instance_from_entry(
                     amount_cents, stamped_amount_cents, settled)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
                 rusqlite::params![
-                    new_id(),
+                    stamped_id(conn, "txn", month_id, &entry.item_id)?,
                     month_id,
                     s.id,
                     s.label,
@@ -1450,6 +1468,109 @@ mod tests {
         let id = stamp(&mut conn, &plan_id, "2099-01", start, 31).unwrap();
         assert_eq!(id, month_id("2099-01"));
         assert_ne!(month_id("2099-01"), month_id("2099-02"));
+    }
+
+    /// Ids of a month's stamped envelopes and standalone transactions, sorted.
+    fn stamped_row_ids(conn: &Connection, month_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = queries::load_envelopes(conn, month_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .chain(
+                queries::load_txns(conn, month_id)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|t| t.envelope_id.is_none())
+                    .map(|t| t.id),
+            )
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn stamping_a_month_on_two_devices_makes_the_same_rows() {
+        let mut phone = db::open_in_memory().unwrap();
+        seed_starter(&mut phone).unwrap();
+        let plan_id = queries::current_month(&phone)
+            .unwrap()
+            .unwrap()
+            .plan_id
+            .unwrap();
+        // A second device holding the same budget, synced before either stamps.
+        let mut tablet = Connection::open_in_memory().unwrap();
+        rusqlite::backup::Backup::new(&phone, &mut tablet)
+            .unwrap()
+            .run_to_completion(64, std::time::Duration::ZERO, None)
+            .unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
+        let month = stamp(&mut phone, &plan_id, "2099-01", start, 31).unwrap();
+        stamp(&mut tablet, &plan_id, "2099-01", start, 31).unwrap();
+
+        let ids = stamped_row_ids(&phone, &month);
+        assert_eq!(ids.len(), 10);
+        assert_eq!(ids, stamped_row_ids(&tablet, &month));
+    }
+
+    #[test]
+    fn restamp_brings_back_a_deleted_row_with_its_id() {
+        let mut conn = db::open_in_memory().unwrap();
+        seed_starter(&mut conn).unwrap();
+        let month = queries::current_month(&conn).unwrap().unwrap();
+        let plan_id = month.plan_id.unwrap();
+        let rent = queries::load_txns(&conn, &month.id)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.label == "Rent/Mortgage")
+            .unwrap();
+
+        delete_txn(&conn, &rent.id).unwrap();
+        restamp(&mut conn, &month.id, &plan_id, false).unwrap();
+
+        assert!(
+            queries::load_txns(&conn, &month.id)
+                .unwrap()
+                .iter()
+                .any(|t| t.id == rent.id)
+        );
+        let tombstones: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM deletion WHERE row_id = ?1",
+                [&rent.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstones, 0);
+    }
+
+    #[test]
+    fn restamp_adds_a_row_when_another_occurrence_holds_its_id() {
+        // Two items share a series. Deleting either row and restamping must give two rows
+        // again, even when the surviving row carries the id the missing item would derive.
+        for deleted in 0..2 {
+            let mut conn = db::open_in_memory().unwrap();
+            let plan = create_plan(&conn, "P").unwrap();
+            let paycheck = create_series(
+                &conn,
+                Kind::Transaction,
+                "Paycheck",
+                Some(Direction::In),
+                None,
+                None,
+            )
+            .unwrap();
+            add_plan_item(&conn, &plan, &paycheck, Money::from_dollars(5000.0)).unwrap();
+            add_plan_item(&conn, &plan, &paycheck, Money::from_dollars(4500.0)).unwrap();
+            let start = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+            let month_id = stamp(&mut conn, &plan, "2026-09", start, 30).unwrap();
+
+            let rows = queries::load_txns(&conn, &month_id).unwrap();
+            delete_txn(&conn, &rows[deleted].id).unwrap();
+            restamp(&mut conn, &month_id, &plan, false).unwrap();
+
+            assert_eq!(queries::load_txns(&conn, &month_id).unwrap().len(), 2);
+        }
     }
 
     #[test]
