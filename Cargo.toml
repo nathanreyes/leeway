@@ -15,7 +15,7 @@ leeway-core = { path = "crates/leeway-core", version = "0.1.10" }
 anyhow = "1.0.103"
 chrono = "0.4.45"
 rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
-uuid = { version = "1.23.4", features = ["v4"] }
+uuid = { version = "1.23.4", features = ["v4", "v5"] }
 
 [package]
 name = "leeway"

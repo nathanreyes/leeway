@@ -1025,7 +1025,8 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
 
             Screen::Series { state } => {
                 let state = state.clone();
-                let view = leeway_core::view::SeriesPageView::build(&app.conn, today, app.series_range)?;
+                let view =
+                    leeway_core::view::SeriesPageView::build(&app.conn, today, app.series_range)?;
                 match state.mode {
                     SeriesMode::Detail { series_id } => {
                         let Some(detail) = series::detail_by_id(&view, &series_id) else {
@@ -4481,9 +4482,12 @@ mod tests {
         let series_id = series_id_for_manage(&app, &envelope_detail);
         handle_global_key_with_series(&mut app, key(KeyCode::Char('S')), Some(series_id.clone()));
         let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
-        let view =
-            leeway_core::view::SeriesPageView::build(&app.conn, today, SeriesTimeRange::Last12Stamped)
-                .unwrap();
+        let view = leeway_core::view::SeriesPageView::build(
+            &app.conn,
+            today,
+            SeriesTimeRange::Last12Stamped,
+        )
+        .unwrap();
         let detail = series::detail_by_id(&view, &series_id).unwrap();
 
         let backend = ratatui::backend::TestBackend::new(100, 32);
@@ -4509,9 +4513,12 @@ mod tests {
         let (mut app, envelope_detail, _) = app_with_envelope_modal();
         let series_id = series_id_for_manage(&app, &envelope_detail);
         let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
-        let view =
-            leeway_core::view::SeriesPageView::build(&app.conn, today, SeriesTimeRange::Last12Stamped)
-                .unwrap();
+        let view = leeway_core::view::SeriesPageView::build(
+            &app.conn,
+            today,
+            SeriesTimeRange::Last12Stamped,
+        )
+        .unwrap();
         app.series_filter = SeriesFilter::AdHoc;
         app.series_search = "not dining".into();
 

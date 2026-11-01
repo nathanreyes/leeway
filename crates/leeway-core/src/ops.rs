@@ -20,6 +20,15 @@ fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// Namespace for ids derived from natural keys. Never change it: stored ids depend on it.
+const LEEWAY_NAMESPACE: Uuid = Uuid::from_u128(0x6f1c_2b8e_4d3a_4e5f_9a7b_1c2d_3e4f_5a6b);
+
+/// The fixed id of the month labelled `label` (`YYYY-MM`). Every device derives the same id,
+/// so a month stamped offline on two devices is one row once they sync.
+pub fn month_id(label: &str) -> String {
+    Uuid::new_v5(&LEEWAY_NAMESPACE, format!("month:{label}").as_bytes()).to_string()
+}
+
 /// Persist the app-wide display currency into the `setting` table (upsert). Because
 /// the row lives in the database, backups retain the choice. The caller is
 /// responsible for updating the in-process active currency (`currency::set_active`).
@@ -137,7 +146,7 @@ pub fn stamp_plans_batch_filtered(
     let tx = conn.transaction()?;
     let mut month_ids = Vec::with_capacity(months.len());
     for (label, start_date, days_in_month) in months {
-        let month_id = new_id();
+        let month_id = month_id(label);
         tx.execute(
             "INSERT INTO month (id, plan_id, label, start_date, days_in_month)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -173,7 +182,7 @@ fn stamp_in_transaction(
     days_in_month: i64,
     excluded_item_ids: &[String],
 ) -> Result<String> {
-    let month_id = new_id();
+    let month_id = month_id(label);
 
     conn.execute(
         "INSERT INTO month (id, plan_id, label, start_date, days_in_month)
@@ -1425,6 +1434,22 @@ mod tests {
         assert_eq!(rent.amount, Money::from_dollars(1800.0));
         assert_eq!(rent.stamped_amount, Some(Money::from_dollars(1800.0)));
         assert!(!rent.settled);
+    }
+
+    #[test]
+    fn stamped_months_get_ids_from_their_labels() {
+        let mut conn = db::open_in_memory().unwrap();
+        seed_starter(&mut conn).unwrap();
+        let plan_id = queries::current_month(&conn)
+            .unwrap()
+            .unwrap()
+            .plan_id
+            .unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
+        let id = stamp(&mut conn, &plan_id, "2099-01", start, 31).unwrap();
+        assert_eq!(id, month_id("2099-01"));
+        assert_ne!(month_id("2099-01"), month_id("2099-02"));
     }
 
     #[test]
