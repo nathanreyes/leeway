@@ -1,0 +1,116 @@
+---
+/*
+ * Apps.astro — the apps Leeway ships as, one card each. Add a platform by adding an entry
+ * to `apps`; cards wrap to fit.
+ */
+const repo = "https://github.com/nathanreyes/leeway";
+
+const apps = [
+  {
+    name: "Terminal",
+    platforms: "macOS · Linux · Windows",
+    status: "available",
+    body: "A fast, keyboard-driven Ratatui app that shows the whole month in one window.",
+    points: [
+      "Free and open source",
+      "Your budget in a SQLite file you own",
+      "Install with one line, or from crates.io",
+    ],
+    links: [
+      { label: "Install", href: "#install", primary: true },
+      { label: "Source ↗", href: repo, external: true },
+    ],
+  },
+  {
+    name: "iPhone",
+    platforms: "iOS 17 or later",
+    status: "coming soon",
+    body: "Glance at what's left, tick off bills and income, log spending in a few taps, and stamp next month from a plan.",
+    points: [
+      "Free and complete on one device",
+      "No account, ads or tracking",
+      "Later: a one-time Pro purchase adds iCloud sync, sharing with a partner and bank sync",
+    ],
+    links: [],
+  },
+];
+---
+
+<section id="apps" class="apps">
+  <div class="container">
+    <p class="eyebrow">apps</p>
+    <h2 class="apps__h">Two apps, one set of rules.</h2>
+    <p class="apps__sub">
+      Both run the same Rust budget engine, so what's left comes out the same on either.
+      They keep separate budgets for now.
+    </p>
+
+    <div class="apps__grid">
+      {apps.map((app) => (
+        <article class="panel app">
+          <span class="panel__title">{app.name}</span>
+          <div class="app__top">
+            <span class="t-dim">{app.platforms}</span>
+            <span class:list={["app__status", { "app__status--soon": app.status !== "available" }]}>
+              {app.status}
+            </span>
+          </div>
+          <p class="app__body">{app.body}</p>
+          <ul class="app__points">
+            {app.points.map((point) => <li>{point}</li>)}
+          </ul>
+          <div class="app__links">
+            {app.links.length === 0 && <span class="btn btn--off">Coming to the App Store</span>}
+            {app.links.map((link) => (
+              <a
+                class:list={["btn", { "btn--primary": link.primary }]}
+                href={link.href}
+                {...(link.external ? { target: "_blank", rel: "noopener" } : {})}
+              >{link.label}</a>
+            ))}
+          </div>
+        </article>
+      ))}
+    </div>
+  </div>
+</section>
+
+<style>
+  .apps { padding: 72px 0 40px; }
+  .apps__h { font-size: clamp(22px, 3vw, 30px); margin: 12px 0 12px; }
+  .apps__sub { color: var(--dim); max-width: 62ch; margin: 0 0 40px; }
+
+  .apps__grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 22px;
+  }
+  .app { display: flex; flex-direction: column; padding: 30px 26px 26px; }
+  .app__top {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 12.5px;
+    margin-bottom: 14px;
+  }
+  .app__status {
+    color: var(--green);
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    font-size: 11px;
+  }
+  .app__status--soon { color: var(--amber); }
+  .app__body { margin: 0 0 16px; }
+  .app__points {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 24px;
+    color: var(--dim);
+    font-size: 13.5px;
+  }
+  .app__points li { padding-left: 1.6em; text-indent: -1.6em; }
+  .app__points li::before { content: "→ "; color: var(--mauve); }
+  .app__links { display: flex; flex-wrap: wrap; gap: 12px; margin-top: auto; }
+  .btn--off { color: var(--dim); border-style: dashed; cursor: default; }
+  .btn--off:hover { transform: none; border-color: var(--line-bright); }
+</style>

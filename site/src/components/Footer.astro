@@ -7,17 +7,19 @@ const repo = "https://github.com/nathanreyes/leeway";
   <div class="container foot__inner">
     <div class="foot__brand">
       <span class="brand__glyph">▮</span> leeway
-      <p class="foot__note">Early open-source software, subject to change before a stable release.</p>
+      <p class="foot__note">Early software, subject to change before a stable release. The terminal app is open source.</p>
     </div>
     <div class="foot__links">
       <a href={repo} target="_blank" rel="noopener">GitHub ↗</a>
       <a href="/#concepts">How it works</a>
       <a href="/#features">Features</a>
+      <a href="/#apps">Apps</a>
       <a href="/#install">Install</a>
+      <a href="/privacy">Privacy</a>
     </div>
   </div>
   <div class="container foot__base t-faint">
-    <span>Built in Rust with Ratatui.</span>
+    <span>Built in Rust, with Ratatui and SwiftUI.</span>
     <span>what's&nbsp;left?</span>
   </div>
 </footer>
@@ -43,7 +45,7 @@ const repo = "https://github.com/nathanreyes/leeway";
     max-width: 46ch;
     margin: 10px 0 0;
   }
-  .foot__links { display: flex; gap: 22px; font-size: 14px; height: fit-content; }
+  .foot__links { display: flex; flex-wrap: wrap; gap: 10px 22px; font-size: 14px; height: fit-content; }
   .foot__links a { color: var(--dim); }
   .foot__links a:hover { color: var(--text); text-decoration: none; }
 

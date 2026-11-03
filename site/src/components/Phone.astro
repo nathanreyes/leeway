@@ -1,0 +1,238 @@
+---
+/*
+ * Phone.astro — an HTML sketch of Leeway for iPhone's Month screen in dark mode.
+ *
+ * It mirrors the app: the What's left card with its mauve band, day marks, the serif
+ * figure, the split bar and its legend, then "To settle" rows and the floating tab pill
+ * with its round "+". Colours come from the app's dark theme tokens.
+ */
+const DAYS = 31;
+const TODAY = 10;
+
+// Split bar parts: share of the bar and the legend figure.
+const parts = [
+  { label: "Left",      cents: "$1,284", share: 31, color: "var(--green)" },
+  { label: "Card owed", cents: "$412",   share: 10, color: "var(--pink)" },
+  { label: "Envelopes", cents: "$3,074", share: 42, color: "var(--cyan)" },
+  { label: "Bills due", cents: "$680",   share: 17, color: "var(--amber)" },
+];
+
+const settle = [
+  { name: "Paycheck", note: "Income · due 15th", amount: "$3,150", kind: "income" },
+  { name: "Electric", note: "Bill · due 18th",   amount: "$142",   kind: "bill" },
+];
+---
+
+<div class="phone" aria-label="Leeway for iPhone, Month screen" role="img">
+  <div class="phone__screen">
+    <div class="phone__status">
+      <span>9:41</span>
+      <span class="phone__island"></span>
+      <span class="phone__bars">●●●</span>
+    </div>
+
+    <p class="phone__month serif">July</p>
+
+    <div class="wl">
+      <div class="wl__band">
+        <span>WHAT'S LEFT</span>
+        <span class="wl__tag">From Standard ↻</span>
+      </div>
+      <div class="wl__body">
+        <div class="wl__days">
+          {Array.from({ length: DAYS }, (_, i) => (
+            <i class:list={{ past: i < TODAY - 1, today: i === TODAY - 1 }} />
+          ))}
+        </div>
+        <p class="wl__daytext">Day 10 · 21 days left</p>
+        <p class="wl__figure serif"><small>$</small>1,284<small class="wl__cents">.10</small></p>
+        <div class="wl__bar">
+          {parts.map((p) => <span style={`flex:${p.share};background:${p.color}`} />)}
+        </div>
+        <div class="wl__legend">
+          {parts.map((p) => (
+            <span><i style={`background:${p.color}`} />{p.label}<b>{p.cents}</b></span>
+          ))}
+        </div>
+      </div>
+    </div>
+
+    <p class="phone__h serif">To settle</p>
+    <div class="settle">
+      {settle.map((s) => (
+        <div class="settle__row">
+          <span class:list={["settle__tile", `settle__tile--${s.kind}`]}>{s.kind === "income" ? "↓" : "↑"}</span>
+          <span class="settle__name">{s.name}<small>{s.note}</small></span>
+          <span class:list={["settle__amt", { "t-green": s.kind === "income" }]}>{s.amount}</span>
+          <span class="settle__check" />
+        </div>
+      ))}
+    </div>
+
+    <div class="phone__dock">
+      <div class="pill">
+        <span class="pill__tab pill__tab--on"><i>▦</i>Month</span>
+        <span class="pill__tab"><i>☰</i>Plans</span>
+        <span class="pill__tab"><i>∿</i>Series</span>
+      </div>
+      <span class="add">+</span>
+    </div>
+  </div>
+</div>
+
+<style>
+  .phone {
+    width: 290px;
+    flex: none;
+    padding: 10px;
+    border-radius: 48px;
+    background: linear-gradient(160deg, #2c2c3a, #15151d);
+    border: 1px solid var(--line-bright);
+    box-shadow: var(--shadow), inset 0 0 0 2px #0c0c11;
+    font-family: -apple-system, "SF Pro Text", system-ui, sans-serif;
+    font-size: 11px;
+    line-height: 1.3;
+  }
+  .phone__screen {
+    position: relative;
+    height: 600px;
+    border-radius: 39px;
+    overflow: hidden;
+    background: var(--bg);
+    padding: 12px 14px 0;
+  }
+
+  .phone__status {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 0 10px;
+  }
+  .phone__island { width: 84px; height: 24px; border-radius: 99px; background: #000; }
+  .phone__bars { font-size: 7px; letter-spacing: 1px; }
+
+  .phone__month { font-size: 32px; margin: 14px 4px 10px; line-height: 1; }
+  .phone__h { font-size: 21px; margin: 18px 4px 8px; line-height: 1; }
+
+  .wl {
+    border-radius: 20px;
+    overflow: hidden;
+    background: var(--panel);
+    border: 1px solid #262635;
+  }
+  .wl__band {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 14px;
+    background: #5b3aa8;
+    color: #fff;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    font-size: 10.5px;
+  }
+  .wl__tag {
+    font-weight: 600;
+    letter-spacing: 0;
+    padding: 2px 8px;
+    border-radius: 99px;
+    background: rgba(255, 255, 255, 0.2);
+  }
+  .wl__body { padding: 14px; }
+  .wl__days { display: flex; gap: 2px; height: 12px; }
+  .wl__days i { flex: 1; border-radius: 2px; background: #3a3a4e; }
+  .wl__days i.past { background: var(--faint); }
+  .wl__days i.today { background: #5b3aa8; }
+  .wl__daytext { margin: 6px 0 0; color: #9a9ab2; font-weight: 500; }
+  .wl__figure { font-size: 54px; line-height: 1; margin: 10px 0 12px; letter-spacing: -1px; }
+  .wl__figure small { font-size: 26px; vertical-align: 20px; letter-spacing: 0; }
+  .wl__figure .wl__cents { opacity: 0.72; }
+  .wl__bar { display: flex; gap: 2px; height: 8px; border-radius: 99px; overflow: hidden; }
+  .wl__legend {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 12px;
+    margin-top: 12px;
+    color: #9a9ab2;
+    font-size: 10.5px;
+  }
+  .wl__legend span { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  .wl__legend i { width: 7px; height: 7px; border-radius: 50%; }
+  .wl__legend b { margin-left: auto; color: var(--text); font-weight: 400; }
+
+  .settle { border-radius: 18px; background: var(--panel); border: 1px solid #262635; }
+  .settle__row {
+    display: grid;
+    grid-template-columns: auto 1fr auto auto;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+  }
+  .settle__row + .settle__row { border-top: 1px solid var(--line); }
+  .settle__tile {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    display: grid;
+    place-items: center;
+    font-weight: 700;
+  }
+  .settle__tile--income { color: var(--green); background: rgba(147, 224, 160, 0.14); }
+  .settle__tile--bill { color: var(--amber); background: rgba(232, 197, 131, 0.14); }
+  .settle__name { font-weight: 600; font-size: 12px; }
+  .settle__name small { display: block; font-weight: 400; color: #9a9ab2; font-size: 10.5px; }
+  .settle__amt { font-weight: 500; }
+  .settle__check { width: 20px; height: 20px; border-radius: 50%; border: 1.5px solid #4a4a5e; }
+
+  .phone__dock {
+    position: absolute;
+    left: 14px;
+    right: 14px;
+    bottom: 22px;
+    display: flex;
+    gap: 10px;
+  }
+  .pill {
+    flex: 1;
+    display: flex;
+    height: 52px;
+    padding: 0 4px;
+    border-radius: 99px;
+    background: rgba(22, 22, 31, 0.78);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--line);
+  }
+  .pill__tab {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1px;
+    color: #9a9ab2;
+    font-size: 9px;
+    font-weight: 600;
+  }
+  .pill__tab i {
+    font-style: normal;
+    font-size: 14px;
+    width: 46px;
+    text-align: center;
+    border-radius: 99px;
+  }
+  .pill__tab--on { color: var(--mauve); }
+  .pill__tab--on i { background: rgba(201, 166, 242, 0.16); }
+  .add {
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    background: var(--mauve);
+    color: var(--bg);
+    font-size: 26px;
+    font-weight: 500;
+  }
+</style>
