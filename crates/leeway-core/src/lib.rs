@@ -5,6 +5,7 @@
 //! renders. It has no dependency on ratatui, so it could be reused unchanged behind a
 //! web or desktop frontend. The terminal UI lives in `main.rs` and depends on this.
 
+pub mod bank;
 pub mod calc;
 pub mod currency;
 pub mod db;

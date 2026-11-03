@@ -24,6 +24,7 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("migration_003_plan_item_active_months.sql")),
         M::up(include_str!("migration_004_plan_item_forecast_method.sql")),
         M::up_with_hook(include_str!("migration_005_sync_ready.sql"), fix_month_ids),
+        M::up(include_str!("migration_006_bank_sync.sql")),
     ])
 });
 
