@@ -120,14 +120,19 @@ pub struct BankTxn {
     pub pending: bool,
 }
 
-/// A charge that recurs about monthly with no plan item to match it.
+/// Money that comes in or goes out on a schedule, monthly or twice a month, with no plan item
+/// to match it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Suggestion {
     /// The cleaned description, which is also the match text it would get.
     pub key: String,
     pub label: String,
-    /// The latest amount, positive.
+    pub direction: Direction,
+    /// One payment's amount, positive: the middle of the last three, so one odd month
+    /// doesn't set it.
     pub amount: Money,
+    /// Payments in a typical month: 1, or 2 for twice a month or every two weeks.
+    pub payments: u32,
     /// The months it was seen in, `YYYY-MM`, oldest first.
     pub months: Vec<String>,
 }
@@ -618,64 +623,93 @@ pub fn set_match_text(conn: &Connection, series_id: &str, text: Option<&str>) ->
 
 // --- Suggestions -----------------------------------------------------------------------
 
-/// Charges from the last few months that recur about monthly and that no series names.
-/// Largest first.
+/// Income and charges from the last few months that recur on a schedule and that no series in
+/// use names. Income first, then charges, each largest first.
 pub fn suggestions(conn: &Connection, today: NaiveDate) -> Result<Vec<Suggestion>> {
     let from = today - Duration::days(SUGGESTION_DAYS);
-    let mut texts: Vec<String> = queries::list_series(conn)?
-        .into_iter()
-        .map(|s| s.label)
-        .collect();
+    // A series no plan gives an amount and no month has used, such as a $0 starter item,
+    // doesn't hide anything.
+    let mut texts: Vec<String> = conn
+        .prepare(
+            "SELECT s.label FROM series s
+             WHERE EXISTS (SELECT 1 FROM plan_item p
+                           WHERE p.series_id = s.id AND p.amount_cents != 0)
+                OR EXISTS (SELECT 1 FROM txn t
+                           WHERE t.series_id = s.id AND (t.amount_cents != 0 OR t.settled))",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     texts.extend(match_texts(conn)?.into_values());
     let dismissed: HashSet<String> = conn
         .prepare("SELECT key FROM bank_dismissal")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
 
-    let mut groups: HashMap<String, Vec<BankTxn>> = HashMap::new();
+    let mut groups: HashMap<(String, bool), Vec<BankTxn>> = HashMap::new();
     for t in free_txns(conn, from, today, false)? {
         let key = clean(&t.description);
-        if t.amount.0 < 0
+        if t.amount.0 != 0
             && !key.is_empty()
             && !dismissed.contains(&key)
             && !texts.iter().any(|text| names(&t.description, text))
         {
-            groups.entry(key).or_default().push(t);
+            groups.entry((key, t.amount.0 > 0)).or_default().push(t);
         }
     }
     let mut found: Vec<Suggestion> = groups
         .into_iter()
-        .filter_map(|(key, txns)| recurring(key, txns))
+        .filter_map(|((key, income), txns)| recurring(key, income, txns))
         .collect();
-    found.sort_by(|a, b| b.amount.cmp(&a.amount).then(a.key.cmp(&b.key)));
+    found.sort_by(|a, b| {
+        (b.direction == Direction::In)
+            .cmp(&(a.direction == Direction::In))
+            .then((b.amount.0 * b.payments as i64).cmp(&(a.amount.0 * a.payments as i64)))
+            .then(a.key.cmp(&b.key))
+    });
     Ok(found)
 }
 
-/// A suggestion when `txns` (oldest first) show up in two or more months, about a month
-/// apart, at much the same amount.
-fn recurring(key: String, txns: Vec<BankTxn>) -> Option<Suggestion> {
-    if txns.len() < 2 {
-        return None;
-    }
+/// A suggestion when `txns` (oldest first) come on a schedule at much the same amount: about
+/// a month apart in two or more months, or about two weeks apart at least four times.
+fn recurring(key: String, income: bool, txns: Vec<BankTxn>) -> Option<Suggestion> {
     let dates: Vec<NaiveDate> = txns.iter().filter_map(|t| t.date.parse().ok()).collect();
-    if dates.len() != txns.len()
-        || dates
-            .windows(2)
-            .any(|w| !(20..=40).contains(&(w[1] - w[0]).num_days()))
-    {
+    if dates.len() != txns.len() || dates.len() < 2 {
         return None;
     }
-    let latest = txns.last()?.amount;
-    if !txns.iter().all(|t| close(latest, t.amount)) {
+    let gaps: Vec<i64> = dates.windows(2).map(|w| (w[1] - w[0]).num_days()).collect();
+    let payments = if gaps.iter().all(|g| (20..=40).contains(g)) {
+        1
+    } else if dates.len() >= 4 && gaps.iter().all(|g| (10..=20).contains(g)) {
+        2
+    } else {
+        return None;
+    };
+    let mut recent: Vec<i64> = txns
+        .iter()
+        .rev()
+        .take(3)
+        .map(|t| t.amount.0.abs())
+        .collect();
+    recent.sort_unstable();
+    let amount = Money(recent[recent.len() / 2]);
+    if !txns.iter().all(|t| close(amount, t.amount)) {
         return None;
     }
+    let mut months: Vec<String> = dates
+        .iter()
+        .map(|d| d.format("%Y-%m").to_string())
+        .collect();
+    months.dedup();
     Some(Suggestion {
         label: title_case(&key),
-        amount: Money(latest.0.abs()),
-        months: dates
-            .iter()
-            .map(|d| d.format("%Y-%m").to_string())
-            .collect(),
+        direction: if income {
+            Direction::In
+        } else {
+            Direction::Out
+        },
+        amount,
+        payments,
+        months,
         key,
     })
 }
@@ -1053,7 +1087,13 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].key, "netflix");
         assert_eq!(found[0].label, "Netflix");
-        assert_eq!(found[0].amount, Money(1_599));
+        assert_eq!(found[0].direction, Direction::Out);
+        assert_eq!(
+            found[0].amount,
+            Money(1_549),
+            "the middle of the last three"
+        );
+        assert_eq!(found[0].payments, 1);
         assert_eq!(found[0].months, vec!["2026-08", "2026-09", "2026-10"]);
     }
 
@@ -1087,5 +1127,84 @@ mod tests {
         let links = links(&f.conn).unwrap();
         assert_eq!(links.get(&f.card).map(String::as_str), Some("chk"));
         assert!(!links.contains_key(&f.checking));
+    }
+
+    #[test]
+    fn paychecks_twice_a_month_become_income_with_two_payments() {
+        let mut f = fixture();
+        let mut txns = Vec::new();
+        for (i, day) in [
+            "2026-08-01",
+            "2026-08-15",
+            "2026-09-01",
+            "2026-09-15",
+            "2026-10-01",
+            "2026-10-15",
+        ]
+        .iter()
+        .enumerate()
+        {
+            txns.push(txn("chk", &format!("p{i}"), day, 256_448, "Pay day!"));
+        }
+        // Paid every two weeks, on Fridays: three in September.
+        for (i, day) in [
+            "2026-08-07",
+            "2026-08-21",
+            "2026-09-04",
+            "2026-09-18",
+            "2026-10-02",
+        ]
+        .iter()
+        .enumerate()
+        {
+            txns.push(txn("chk", &format!("s{i}"), day, 80_000, "SIDE GIG LLC"));
+        }
+        apply_feed(&mut f.conn, &feed(txns), today()).unwrap();
+
+        let found = suggestions(&f.conn, today()).unwrap();
+        let keys: Vec<&str> = found.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["pay day", "side gig llc"],
+            "income, larger first"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|s| s.direction == Direction::In && s.payments == 2)
+        );
+        assert_eq!(found[0].months, vec!["2026-08", "2026-09", "2026-10"]);
+    }
+
+    #[test]
+    fn a_series_nobody_uses_hides_nothing() {
+        let mut f = fixture();
+        // "Electric" is in the plan but at $0 and never paid, like a starter placeholder.
+        let plan: String = f
+            .conn
+            .query_row("SELECT id FROM plan", [], |r| r.get(0))
+            .unwrap();
+        let unused = create_series(
+            &f.conn,
+            Kind::Transaction,
+            "Water",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        add_plan_item(&f.conn, &plan, &unused, Money(0)).unwrap();
+        apply_feed(
+            &mut f.conn,
+            &feed(vec![
+                txn("chk", "1", "2026-09-10", -4_000, "CITY WATER"),
+                txn("chk", "2", "2026-10-10", -4_200, "CITY WATER"),
+            ]),
+            today(),
+        )
+        .unwrap();
+        let found = suggestions(&f.conn, today()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].key, "city water");
     }
 }
