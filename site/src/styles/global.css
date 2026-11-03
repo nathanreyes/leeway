@@ -86,6 +86,11 @@ body::before {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
 }
 
+/* ── App switch: the hero toggle sets <html data-app>; content marked
+   data-only="terminal" or data-only="iphone" shows only for that app. ──────*/
+html[data-app="terminal"] [data-only="iphone"],
+html[data-app="iphone"] [data-only="terminal"] { display: none !important; }
+
 /* ── Layout helpers ───────────────────────────────────────────────────────*/
 .container {
   width: 100%;

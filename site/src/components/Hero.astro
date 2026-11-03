@@ -1,34 +1,61 @@
 ---
-/* Hero.astro — the opening pitch, then the terminal and phone side by side below it. */
+/*
+ * Hero.astro — the opening pitch, then the chosen app below it: the terminal dashboard
+ * or three iPhone screens that follow the Plan → Month → Series cards in Concepts.
+ */
 import Terminal from "./Terminal.astro";
 import Phone from "./Phone.astro";
+import AppSwitch from "./AppSwitch.astro";
+const repo = "https://github.com/nathanreyes/leeway";
+
+const phones = [
+  { screen: "plan", caption: "01 · plan", color: "mauve" },
+  { screen: "month", caption: "02 · month", color: "cyan" },
+  { screen: "series", caption: "03 · series", color: "green" },
+] as const;
 ---
 
 <section id="top" class="hero">
   <div class="container hero__inner">
-    <p class="eyebrow reveal">local-first · terminal · iphone</p>
+    <p class="eyebrow reveal">
+      <span data-only="terminal">local-first · terminal · rust</span>
+      <span data-only="iphone">local-first · iphone · no account</span>
+    </p>
 
     <h1 class="hero__title reveal" style="animation-delay: 0.06s">
       A budget that answers<br />
       one question: <span class="serif hero__hook">what's left?</span><span class="cursor"></span>
     </h1>
 
+    <div class="hero__switch reveal" style="animation-delay: 0.09s"><AppSwitch /></div>
+
     <p class="hero__sub reveal" style="animation-delay: 0.12s">
       Leeway forecasts what's left without tracking every transaction: use your
       checking balance as the truth, mark income and bills settled, and watch
-      envelopes draw down through the month. In your terminal or on your iPhone.
+      envelopes draw down through the month.
     </p>
 
     <div class="hero__cta reveal" style="animation-delay: 0.18s">
-      <a class="btn btn--primary" href="#install">Get the terminal app</a>
-      <a class="btn" href="#apps">iPhone app</a>
+      <a class="btn btn--primary" href="#install" data-only="terminal">
+        Get started <span class="btn__key">curl | sh</span>
+      </a>
+      <a class="btn" href={repo} target="_blank" rel="noopener" data-only="terminal">View source ↗</a>
+      <a class="btn btn--primary" href="#install" data-only="iphone">Coming to the App Store</a>
+      <a class="btn" href="#concepts" data-only="iphone">How it works</a>
       <span class="hero__badge">pre-release</span>
     </div>
   </div>
 
   <div class="container hero__visual">
-    <div class="hero__terminal"><Terminal /></div>
-    <div class="hero__phone reveal" style="animation-delay: 0.32s"><Phone /></div>
+    <div class="hero__terminal" data-only="terminal"><Terminal /></div>
+    <div class="hero__phones" data-only="iphone">
+      {phones.map((p, i) => (
+        <figure class:list={["hero__phone", "reveal", `hero__phone--${p.screen}`]} style={`animation-delay: ${0.25 + i * 0.08}s`}>
+          <Phone screen={p.screen} />
+          <figcaption style={`color: var(--${p.color})`}>{p.caption}</figcaption>
+        </figure>
+      ))}
+    </div>
   </div>
 </section>
 
@@ -47,12 +74,14 @@ import Phone from "./Phone.astro";
     font-style: italic;
   }
 
+  .hero__switch { margin-top: 52px; }
+
   .hero__sub {
     color: var(--dim);
     font-size: clamp(14px, 1.6vw, 16px);
     line-height: 1.7;
     max-width: 60ch;
-    margin: 22px auto 0;
+    margin: 40px auto 0;
   }
 
   .hero__cta {
@@ -61,7 +90,7 @@ import Phone from "./Phone.astro";
     align-items: center;
     justify-content: center;
     gap: 14px;
-    margin-top: 30px;
+    margin-top: 40px;
   }
   .hero__badge {
     font-size: 11px;
@@ -73,16 +102,33 @@ import Phone from "./Phone.astro";
     padding: 4px 12px;
   }
 
-  .hero__visual {
-    display: flex;
-    align-items: center;
-    gap: 36px;
-    margin-top: 54px;
-  }
+  .hero__visual { display: flex; justify-content: center; margin-top: 72px; }
   .hero__terminal { flex: 1; min-width: 0; }
 
-  @media (max-width: 900px) {
-    .hero__visual { flex-direction: column-reverse; gap: 40px; }
-    .hero__terminal { width: 100%; }
+  /* Three phones, the middle one raised. */
+  .hero__phones { display: flex; align-items: flex-start; gap: 32px; }
+  .hero__phone { margin: 0; }
+  .hero__phone--plan, .hero__phone--series { margin-top: 40px; }
+  .hero__phone figcaption {
+    margin-top: 18px;
+    text-align: center;
+    font-size: 12px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+
+  /* Too narrow for three: swipe through them, Month first. */
+  @media (max-width: 1000px) {
+    :global(html[data-app="iphone"]) .hero__visual { padding-inline: 0; }
+    .hero__phones {
+      width: 100%;
+      overflow-x: auto;
+      scroll-snap-type: x mandatory;
+      padding: 0 24px 24px;
+      scrollbar-width: none;
+    }
+    .hero__phone { scroll-snap-align: center; }
+    .hero__phone--plan, .hero__phone--series { margin-top: 0; }
+    .hero__phone--month { order: -1; }
   }
 </style>

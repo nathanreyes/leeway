@@ -4,22 +4,41 @@
  * so the page makes no claims the app doesn't back up. Each card is a little
  * ratatui panel (bordered box with a title on its top edge).
  *
+ * A card with `only` shows for that app alone (see the app switch in global.css).
+ *
  * Icons are inline SVG line drawings (not Unicode glyphs — those render as tofu
  * in fonts that lack them). The shared <svg> shell in the template sets stroke =
  * currentColor, so each `icon` below is just the inner geometry.
  */
-const features = [
+// disk / local database cylinder
+const disk = `<ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v12c0 1.7 3.36 3 7.5 3s7.5-1.3 7.5-3V6"/><path d="M4.5 12c0 1.7 3.36 3 7.5 3s7.5-1.3 7.5-3"/>`;
+
+const features: { icon: string; title: string; body: string; only?: "terminal" | "iphone" }[] = [
   {
-    // disk / local database cylinder
-    icon: `<ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v12c0 1.7 3.36 3 7.5 3s7.5-1.3 7.5-3V6"/><path d="M4.5 12c0 1.7 3.36 3 7.5 3s7.5-1.3 7.5-3"/>`,
+    icon: disk,
     title: "Local-first",
-    body: "Your budget stays on your device, with no account and no tracking.",
+    body: "Your data stays in a local SQLite file with no account or cloud.",
+    only: "terminal",
+  },
+  {
+    icon: disk,
+    title: "Local-first",
+    body: "Your budget stays on your phone, with no account, ads or tracking.",
+    only: "iphone",
   },
   {
     // terminal window with a >_ prompt
     icon: `<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15.5h4"/>`,
-    title: "Terminal and iPhone",
-    body: "A keyboard-driven terminal app and a touch-first iPhone app, both centered on what's left.",
+    title: "Built for the terminal",
+    body: "A fast, keyboard-driven Ratatui app centered on what's left.",
+    only: "terminal",
+  },
+  {
+    // phone with a plus button
+    icon: `<rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path d="M12 11v5"/><path d="M9.5 13.5h5"/>`,
+    title: "Made for iPhone",
+    body: "Settle a bill with a tap and log spending from any tab with the + button.",
+    only: "iphone",
   },
   {
     // account / card with a stripe
@@ -55,7 +74,7 @@ const features = [
 
     <div class="grid">
       {features.map((f) => (
-        <article class="panel card">
+        <article class="panel card" data-only={f.only}>
           <span class="panel__title">{f.title}</span>
           <div class="card__glyph" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"

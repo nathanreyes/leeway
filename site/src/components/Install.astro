@@ -2,7 +2,8 @@
 /*
  * Install.astro — the install instructions, straight from README.md. Rendered
  * as a terminal window so it stays on-theme. Leads with the prebuilt-binary
- * installer (no toolchain required); crates.io and source follow.
+ * installer (no toolchain required); crates.io and source follow. The iPhone
+ * side says the app is coming and what Leeway Pro will add.
  */
 const repo = "https://github.com/nathanreyes/leeway";
 
@@ -20,10 +21,16 @@ const lines = [
   { p: true,  t: "git clone https://github.com/nathanreyes/leeway.git && cd leeway", k: "cmd" },
   { p: true,  t: "cargo run", k: "cmd" },
 ];
+
+const pro = [
+  "iCloud sync across your devices",
+  "Share a budget with a partner",
+  "Bank sync through SimpleFIN",
+];
 ---
 
 <section id="install" class="install">
-  <div class="container install__inner">
+  <div class="container install__inner" data-only="terminal">
     <div class="install__copy">
       <p class="eyebrow">install · terminal</p>
       <h2 class="install__h">One line to install.</h2>
@@ -52,6 +59,33 @@ const lines = [
         l.k === "gap" ? <div class="ln">&nbsp;</div> :
         <div class:list={["ln", `ln--${l.k}`]}>{l.p && <span class="prompt">$</span>}<span>{l.t}</span></div>
       ))}</pre>
+    </div>
+  </div>
+
+  <div class="container install__inner" data-only="iphone">
+    <div class="install__copy">
+      <p class="eyebrow">get it · iphone</p>
+      <h2 class="install__h">Coming soon to the App Store.</h2>
+      <p class="install__sub">
+        Free and complete on one device, for iOS 17 or later. No account, ads or
+        tracking.
+      </p>
+      <p class="install__next">
+        <span class="t-mauve">also →</span> the terminal app runs the same rules today,
+        on macOS, Linux and Windows.
+      </p>
+      <a class="btn" href="#install" data-pick="terminal">See the terminal app</a>
+    </div>
+
+    <div class="panel pro">
+      <span class="panel__title">Leeway Pro · later</span>
+      <p class="pro__lead">One purchase, not a subscription.</p>
+      <ul class="pro__list">
+        {pro.map((item) => <li>{item}</li>)}
+      </ul>
+      <p class="pro__note">
+        Your budget syncs through your own iCloud. We run no server that sees it.
+      </p>
     </div>
   </div>
 </section>
@@ -97,6 +131,12 @@ const lines = [
   .ln--out, .ln--comment { white-space: pre-wrap; }
   .ln--out { color: var(--dim); }
   .ln--comment { color: var(--faint); }
+
+  .pro { padding: 32px 28px 26px; }
+  .pro__lead { font-size: 17px; margin: 0 0 14px; }
+  .pro__list { list-style: none; padding: 0; margin: 0 0 18px; color: var(--dim); }
+  .pro__list li::before { content: "→ "; color: var(--mauve); }
+  .pro__note { color: var(--faint); font-size: 13px; margin: 0; }
 
   @media (max-width: 780px) {
     .install__inner { grid-template-columns: 1fr; gap: 28px; }

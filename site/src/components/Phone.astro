@@ -1,29 +1,67 @@
 ---
 /*
- * Phone.astro — an HTML sketch of Leeway for iPhone's Month screen in dark mode.
+ * Phone.astro — an HTML sketch of one Leeway for iPhone screen in dark mode.
  *
- * It mirrors the app: the What's left card with its mauve band, day marks, the serif
- * figure, the split bar and its legend, then "To settle" rows and the floating tab pill
- * with its round "+". Colours come from the app's dark theme tokens.
+ * `screen` picks which:
+ * - plan: a plan's detail, with what a typical month leaves, the 12-month strip, Stamp,
+ *   and its items.
+ * - month: the What's left card with its mauve band, day marks, the serif figure, the
+ *   split bar and its legend, then "To settle" rows.
+ * - series: one series' bar chart with its dashed plan line, average and range.
+ *
+ * Every screen has the floating tab pill with its round "+". Colours come from the app's
+ * dark theme tokens.
  */
+interface Props {
+  screen: "plan" | "month" | "series";
+}
+const { screen } = Astro.props;
+
+const titles = { plan: "Plan detail", month: "Month", series: "Series detail" };
+const tab = { plan: "Plans", month: "Month", series: "Series" }[screen];
+const tabs = [
+  { name: "Month", glyph: "▦" },
+  { name: "Plans", glyph: "☰" },
+  { name: "Series", glyph: "∿" },
+];
+
+// Month: the day marks, and split bar parts with their share of the bar.
 const DAYS = 31;
 const TODAY = 10;
-
-// Split bar parts: share of the bar and the legend figure.
 const parts = [
   { label: "Left",      cents: "$1,284", share: 31, color: "var(--green)" },
   { label: "Card owed", cents: "$412",   share: 10, color: "var(--pink)" },
   { label: "Envelopes", cents: "$3,074", share: 42, color: "var(--cyan)" },
   { label: "Bills due", cents: "$680",   share: 17, color: "var(--amber)" },
 ];
-
 const settle = [
   { name: "Paycheck", note: "Income · due 15th", amount: "$3,150", kind: "income" },
   { name: "Electric", note: "Bill · due 18th",   amount: "$142",   kind: "bill" },
 ];
+
+// Plan: what each month leaves against a typical one. Car insurance falls in April and
+// October and gifts in December, so those months leave less.
+const nets = [1140, 1140, 1140, 760, 1140, 1140, 1140, 1140, 1140, 760, 1140, 840];
+const NET_MAX = Math.max(...nets);
+const planItems = [
+  { group: "Income", rows: [
+    { name: "Paycheck", note: "1 of 2", amount: "$3,150.00", kind: "income" },
+    { name: "Paycheck", note: "2 of 2", amount: "$3,150.00", kind: "income" },
+  ] },
+  { group: "Bills", rows: [
+    { name: "Rent", note: "", amount: "$1,850.00", kind: "bill" },
+  ] },
+];
+
+// Series: Groceries over the last 12 months. The last month isn't settled yet.
+const PLAN = 650;
+const CHART_MAX = 800;
+const months = ["Aug", "Sep", "Oct", "Nov", "Dec", "Jan 26", "Feb", "Mar", "Apr", "May", "Jun", "Jul"];
+const amounts = [612, 655, 640, 702, 742, 598, 630, 671, 690, 705, 668, 650];
+const pct = (v: number) => `${(v / CHART_MAX) * 100}%`;
 ---
 
-<div class="phone" aria-label="Leeway for iPhone, Month screen" role="img">
+<div class="phone" aria-label={`Leeway for iPhone, ${titles[screen]} screen`} role="img">
   <div class="phone__screen">
     <div class="phone__status">
       <span>9:41</span>
@@ -31,49 +69,146 @@ const settle = [
       <span class="phone__bars">●●●</span>
     </div>
 
-    <p class="phone__month serif">July</p>
+    {screen === "month" && (
+      <>
+        <p class="phone__month serif">July</p>
 
-    <div class="wl">
-      <div class="wl__band">
-        <span>WHAT'S LEFT</span>
-        <span class="wl__tag">From Standard ↻</span>
-      </div>
-      <div class="wl__body">
-        <div class="wl__days">
-          {Array.from({ length: DAYS }, (_, i) => (
-            <i class:list={{ past: i < TODAY - 1, today: i === TODAY - 1 }} />
+        <div class="card wl">
+          <div class="wl__band">
+            <span>WHAT'S LEFT</span>
+            <span class="wl__tag">From Standard ↻</span>
+          </div>
+          <div class="wl__body">
+            <div class="wl__days">
+              {Array.from({ length: DAYS }, (_, i) => (
+                <i class:list={{ past: i < TODAY - 1, today: i === TODAY - 1 }} />
+              ))}
+            </div>
+            <p class="dim wl__daytext">Day 10 · 21 days left</p>
+            <p class="wl__figure serif"><small>$</small>1,284<small class="wl__cents">.10</small></p>
+            <div class="wl__bar">
+              {parts.map((p) => <span style={`flex:${p.share};background:${p.color}`} />)}
+            </div>
+            <div class="wl__legend">
+              {parts.map((p) => (
+                <span><i style={`background:${p.color}`} />{p.label}<b>{p.cents}</b></span>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <p class="phone__h serif">To settle</p>
+        <div class="card">
+          {settle.map((s) => (
+            <div class="row">
+              <span class:list={["tile", `tile--${s.kind}`]}>{s.kind === "income" ? "↓" : "↑"}</span>
+              <span class="row__name">{s.name}<small>{s.note}</small></span>
+              <span class:list={["row__amt", { "t-green": s.kind === "income" }]}>{s.amount}</span>
+              <span class="row__check" />
+            </div>
           ))}
         </div>
-        <p class="wl__daytext">Day 10 · 21 days left</p>
-        <p class="wl__figure serif"><small>$</small>1,284<small class="wl__cents">.10</small></p>
-        <div class="wl__bar">
-          {parts.map((p) => <span style={`flex:${p.share};background:${p.color}`} />)}
-        </div>
-        <div class="wl__legend">
-          {parts.map((p) => (
-            <span><i style={`background:${p.color}`} />{p.label}<b>{p.cents}</b></span>
-          ))}
-        </div>
-      </div>
-    </div>
+      </>
+    )}
 
-    <p class="phone__h serif">To settle</p>
-    <div class="settle">
-      {settle.map((s) => (
-        <div class="settle__row">
-          <span class:list={["settle__tile", `settle__tile--${s.kind}`]}>{s.kind === "income" ? "↓" : "↑"}</span>
-          <span class="settle__name">{s.name}<small>{s.note}</small></span>
-          <span class:list={["settle__amt", { "t-green": s.kind === "income" }]}>{s.amount}</span>
-          <span class="settle__check" />
+    {screen === "plan" && (
+      <>
+        <p class="phone__back">‹</p>
+        <div class="phone__title">
+          <p class="serif">Standard</p>
+          <span class="phone__more">•••</span>
         </div>
-      ))}
-    </div>
+
+        <div class="card net">
+          <p class="caps dim">A typical month leaves</p>
+          <p class="net__figure serif">$1,140.00</p>
+          <p class="dim net__parts">$6,300 in · $3,460 bills · $1,700 envelopes</p>
+          <div class="net__strip">
+            {nets.map((n) => (
+              <span class:list={{ low: n < 1140 }} style={`height:${(n / NET_MAX) * 100}%`} />
+            ))}
+          </div>
+          <div class="net__months">
+            {"JFMAMJJASOND".split("").map((m, i) => <span class:list={{ low: nets[i] < 1140 }}>{m}</span>)}
+          </div>
+        </div>
+
+        <p class="stamp">◎ Stamp August from this plan</p>
+
+        {planItems.map((g) => (
+          <>
+            <p class="group dim">{g.group}</p>
+            <div class="card">
+              {g.rows.map((r) => (
+                <div class="row">
+                  <span class:list={["tile", `tile--${r.kind}`]}>{r.kind === "income" ? "↓" : "⌂"}</span>
+                  <span class="row__name">{r.name}{r.note && <small>{r.note}</small>}</span>
+                  <span class:list={["row__amt", { "t-green": r.kind === "income" }]}>{r.amount}</span>
+                </div>
+              ))}
+            </div>
+          </>
+        ))}
+      </>
+    )}
+
+    {screen === "series" && (
+      <>
+        <p class="phone__back">‹</p>
+        <div class="series__head">
+          <span class="tile tile--envelope tile--big">⛁</span>
+          <span>
+            <p class="serif">Groceries</p>
+            <p class="dim">Automatic envelope</p>
+          </span>
+        </div>
+
+        <div class="segments">
+          <span class="on">12 months</span><span>This year</span><span>Last year</span><span>All</span>
+        </div>
+
+        <div class="card chart">
+          <div class="chart__plot">
+            {[0, 400, 800].map((v) => (
+              <span class="chart__grid" style={`bottom:${pct(v)}`}><i>${v}</i></span>
+            ))}
+            <span class="chart__plan" style={`bottom:${pct(PLAN)}`} />
+            <div class="chart__bars">
+              {amounts.map((a, i) => (
+                <span class:list={{ open: i === amounts.length - 1 }} style={`height:${pct(a)}`} />
+              ))}
+            </div>
+          </div>
+          <div class="chart__months dim">
+            {months.map((m, i) => <span>{i % 3 === 0 ? m : ""}</span>)}
+          </div>
+          <div class="chart__legend dim">
+            <span><i class="sw" />Settled</span>
+            <span><i class="sw sw--open" />Not yet</span>
+            <span><i class="sw sw--plan" />Plan</span>
+          </div>
+        </div>
+
+        <div class="figures">
+          <div class="card figure">
+            <p class="dim">Average</p>
+            <b>$664</b>
+            <p class="dim">$14 over plan</p>
+          </div>
+          <div class="card figure">
+            <p class="dim">Range</p>
+            <b>$598–$742</b>
+            <p class="dim">12 months</p>
+          </div>
+        </div>
+      </>
+    )}
 
     <div class="phone__dock">
       <div class="pill">
-        <span class="pill__tab pill__tab--on"><i>▦</i>Month</span>
-        <span class="pill__tab"><i>☰</i>Plans</span>
-        <span class="pill__tab"><i>∿</i>Series</span>
+        {tabs.map((t) => (
+          <span class:list={["pill__tab", { "pill__tab--on": t.name === tab }]}><i>{t.glyph}</i>{t.name}</span>
+        ))}
       </div>
       <span class="add">+</span>
     </div>
@@ -93,6 +228,7 @@ const settle = [
     font-size: 11px;
     line-height: 1.3;
   }
+  .phone p { margin: 0; }
   .phone__screen {
     position: relative;
     height: 600px;
@@ -113,15 +249,28 @@ const settle = [
   .phone__island { width: 84px; height: 24px; border-radius: 99px; background: #000; }
   .phone__bars { font-size: 7px; letter-spacing: 1px; }
 
-  .phone__month { font-size: 32px; margin: 14px 4px 10px; line-height: 1; }
-  .phone__h { font-size: 21px; margin: 18px 4px 8px; line-height: 1; }
-
-  .wl {
-    border-radius: 20px;
-    overflow: hidden;
+  .phone .phone__month { font-size: 32px; margin: 14px 4px 10px; line-height: 1; }
+  .phone .phone__h { font-size: 21px; margin: 18px 4px 8px; line-height: 1; }
+  .phone .phone__back { color: var(--mauve); font-size: 26px; line-height: 1; margin: 6px 2px 2px; }
+  .phone__title { display: flex; justify-content: space-between; align-items: center; margin: 0 4px 10px; }
+  .phone__title .serif { font-size: 30px; line-height: 1; }
+  .phone__more {
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    font-size: 7px;
     background: var(--panel);
     border: 1px solid #262635;
   }
+
+  .dim { color: #9a9ab2; }
+  .caps { font-weight: 600; font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; }
+  .card { border-radius: 18px; background: var(--panel); border: 1px solid #262635; }
+
+  /* Month */
+  .wl { border-radius: 20px; overflow: hidden; }
   .wl__band {
     display: flex;
     justify-content: space-between;
@@ -145,8 +294,8 @@ const settle = [
   .wl__days i { flex: 1; border-radius: 2px; background: #3a3a4e; }
   .wl__days i.past { background: var(--faint); }
   .wl__days i.today { background: #5b3aa8; }
-  .wl__daytext { margin: 6px 0 0; color: #9a9ab2; font-weight: 500; }
-  .wl__figure { font-size: 54px; line-height: 1; margin: 10px 0 12px; letter-spacing: -1px; }
+  .phone .wl__daytext { margin-top: 6px; font-weight: 500; }
+  .phone .wl__figure { font-size: 54px; line-height: 1; margin: 10px 0 12px; letter-spacing: -1px; }
   .wl__figure small { font-size: 26px; vertical-align: 20px; letter-spacing: 0; }
   .wl__figure .wl__cents { opacity: 0.72; }
   .wl__bar { display: flex; gap: 2px; height: 8px; border-radius: 99px; overflow: hidden; }
@@ -162,16 +311,16 @@ const settle = [
   .wl__legend i { width: 7px; height: 7px; border-radius: 50%; }
   .wl__legend b { margin-left: auto; color: var(--text); font-weight: 400; }
 
-  .settle { border-radius: 18px; background: var(--panel); border: 1px solid #262635; }
-  .settle__row {
+  /* Rows, shared by To settle and plan items */
+  .row {
     display: grid;
     grid-template-columns: auto 1fr auto auto;
     align-items: center;
     gap: 10px;
     padding: 10px 12px;
   }
-  .settle__row + .settle__row { border-top: 1px solid var(--line); }
-  .settle__tile {
+  .row + .row { border-top: 1px solid var(--line); }
+  .tile {
     width: 28px;
     height: 28px;
     border-radius: 8px;
@@ -179,13 +328,87 @@ const settle = [
     place-items: center;
     font-weight: 700;
   }
-  .settle__tile--income { color: var(--green); background: rgba(147, 224, 160, 0.14); }
-  .settle__tile--bill { color: var(--amber); background: rgba(232, 197, 131, 0.14); }
-  .settle__name { font-weight: 600; font-size: 12px; }
-  .settle__name small { display: block; font-weight: 400; color: #9a9ab2; font-size: 10.5px; }
-  .settle__amt { font-weight: 500; }
-  .settle__check { width: 20px; height: 20px; border-radius: 50%; border: 1.5px solid #4a4a5e; }
+  .tile--income { color: var(--green); background: rgba(147, 224, 160, 0.14); }
+  .tile--bill { color: var(--amber); background: rgba(232, 197, 131, 0.14); }
+  .tile--envelope { color: var(--cyan); background: rgba(134, 217, 230, 0.14); }
+  .tile--big { width: 36px; height: 36px; border-radius: 11px; font-size: 16px; font-weight: 400; }
+  .row__name { font-weight: 600; font-size: 12px; }
+  .row__name small { display: block; font-weight: 400; color: #9a9ab2; font-size: 10.5px; }
+  .row__amt { font-weight: 600; }
+  .row__check { width: 20px; height: 20px; border-radius: 50%; border: 1.5px solid #4a4a5e; }
 
+  /* Plan */
+  .net { padding: 14px; border-radius: 20px; }
+  .phone .net__figure { font-size: 40px; line-height: 1; margin: 8px 0 6px; letter-spacing: -0.5px; }
+  /* The app shrinks this line to fit rather than wrapping it. */
+  .net__parts { font-size: 9.5px; white-space: nowrap; }
+  .net__strip {
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    height: 34px;
+    margin-top: 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .net__strip span { flex: 1; border-radius: 2px 2px 0 0; background: #4a4a5e; }
+  .net__strip span.low { background: var(--amber); }
+  .net__months { display: flex; gap: 4px; margin-top: 4px; color: #9a9ab2; font-size: 9px; }
+  .net__months span { flex: 1; text-align: center; }
+  .net__months span.low { color: var(--amber); font-weight: 700; }
+  .phone .stamp {
+    margin: 12px 0 4px;
+    padding: 11px;
+    border-radius: 99px;
+    text-align: center;
+    background: var(--mauve);
+    color: var(--bg);
+    font-weight: 600;
+    font-size: 12px;
+  }
+  .phone .group { font-weight: 600; margin: 12px 4px 6px; }
+
+  /* Series */
+  .series__head { display: flex; align-items: center; gap: 10px; margin: 0 4px 12px; }
+  .series__head .serif { font-size: 30px; line-height: 1; }
+  .segments {
+    display: flex;
+    padding: 2px;
+    border-radius: 8px;
+    background: #1f1f2b;
+    font-size: 9.5px;
+    font-weight: 500;
+    margin-bottom: 10px;
+  }
+  .segments span { flex: 1; text-align: center; padding: 4px 0; border-radius: 6px; }
+  .segments .on { background: #3a3a4e; }
+  .chart { padding: 12px 12px 10px; border-radius: 20px; }
+  .chart__plot { position: relative; height: 130px; margin-left: 28px; }
+  .chart__grid { position: absolute; left: 0; right: 0; border-top: 1px solid var(--line); }
+  .chart__grid i {
+    position: absolute;
+    right: calc(100% + 5px);
+    top: -6px;
+    font-style: normal;
+    font-size: 8.5px;
+    color: #9a9ab2;
+  }
+  .chart__plan { position: absolute; left: 0; right: 0; border-top: 1.5px dashed var(--text); z-index: 1; }
+  .chart__bars { position: absolute; inset: 0; display: flex; align-items: flex-end; gap: 4px; }
+  .chart__bars span { flex: 1; border-radius: 3px 3px 0 0; background: var(--cyan); }
+  .chart__bars span.open { opacity: 0.4; }
+  .chart__months { display: flex; gap: 4px; margin: 4px 0 0 28px; font-size: 8.5px; }
+  .chart__months span { flex: 1; white-space: nowrap; }
+  .chart__legend { display: flex; gap: 12px; margin-top: 10px; font-size: 10px; }
+  .chart__legend span { display: flex; align-items: center; gap: 4px; }
+  .sw { width: 10px; height: 7px; background: var(--cyan); }
+  .sw--open { opacity: 0.4; }
+  .sw--plan { height: 0; border-top: 1.5px dashed var(--text); background: none; }
+  .figures { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  .figure { padding: 10px 12px; }
+  .figure b { display: block; font-size: 16px; font-weight: 600; margin: 2px 0; }
+  .figure p:last-child { font-size: 10px; }
+
+  /* Tab pill and "+" */
   .phone__dock {
     position: absolute;
     left: 14px;

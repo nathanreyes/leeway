@@ -1,0 +1,84 @@
+---
+/*
+ * AppSwitch.astro — the iphone | terminal toggle under the hero headline. It sets
+ * <html data-app>, which shows or hides content marked data-only (see global.css).
+ * Any element with data-pick elsewhere on the page switches too. The default app, set
+ * in Base.astro, comes first.
+ */
+const apps = [
+  {
+    id: "iphone",
+    label: "iphone",
+    icon: `<rect x="6" y="2.5" width="12" height="19" rx="2.5"/><path d="M10.5 18.5h3"/>`,
+  },
+  {
+    id: "terminal",
+    label: "terminal",
+    icon: `<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15.5h4"/>`,
+  },
+];
+---
+
+<div class="switch" role="group" aria-label="Show the app for">
+  {apps.map((app) => (
+    <button type="button" data-pick={app.id}>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" set:html={app.icon} />
+      {app.label}
+    </button>
+  ))}
+</div>
+
+<script>
+  // Switch apps: mark the choice on <html>, remember it, and put it in the URL so a
+  // shared link opens the same app.
+  const root = document.documentElement;
+  const toggle = document.querySelectorAll<HTMLButtonElement>(".switch button");
+
+  function show(app: string) {
+    toggle.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.pick === app)));
+  }
+
+  function pick(app: string) {
+    root.dataset.app = app;
+    show(app);
+    try { localStorage.setItem("leeway-app", app); } catch {}
+    const url = new URL(location.href);
+    url.searchParams.set("app", app);
+    history.replaceState(null, "", url);
+  }
+
+  document.querySelectorAll<HTMLElement>("[data-pick]").forEach((el) =>
+    el.addEventListener("click", () => pick(el.dataset.pick!)),
+  );
+  show(root.dataset.app!);
+</script>
+
+<style>
+  /* Two segments in a pill, the chosen one filled mauve. */
+  .switch {
+    display: inline-flex;
+    padding: 4px;
+    border: 1px solid var(--line-bright);
+    border-radius: 999px;
+    background: var(--bg-soft);
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--mauve) 6%, transparent);
+  }
+  .switch button {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font: 500 15px/1 var(--mono);
+    color: var(--dim);
+    background: none;
+    border: 0;
+    border-radius: 999px;
+    padding: 11px 22px;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  .switch svg { width: 18px; height: 18px; }
+  .switch button:hover { color: var(--text); }
+  .switch button[aria-pressed="true"] { background: var(--mauve); color: #1a1020; font-weight: 600; }
+  .switch button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+</style>

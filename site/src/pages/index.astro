@@ -1,10 +1,12 @@
 ---
-/* The landing page: nav + hero (terminal and phone mocks) + concepts + apps + features + install + footer. */
+/*
+ * The landing page: nav + hero + concepts + features + install + footer. The nav's
+ * toggle focuses the page on the terminal or iPhone app.
+ */
 import Base from "../layouts/Base.astro";
 import Nav from "../components/Nav.astro";
 import Hero from "../components/Hero.astro";
 import Concepts from "../components/Concepts.astro";
-import Apps from "../components/Apps.astro";
 import Features from "../components/Features.astro";
 import Install from "../components/Install.astro";
 import Footer from "../components/Footer.astro";
@@ -15,7 +17,6 @@ import Footer from "../components/Footer.astro";
   <main>
     <Hero />
     <Concepts />
-    <Apps />
     <Features />
     <Install />
   </main>

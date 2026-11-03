@@ -22,9 +22,19 @@ const canonical = Astro.site
 ---
 
 <!doctype html>
-<html lang="en">
+<html lang="en" data-app="iphone">
   <head>
     <meta charset="utf-8" />
+    <!-- Pick the app before first paint: ?app= first, then the last choice, else the
+         iPhone app set on <html>. AppSwitch.astro handles later switches. -->
+    <script is:inline>
+      (() => {
+        const apps = ["terminal", "iphone"];
+        let app = new URLSearchParams(location.search).get("app");
+        try { if (!apps.includes(app)) app = localStorage.getItem("leeway-app"); } catch {}
+        if (apps.includes(app)) document.documentElement.dataset.app = app;
+      })();
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 
