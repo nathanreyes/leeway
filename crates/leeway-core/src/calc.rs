@@ -106,9 +106,10 @@ pub struct SeasonalItem {
 /// A plan-only cash-flow projection. Unlike [`WhatsLeft`], this deliberately has no
 /// account or settlement terms: a reusable plan describes commitments, not live money.
 ///
-/// The four totals describe a **typical** month — they count only the items that run every
-/// month. Seasonal items are reported separately in `seasonal` instead of being averaged
-/// in, so the headline stays the number you plan against and the exceptions stay visible.
+/// The four totals describe a **typical** month — they count only the items that run in
+/// `month` and every month after it. Seasonal items still running are reported separately
+/// in `seasonal` instead of being averaged in, so the headline stays the number you plan
+/// against and the exceptions stay visible. Items with dates show up in [`project_month`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanProjection {
     pub income: Money,
@@ -123,10 +124,15 @@ pub struct PlanProjection {
 /// A plan has no target calendar month yet, so daily envelope rates use the documented
 /// 30-day assumption. Legacy weekly envelopes continue to behave as monthly values,
 /// matching stamping behavior.
-pub fn project_plan(entries: &[PlanEntry]) -> PlanProjection {
-    let (every_month, seasonal): (Vec<&PlanEntry>, Vec<&PlanEntry>) = entries
+pub fn project_plan(entries: &[PlanEntry], month: NaiveDate) -> PlanProjection {
+    let every_month: Vec<&PlanEntry> = entries
         .iter()
-        .partition(|entry| entry.active_months.is_all());
+        .filter(|entry| entry.is_every_month_from(month))
+        .collect();
+    let seasonal = entries.iter().filter(|entry| {
+        !entry.active_months.is_all()
+            && entry.skip_reason(month) != Some(crate::models::SkipReason::Ended)
+    });
 
     let income: Money = every_month
         .iter()
@@ -154,7 +160,6 @@ pub fn project_plan(entries: &[PlanEntry]) -> PlanProjection {
         envelopes,
         whats_left: income - expenses - envelopes,
         seasonal: seasonal
-            .into_iter()
             .map(|entry| SeasonalItem {
                 label: entry.series.label.clone(),
                 net: signed_projected_amount(entry),
@@ -162,6 +167,16 @@ pub fn project_plan(entries: &[PlanEntry]) -> PlanProjection {
             })
             .collect(),
     }
+}
+
+/// What the plan leaves in the month starting `month`: every entry that runs then, signed,
+/// with daily envelopes over the same 30-day assumption as [`project_plan`].
+pub fn project_month(entries: &[PlanEntry], month: NaiveDate) -> Money {
+    entries
+        .iter()
+        .filter(|entry| entry.runs_in(month))
+        .map(signed_projected_amount)
+        .sum()
 }
 
 /// One entry's contribution to a month, before direction: envelopes projected across the
@@ -448,7 +463,7 @@ mod tests {
             ),
         ];
 
-        let projection = project_plan(&entries);
+        let projection = project_plan(&entries, june());
 
         assert_eq!(projection.income, Money::from_dollars(6000.0));
         assert_eq!(projection.expenses, Money::from_dollars(2200.0));
@@ -473,7 +488,7 @@ mod tests {
             ),
         ];
 
-        let projection = project_plan(&entries);
+        let projection = project_plan(&entries, june());
 
         assert_eq!(projection.envelopes, Money::from_dollars(860.0));
         assert_eq!(projection.whats_left, Money::from_dollars(-860.0));
@@ -482,7 +497,7 @@ mod tests {
     #[test]
     fn empty_plan_projection_is_zero() {
         assert_eq!(
-            project_plan(&[]),
+            project_plan(&[], june()),
             PlanProjection {
                 income: Money::ZERO,
                 expenses: Money::ZERO,
@@ -524,7 +539,7 @@ mod tests {
             ),
         ];
 
-        let projection = project_plan(&entries);
+        let projection = project_plan(&entries, june());
 
         // The headline describes an ordinary month: neither seasonal item is folded in.
         assert_eq!(projection.income, Money::from_dollars(3000.0));
@@ -561,7 +576,7 @@ mod tests {
         let mut entries = entries;
         entries[0].series.period_type = Some(PeriodType::Daily);
 
-        let projection = project_plan(&entries);
+        let projection = project_plan(&entries, june());
 
         assert_eq!(projection.envelopes, Money::ZERO);
         assert_eq!(projection.seasonal[0].net, Money::from_dollars(-360.0));
@@ -579,6 +594,9 @@ mod tests {
             amount,
             forecast_method: crate::models::ForecastMethod::Static,
             active_months: MonthSet::ALL,
+            starts_on: None,
+            ends_on: None,
+            origin: crate::models::ItemOrigin::Own,
             series: Series {
                 id: "series".into(),
                 kind,
@@ -608,6 +626,40 @@ mod tests {
         entry.series.label = label.into();
         entry.active_months = MonthSet::parse(months).expect("test months should parse");
         entry
+    }
+
+    fn june() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()
+    }
+
+    #[test]
+    fn dated_items_stay_out_of_the_typical_month() {
+        let pay = plan_entry(
+            Kind::Transaction,
+            Some(Direction::In),
+            None,
+            Money::from_dollars(3000.0),
+        );
+        let mut car = plan_entry(
+            Kind::Transaction,
+            Some(Direction::Out),
+            None,
+            Money::from_dollars(340.0),
+        );
+        car.starts_on = Some("2026-06".into());
+        car.ends_on = Some("2026-08".into());
+        let entries = vec![pay, car];
+
+        assert_eq!(
+            project_plan(&entries, june()).whats_left,
+            Money::from_dollars(3000.0)
+        );
+        assert_eq!(project_month(&entries, june()), Money::from_dollars(2660.0));
+        let september = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        assert_eq!(
+            project_month(&entries, september),
+            Money::from_dollars(3000.0)
+        );
     }
 
     fn mk_txn(amount: Money) -> Txn {

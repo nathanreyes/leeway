@@ -233,41 +233,55 @@ pub fn load_envelope_txns(
 }
 
 pub fn plans(conn: &Connection) -> Result<Vec<Plan>> {
-    let mut stmt = conn.prepare("SELECT id, name FROM plan ORDER BY name")?;
+    let mut stmt = conn.prepare("SELECT id, name, base_plan_id FROM plan ORDER BY name")?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok(Plan {
-                id: r.get("id")?,
-                name: r.get("name")?,
-            })
-        })?
+        .query_map([], map_plan)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
-/// A plan plus how many items it holds — enough to render the plans list.
+fn map_plan(r: &Row) -> rusqlite::Result<Plan> {
+    Ok(Plan {
+        id: r.get("id")?,
+        name: r.get("name")?,
+        base_plan_id: r.get("base_plan_id")?,
+    })
+}
+
+/// The plan named Main, if there is one.
+pub fn main_plan_id(conn: &Connection) -> Result<Option<String>> {
+    let id = conn
+        .query_row(
+            "SELECT s.value FROM setting s JOIN plan p ON p.id = s.value
+             WHERE s.key = 'main_plan_id'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// A plan plus how many rows it holds — enough to render the plans list. On a what-if
+/// the rows are its changes from Main.
 pub struct PlanSummary {
     pub plan: Plan,
     pub item_count: i64,
 }
 
-/// All plans with their item counts. The `LEFT JOIN` keeps a brand-new empty plan in
+/// All plans with their row counts. The `LEFT JOIN` keeps a brand-new empty plan in
 /// the list (a plain JOIN would drop it); `COUNT(plan_item.id)` then reads 0 for it.
 pub fn plan_summaries(conn: &Connection) -> Result<Vec<PlanSummary>> {
     let mut stmt = conn.prepare(
-        "SELECT p.id, p.name, COUNT(pi.id) AS item_count
+        "SELECT p.id, p.name, p.base_plan_id, COUNT(pi.id) AS item_count
          FROM plan p
          LEFT JOIN plan_item pi ON pi.plan_id = p.id
-         GROUP BY p.id, p.name
+         GROUP BY p.id, p.name, p.base_plan_id
          ORDER BY p.name",
     )?;
     let rows = stmt
         .query_map([], |r| {
             Ok(PlanSummary {
-                plan: Plan {
-                    id: r.get("id")?,
-                    name: r.get("name")?,
-                },
+                plan: map_plan(r)?,
                 item_count: r.get("item_count")?,
             })
         })?
@@ -277,13 +291,8 @@ pub fn plan_summaries(conn: &Connection) -> Result<Vec<PlanSummary>> {
 
 /// Fetch a single plan by id, or `None` if it was deleted.
 pub fn get_plan(conn: &Connection, plan_id: &str) -> Result<Option<Plan>> {
-    let mut stmt = conn.prepare("SELECT id, name FROM plan WHERE id = ?1")?;
-    let mut rows = stmt.query_map([plan_id], |r| {
-        Ok(Plan {
-            id: r.get("id")?,
-            name: r.get("name")?,
-        })
-    })?;
+    let mut stmt = conn.prepare("SELECT id, name, base_plan_id FROM plan WHERE id = ?1")?;
+    let mut rows = stmt.query_map([plan_id], map_plan)?;
     match rows.next() {
         None => Ok(None),
         Some(p) => Ok(Some(p?)),
@@ -292,10 +301,123 @@ pub fn get_plan(conn: &Connection, plan_id: &str) -> Result<Option<Plan>> {
 
 /// All entries in a plan, with envelopes by label and transactions by direction,
 /// largest amount first, then label, matching the month view.
+///
+/// A what-if resolves against Main: each of Main's entries unless the what-if removes it,
+/// in the what-if's changed form where it has one, then the entries it adds. Stamping,
+/// restamping, and projections all read plans through here.
 pub fn load_plan_entries(conn: &Connection, plan_id: &str) -> Result<Vec<PlanEntry>> {
+    let Some(base_id) = base_plan_id(conn, plan_id)? else {
+        return Ok(own_rows(conn, plan_id)?
+            .into_iter()
+            .map(|row| row.entry)
+            .collect());
+    };
+    let changes = own_rows(conn, plan_id)?;
+    let mut entries = Vec::new();
+    for base in own_rows(conn, &base_id)? {
+        let base = base.entry;
+        match changes
+            .iter()
+            .find(|c| c.base_item_id.as_deref() == Some(&base.item_id))
+        {
+            Some(change) if change.removed => {}
+            Some(change) => entries.push(PlanEntry {
+                item_id: base.item_id.clone(),
+                plan_id: plan_id.to_string(),
+                origin: ItemOrigin::Changed {
+                    base_amount: base.amount,
+                },
+                ..change.entry.clone()
+            }),
+            None => entries.push(PlanEntry {
+                plan_id: plan_id.to_string(),
+                origin: ItemOrigin::Inherited,
+                ..base
+            }),
+        }
+    }
+    entries.extend(
+        changes
+            .into_iter()
+            .filter(|c| c.base_item_id.is_none())
+            .map(|c| c.entry),
+    );
+    entries.sort_by_key(entry_order);
+    Ok(entries)
+}
+
+/// Main's entries that the what-if `plan_id` removes, as Main has them. Empty for any
+/// other plan.
+pub fn removed_entries(conn: &Connection, plan_id: &str) -> Result<Vec<PlanEntry>> {
+    let Some(base_id) = base_plan_id(conn, plan_id)? else {
+        return Ok(Vec::new());
+    };
+    let removed: HashSet<String> = own_rows(conn, plan_id)?
+        .into_iter()
+        .filter(|c| c.removed)
+        .filter_map(|c| c.base_item_id)
+        .collect();
+    Ok(own_rows(conn, &base_id)?
+        .into_iter()
+        .map(|row| row.entry)
+        .filter(|entry| removed.contains(&entry.item_id))
+        .collect())
+}
+
+/// The plan's entries that don't go into the month starting `month`, each with why.
+pub fn skipped_entries(
+    conn: &Connection,
+    plan_id: &str,
+    month: NaiveDate,
+) -> Result<Vec<(PlanEntry, SkipReason)>> {
+    let mut skipped: Vec<(PlanEntry, SkipReason)> = load_plan_entries(conn, plan_id)?
+        .into_iter()
+        .filter_map(|entry| entry.skip_reason(month).map(|reason| (entry, reason)))
+        .collect();
+    skipped.extend(
+        removed_entries(conn, plan_id)?
+            .into_iter()
+            .filter(|entry| entry.runs_in(month))
+            .map(|entry| (entry, SkipReason::Removed)),
+    );
+    Ok(skipped)
+}
+
+/// What-ifs on `plan_id`, by name.
+pub fn what_ifs_of(conn: &Connection, plan_id: &str) -> Result<Vec<Plan>> {
+    let mut stmt = conn
+        .prepare("SELECT id, name, base_plan_id FROM plan WHERE base_plan_id = ?1 ORDER BY name")?;
+    let rows = stmt
+        .query_map([plan_id], map_plan)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn base_plan_id(conn: &Connection, plan_id: &str) -> Result<Option<String>> {
+    let base = conn
+        .query_row(
+            "SELECT base_plan_id FROM plan WHERE id = ?1",
+            [plan_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(base)
+}
+
+/// One `plan_item` row as stored, before a what-if is resolved against Main.
+struct PlanRow {
+    entry: PlanEntry,
+    base_item_id: Option<String>,
+    removed: bool,
+}
+
+fn own_rows(conn: &Connection, plan_id: &str) -> Result<Vec<PlanRow>> {
     let mut stmt = conn.prepare(
         "SELECT pi.id AS item_id, pi.plan_id AS plan_id, pi.amount_cents AS amount_cents,
                 pi.active_months AS active_months, pi.forecast_method AS forecast_method,
+                pi.starts_on AS starts_on, pi.ends_on AS ends_on,
+                pi.base_item_id AS base_item_id, pi.removed AS removed,
                 s.id AS series_id, s.kind AS kind, s.label AS label,
                 s.direction AS direction, s.period_type AS period_type, s.mode AS mode
          FROM plan_item pi JOIN series s ON s.id = pi.series_id
@@ -305,9 +427,40 @@ pub fn load_plan_entries(conn: &Connection, plan_id: &str) -> Result<Vec<PlanEnt
                   s.label, pi.id",
     )?;
     let rows = stmt
-        .query_map([plan_id], map_plan_entry)?
+        .query_map([plan_id], |r| {
+            Ok(PlanRow {
+                entry: map_plan_entry(r)?,
+                base_item_id: r.get("base_item_id")?,
+                removed: r.get("removed")?,
+            })
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// The order `own_rows` sorts by, for a resolved what-if: envelopes, then money out before
+/// money in, larger transactions first, then label and id.
+fn entry_order(entry: &PlanEntry) -> (u8, u8, i64, String, String) {
+    let kind = match entry.series.kind {
+        Kind::Envelope => 0,
+        Kind::Transaction => 1,
+    };
+    let direction = match entry.series.direction {
+        Some(Direction::Out) => 0,
+        Some(Direction::In) => 1,
+        None => 2,
+    };
+    let amount = match entry.series.kind {
+        Kind::Transaction => -entry.amount.cents(),
+        Kind::Envelope => 0,
+    };
+    (
+        kind,
+        direction,
+        amount,
+        entry.series.label.clone(),
+        entry.item_id.clone(),
+    )
 }
 
 /// Every series, for the reuse picker.
@@ -526,6 +679,9 @@ fn map_plan_entry(r: &Row) -> rusqlite::Result<PlanEntry> {
         // NULL is the common case and means every month, so read it as an Option and let
         // MonthSet decide rather than teaching FromSql about a missing value.
         active_months: MonthSet::from_db(r.get("active_months")?),
+        starts_on: r.get("starts_on")?,
+        ends_on: r.get("ends_on")?,
+        origin: ItemOrigin::Own,
         series: Series {
             id: r.get("series_id")?,
             kind: r.get("kind")?,

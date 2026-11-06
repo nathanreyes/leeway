@@ -467,12 +467,22 @@ pub enum PromptKind {
     NewSeries {
         block: BudgetBlock,
     },
-    /// Edit a plan_item's per-plan budgeted amount.
+    /// Create a what-if on Main.
+    NewWhatIf,
+    /// Edit a plan_item's per-plan budgeted amount. On a what-if, an item from Main is
+    /// edited through the what-if's own copy (`ops::editable_item`).
     ItemAmount {
+        plan_id: String,
         id: String,
     },
     /// Edit which months a plan_item is stamped in — per-plan, like the amount.
     ItemMonths {
+        plan_id: String,
+        id: String,
+    },
+    /// Edit the first and last month a plan_item runs.
+    ItemDates {
+        plan_id: String,
         id: String,
     },
     /// Collect the amount, then add a selected or newly-created series to a plan/month.
@@ -569,6 +579,11 @@ pub enum ConfirmAction {
         id: String,
     },
     DeleteItem {
+        plan_id: String,
+        id: String,
+    },
+    /// Write a what-if's changes into Main and delete the what-if.
+    ApplyWhatIf {
         id: String,
     },
     /// Delete a shared series definition. Guarded in `ops::delete_series` (blocked while any
@@ -1916,7 +1931,11 @@ fn confirm_stamp_review(app: &mut App) -> Result<()> {
         return Ok(());
     };
     for item in &review.items {
-        ops::set_item_forecast_method(&app.conn, &item.entry.item_id, item.method)?;
+        // On a what-if, only a new choice makes the what-if its own copy of Main's item.
+        if item.method != item.entry.forecast_method {
+            let id = ops::editable_item(&app.conn, &item.entry.plan_id, &item.entry.item_id)?;
+            ops::set_item_forecast_method(&app.conn, &id, item.method)?;
+        }
     }
     let excluded_item_ids: Vec<String> = review
         .items
@@ -2450,6 +2469,27 @@ fn add_selected_series(
     Ok(())
 }
 
+/// Read what the user typed for an item's dates: `2027-01 to 2027-06`, `2027-01 to` or
+/// `to 2027-06` for one open end, `2027-08` for a single month, or `none` (or nothing) for
+/// no dates. Months are checked by `ops::set_item_dates`.
+fn parse_item_dates(text: &str) -> Option<(Option<String>, Option<String>)> {
+    let text = text.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("none") {
+        return Some((None, None));
+    }
+    let side = |part: &str| {
+        let part = part.trim();
+        (!part.is_empty()).then(|| part.to_string())
+    };
+    match text.split_once("to") {
+        Some((starts, ends)) => {
+            let (starts, ends) = (side(starts), side(ends));
+            (starts.is_some() || ends.is_some()).then_some((starts, ends))
+        }
+        None => Some((side(text), side(text))),
+    }
+}
+
 /// Apply a submitted text prompt. We `take()` the modal first so it closes exactly once,
 /// then act on its kind. Validation failures re-report via `status` instead of mutating.
 fn submit_text(app: &mut App) -> Result<()> {
@@ -2472,6 +2512,21 @@ fn submit_text(app: &mut App) -> Result<()> {
             app.pending_plan_select = Some(id);
             app.screen = Screen::Budget;
             app.status = Some(format!("Created plan “{text}”"));
+        }
+        PromptKind::NewWhatIf => {
+            if text.is_empty() {
+                app.status = Some("What-if name can't be empty".into());
+                return Ok(());
+            }
+            match ops::create_what_if(&app.conn, &text) {
+                Ok(id) => {
+                    reset_editor_selections(app);
+                    app.pending_plan_select = Some(id);
+                    app.screen = Screen::Budget;
+                    app.status = Some(format!("Created what-if “{text}”"));
+                }
+                Err(e) => app.status = Some(e.to_string()),
+            }
         }
         PromptKind::RenamePlan { id } => {
             if !text.is_empty() {
@@ -2523,14 +2578,35 @@ fn submit_text(app: &mut App) -> Result<()> {
                 );
             }
         },
-        PromptKind::ItemAmount { id } => match Money::parse_dollars(&text) {
-            Some(amount) => ops::set_item_amount(&app.conn, &id, amount)?,
+        PromptKind::ItemAmount { plan_id, id } => match Money::parse_dollars(&text) {
+            Some(amount) => {
+                let id = ops::editable_item(&app.conn, &plan_id, &id)?;
+                ops::set_item_amount(&app.conn, &id, amount)?
+            }
             None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
         },
-        PromptKind::ItemMonths { id } => match MonthSet::parse(&text) {
+        PromptKind::ItemMonths { plan_id, id } => match MonthSet::parse(&text) {
             // The parse error already names the token that failed, so show it as written.
-            Ok(months) => ops::set_item_active_months(&app.conn, &id, months)?,
+            Ok(months) => {
+                let id = ops::editable_item(&app.conn, &plan_id, &id)?;
+                ops::set_item_active_months(&app.conn, &id, months)?
+            }
             Err(message) => app.status = Some(message),
+        },
+        PromptKind::ItemDates { plan_id, id } => match parse_item_dates(&text) {
+            Some((starts, ends)) => {
+                let id = ops::editable_item(&app.conn, &plan_id, &id)?;
+                if let Err(e) =
+                    ops::set_item_dates(&app.conn, &id, starts.as_deref(), ends.as_deref())
+                {
+                    app.status = Some(e.to_string());
+                }
+            }
+            None => {
+                app.status = Some(format!(
+                    "Write dates as 2027-01 to 2027-06, 2027-08, or none (got “{text}”)"
+                ))
+            }
         },
         PromptKind::GoToMonth => match parse_year_month(&text) {
             Some((year, month)) => {
@@ -2759,12 +2835,18 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 let return_to = confirm.return_to_envelope_modal;
                 match confirm.action {
                     ConfirmAction::DeletePlan { id } => {
-                        ops::delete_plan(&mut app.conn, &id)?;
-                        app.status = Some("Plan deleted".into());
+                        match ops::delete_plan(&mut app.conn, &id) {
+                            Ok(()) => app.status = Some("Plan deleted".into()),
+                            Err(e) => app.status = Some(e.to_string()),
+                        }
                     }
-                    ConfirmAction::DeleteItem { id } => {
-                        ops::delete_plan_item(&app.conn, &id)?;
-                        app.status = Some("Item deleted".into());
+                    ConfirmAction::DeleteItem { plan_id, id } => {
+                        ops::remove_plan_item(&app.conn, &plan_id, &id)?;
+                        app.status = Some("Item removed".into());
+                    }
+                    ConfirmAction::ApplyWhatIf { id } => {
+                        ops::apply_what_if(&mut app.conn, &id)?;
+                        app.status = Some("Changes applied to Main".into());
                     }
                     ConfirmAction::DeleteSeries { series_id } => {
                         // The UI pre-checks plan usage, but `delete_series` re-checks and
@@ -3774,6 +3856,29 @@ pub(crate) fn amount_edit_string(m: Money) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn item_dates_parse_ranges_single_months_and_none() {
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            parse_item_dates("2027-01 to 2027-06"),
+            Some((some("2027-01"), some("2027-06")))
+        );
+        assert_eq!(
+            parse_item_dates("2027-08"),
+            Some((some("2027-08"), some("2027-08")))
+        );
+        assert_eq!(
+            parse_item_dates("2027-01 to"),
+            Some((some("2027-01"), None))
+        );
+        assert_eq!(
+            parse_item_dates("to 2027-06"),
+            Some((None, some("2027-06")))
+        );
+        assert_eq!(parse_item_dates("none"), Some((None, None)));
+        assert_eq!(parse_item_dates(" to "), None);
+    }
+
     use super::*;
     use ratatui::crossterm::event::KeyModifiers;
     use uuid::Uuid;

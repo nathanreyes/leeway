@@ -428,6 +428,43 @@ pub fn restamp_filtered(
         }
     }
 
+    // A what-if's removal is intent: rows for an item it removes go without the option,
+    // except paid ones and envelopes holding spending. The option still removes those.
+    let month = queries::month_by_id(&tx, month_id)?
+        .with_context(|| format!("month not found: {month_id}"))?;
+    let mut seen_txns = matched_txns.clone();
+    let mut seen_envelopes = matched_envelopes.clone();
+    for removed in queries::removed_entries(&tx, plan_id)?
+        .iter()
+        .filter(|entry| entry.runs_in(month.start_date))
+    {
+        match removed.series.kind {
+            Kind::Envelope => {
+                if let Some(envelope) =
+                    next_matching_envelope(&envelopes, &seen_envelopes, &removed.series.id)
+                {
+                    seen_envelopes.insert(envelope.id.clone());
+                    let spent = txns
+                        .iter()
+                        .any(|t| t.envelope_id.as_deref() == Some(&envelope.id));
+                    if !spent {
+                        tx.execute("DELETE FROM envelope WHERE id = ?1", [&envelope.id])?;
+                        matched_envelopes.insert(envelope.id.clone());
+                    }
+                }
+            }
+            Kind::Transaction => {
+                if let Some(txn) = next_matching_txn(&txns, &seen_txns, &removed.series.id) {
+                    seen_txns.insert(txn.id.clone());
+                    if !txn.settled {
+                        tx.execute("DELETE FROM txn WHERE id = ?1", [&txn.id])?;
+                        matched_txns.insert(txn.id.clone());
+                    }
+                }
+            }
+        }
+    }
+
     if remove_unplanned {
         // Spending is never matched itself; it lives or dies with its envelope.
         for txn in &txns {
@@ -699,13 +736,230 @@ pub fn delete_account(conn: &Connection, account_id: &str) -> Result<bool> {
 
 // --- Plan management -----------------------------------------------------------
 
-/// Create an empty plan and return its id.
+/// Create an empty plan and return its id. The first plan becomes Main.
 pub fn create_plan(conn: &Connection, name: &str) -> Result<String> {
     let id = new_id();
     conn.execute(
         "INSERT INTO plan (id, name) VALUES (?1, ?2)",
         rusqlite::params![id, name],
     )?;
+    if queries::main_plan_id(conn)?.is_none() {
+        set_main_plan(conn, &id)?;
+    }
+    Ok(id)
+}
+
+fn set_main_plan(conn: &Connection, plan_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO setting (key, value) VALUES ('main_plan_id', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [plan_id],
+    )?;
+    Ok(())
+}
+
+/// Name Main again: the plan, not a what-if, with the most stamped months (ties: most
+/// items, then name). With no plans, clears the setting.
+pub fn reset_main_plan(conn: &Connection) -> Result<()> {
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT p.id FROM plan p
+             WHERE p.base_plan_id IS NULL
+             ORDER BY (SELECT COUNT(*) FROM month m WHERE m.plan_id = p.id) DESC,
+                      (SELECT COUNT(*) FROM plan_item pi WHERE pi.plan_id = p.id) DESC,
+                      p.name, p.id
+             LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match id {
+        Some(id) => set_main_plan(conn, &id),
+        None => {
+            conn.execute("DELETE FROM setting WHERE key = 'main_plan_id'", [])?;
+            Ok(())
+        }
+    }
+}
+
+// --- What-ifs ------------------------------------------------------------------
+
+/// Create an empty what-if on Main and return its id. With no changes it stamps exactly
+/// as Main does.
+pub fn create_what_if(conn: &Connection, name: &str) -> Result<String> {
+    let main = queries::main_plan_id(conn)?.context("create a plan first")?;
+    let id = new_id();
+    conn.execute(
+        "INSERT INTO plan (id, name, base_plan_id) VALUES (?1, ?2, ?3)",
+        rusqlite::params![id, name, main],
+    )?;
+    Ok(id)
+}
+
+/// The `plan_item` row to edit for `item_id` as seen in `plan_id`. On a what-if, editing
+/// one of Main's items makes (or reuses) the what-if's changed copy of it, so the edit
+/// stays in the what-if. Anywhere else it's `item_id` itself.
+pub fn editable_item(conn: &Connection, plan_id: &str, item_id: &str) -> Result<String> {
+    let Some(base_item) = base_item_in(conn, plan_id, item_id)? else {
+        return Ok(item_id.to_string());
+    };
+    if let Some(change) = change_row(conn, plan_id, &base_item)? {
+        conn.execute("UPDATE plan_item SET removed = 0 WHERE id = ?1", [&change])?;
+        return Ok(change);
+    }
+    let id = new_id();
+    conn.execute(
+        "INSERT INTO plan_item
+           (id, plan_id, series_id, amount_cents, active_months, forecast_method,
+            starts_on, ends_on, base_item_id)
+         SELECT ?1, ?2, series_id, amount_cents, active_months, forecast_method,
+                starts_on, ends_on, id
+         FROM plan_item WHERE id = ?3",
+        rusqlite::params![id, plan_id, base_item],
+    )?;
+    Ok(id)
+}
+
+/// Take `item_id` out of `plan_id`. On a what-if, one of Main's items is marked removed
+/// rather than deleted; anything else is deleted outright.
+pub fn remove_plan_item(conn: &Connection, plan_id: &str, item_id: &str) -> Result<()> {
+    if base_item_in(conn, plan_id, item_id)?.is_some() {
+        let change = editable_item(conn, plan_id, item_id)?;
+        conn.execute("UPDATE plan_item SET removed = 1 WHERE id = ?1", [&change])?;
+        return Ok(());
+    }
+    delete_plan_item(conn, item_id)
+}
+
+/// Undo a what-if's change to one of Main's items, so it follows Main again.
+pub fn use_main_version(conn: &Connection, plan_id: &str, item_id: &str) -> Result<()> {
+    if let Some(base_item) = base_item_in(conn, plan_id, item_id)?
+        && let Some(change) = change_row(conn, plan_id, &base_item)?
+    {
+        conn.execute("DELETE FROM plan_item WHERE id = ?1", [&change])?;
+    }
+    Ok(())
+}
+
+/// Write a what-if's changes into Main and delete the what-if: changed items overwrite
+/// Main's, removed ones leave Main, and added ones move to Main.
+pub fn apply_what_if(conn: &mut Connection, plan_id: &str) -> Result<()> {
+    let tx = conn.transaction()?;
+    let plan = queries::get_plan(&tx, plan_id)?.context("plan not found")?;
+    let main = plan
+        .base_plan_id
+        .context("only a what-if has changes to apply")?;
+    let changes: Vec<(String, String, bool)> = tx
+        .prepare(
+            "SELECT id, base_item_id, removed FROM plan_item
+             WHERE plan_id = ?1 AND base_item_id IS NOT NULL",
+        )?
+        .query_map([plan_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (change, base_item, removed) in changes {
+        if removed {
+            // Deleting Main's item also deletes every what-if's change to it.
+            delete_plan_item(&tx, &base_item)?;
+            continue;
+        }
+        tx.execute(
+            "UPDATE plan_item SET
+               (amount_cents, active_months, forecast_method, starts_on, ends_on) =
+               (SELECT amount_cents, active_months, forecast_method, starts_on, ends_on
+                FROM plan_item WHERE id = ?1)
+             WHERE id = ?2",
+            [&change, &base_item],
+        )?;
+        tx.execute("DELETE FROM plan_item WHERE id = ?1", [&change])?;
+    }
+    tx.execute(
+        "UPDATE plan_item SET plan_id = ?1 WHERE plan_id = ?2",
+        [&main, plan_id],
+    )?;
+    tx.execute("DELETE FROM plan WHERE id = ?1", [plan_id])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Turn a what-if into a plan of its own that no longer follows Main. Its items stay as
+/// they resolve today; changed items keep their ids.
+pub fn make_standalone(conn: &mut Connection, plan_id: &str) -> Result<()> {
+    let tx = conn.transaction()?;
+    let plan = queries::get_plan(&tx, plan_id)?.context("plan not found")?;
+    if !plan.is_what_if() {
+        return Ok(());
+    }
+    let entries = queries::load_plan_entries(&tx, plan_id)?;
+    tx.execute(
+        "DELETE FROM plan_item WHERE plan_id = ?1 AND removed = 1",
+        [plan_id],
+    )?;
+    tx.execute(
+        "UPDATE plan_item SET base_item_id = NULL WHERE plan_id = ?1",
+        [plan_id],
+    )?;
+    for entry in entries.iter().filter(|e| e.origin == ItemOrigin::Inherited) {
+        tx.execute(
+            "INSERT INTO plan_item
+               (id, plan_id, series_id, amount_cents, active_months, forecast_method,
+                starts_on, ends_on)
+             SELECT ?1, ?2, series_id, amount_cents, active_months, forecast_method,
+                    starts_on, ends_on
+             FROM plan_item WHERE id = ?3",
+            rusqlite::params![new_id(), plan_id, entry.item_id],
+        )?;
+    }
+    tx.execute(
+        "UPDATE plan SET base_plan_id = NULL WHERE id = ?1",
+        [plan_id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Move a standalone plan's items into Main and delete the plan. This is how an add-on
+/// plan from before what-ifs joins Main.
+pub fn merge_into_main(conn: &mut Connection, plan_id: &str) -> Result<()> {
+    let tx = conn.transaction()?;
+    let main = queries::main_plan_id(&tx)?.context("there is no main plan")?;
+    let plan = queries::get_plan(&tx, plan_id)?.context("plan not found")?;
+    if plan.id == main || plan.is_what_if() {
+        anyhow::bail!("only a standalone plan can merge into Main");
+    }
+    if !queries::what_ifs_of(&tx, plan_id)?.is_empty() {
+        anyhow::bail!("this plan has what-ifs");
+    }
+    tx.execute(
+        "UPDATE plan_item SET plan_id = ?1 WHERE plan_id = ?2",
+        [&main, plan_id],
+    )?;
+    tx.execute("DELETE FROM plan WHERE id = ?1", [plan_id])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// If `plan_id` is a what-if and `item_id` is one of Main's items, Main's item id.
+fn base_item_in(conn: &Connection, plan_id: &str, item_id: &str) -> Result<Option<String>> {
+    let found = conn
+        .query_row(
+            "SELECT pi.id FROM plan p JOIN plan_item pi ON pi.plan_id = p.base_plan_id
+             WHERE p.id = ?1 AND pi.id = ?2",
+            [plan_id, item_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(found)
+}
+
+/// The what-if's row that changes or removes Main's item `base_item`.
+fn change_row(conn: &Connection, plan_id: &str, base_item: &str) -> Result<Option<String>> {
+    let id = conn
+        .query_row(
+            "SELECT id FROM plan_item WHERE plan_id = ?1 AND base_item_id = ?2",
+            [plan_id, base_item],
+            |r| r.get(0),
+        )
+        .optional()?;
     Ok(id)
 }
 
@@ -722,10 +976,24 @@ pub fn rename_plan(conn: &Connection, plan_id: &str, name: &str) -> Result<()> {
 /// a plain record with no foreign key, and each instance carries a *copied* `series_id`,
 /// so the snapshot stands on its own (app-spec §2). We delete the child `plan_item` rows
 /// first inside a transaction because they DO have a live foreign key to `plan`.
+///
+/// Main can't be deleted while it has what-ifs; once it's gone another plan becomes Main.
 pub fn delete_plan(conn: &mut Connection, plan_id: &str) -> Result<()> {
     let tx = conn.transaction()?;
+    if !queries::what_ifs_of(&tx, plan_id)?.is_empty() {
+        anyhow::bail!("make this plan's what-ifs standalone or delete them first");
+    }
+    // A what-if's changes point at Main's items, so they go before the items they could
+    // otherwise block.
+    tx.execute(
+        "DELETE FROM plan_item WHERE plan_id = ?1 AND base_item_id IS NOT NULL",
+        [plan_id],
+    )?;
     tx.execute("DELETE FROM plan_item WHERE plan_id = ?1", [plan_id])?;
     tx.execute("DELETE FROM plan WHERE id = ?1", [plan_id])?;
+    if queries::main_plan_id(&tx)?.is_none() {
+        reset_main_plan(&tx)?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -819,7 +1087,7 @@ pub fn set_item_amount(conn: &Connection, item_id: &str, amount: Money) -> Resul
         "UPDATE plan_item SET amount_cents = ?1 WHERE id = ?2",
         rusqlite::params![amount, item_id],
     )?;
-    Ok(())
+    drop_change_matching_main(conn, item_id)
 }
 
 /// Remember which amount source this plan item should try on its next stamp. Historical
@@ -833,7 +1101,7 @@ pub fn set_item_forecast_method(
         "UPDATE plan_item SET forecast_method = ?1 WHERE id = ?2",
         rusqlite::params![method, item_id],
     )?;
-    Ok(())
+    drop_change_matching_main(conn, item_id)
 }
 
 /// Per-plan: which months this plan stamps the item in. Like the amount, this edits
@@ -845,7 +1113,7 @@ pub fn set_item_active_months(conn: &Connection, item_id: &str, months: MonthSet
         "UPDATE plan_item SET active_months = ?1 WHERE id = ?2",
         rusqlite::params![months.to_db(), item_id],
     )?;
-    Ok(())
+    drop_change_matching_main(conn, item_id)
 }
 
 // The following edit the shared SERIES, so they affect every plan that includes it.
@@ -922,9 +1190,58 @@ pub fn set_series_period(conn: &Connection, series_id: &str, period: PeriodType)
 
 /// Remove an item from a plan. The series survives (it may be used by other plans, and
 /// past stamped instances reference its id).
+///
+/// What-ifs' changes to the item go with it.
 pub fn delete_plan_item(conn: &Connection, item_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM plan_item WHERE base_item_id = ?1", [item_id])?;
     conn.execute("DELETE FROM plan_item WHERE id = ?1", [item_id])?;
     Ok(())
+}
+
+/// Per-plan: the first and last month the item runs (`YYYY-MM`), `None` for open-ended.
+/// A one-off has both set to the same month.
+pub fn set_item_dates(
+    conn: &Connection,
+    item_id: &str,
+    starts_on: Option<&str>,
+    ends_on: Option<&str>,
+) -> Result<()> {
+    let starts = starts_on.map(month_label).transpose()?;
+    let ends = ends_on.map(month_label).transpose()?;
+    if let (Some(starts), Some(ends)) = (&starts, &ends)
+        && starts > ends
+    {
+        anyhow::bail!("the last month comes before the first");
+    }
+    conn.execute(
+        "UPDATE plan_item SET starts_on = ?1, ends_on = ?2 WHERE id = ?3",
+        rusqlite::params![starts, ends, item_id],
+    )?;
+    drop_change_matching_main(conn, item_id)
+}
+
+/// A what-if's change that has come back to match Main's item exactly is no change: delete
+/// it, so the item follows Main again.
+fn drop_change_matching_main(conn: &Connection, item_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM plan_item AS c
+         WHERE c.id = ?1 AND c.removed = 0
+           AND EXISTS (SELECT 1 FROM plan_item b
+                       WHERE b.id = c.base_item_id
+                         AND b.amount_cents = c.amount_cents
+                         AND b.active_months IS c.active_months
+                         AND b.forecast_method = c.forecast_method
+                         AND b.starts_on IS c.starts_on
+                         AND b.ends_on IS c.ends_on)",
+        [item_id],
+    )?;
+    Ok(())
+}
+
+/// `label` as a stored month (`YYYY-MM`), or an error naming it.
+fn month_label(label: &str) -> Result<String> {
+    let month = parse_month_label(label).with_context(|| format!("“{label}” isn't a month"))?;
+    Ok(month.format("%Y-%m").to_string())
 }
 
 /// Delete a series, but only if no plan still references it. We guard against live *plan*
@@ -1228,6 +1545,9 @@ pub fn seed_starter(conn: &mut Connection) -> Result<()> {
         "INSERT INTO plan (id, name) VALUES (?1, ?2)",
         rusqlite::params![plan_id, "Monthly Budget"],
     )?;
+    if queries::main_plan_id(conn)?.is_none() {
+        set_main_plan(conn, &plan_id)?;
+    }
 
     // Helper: create a series and immediately add it to the plan at `amount`.
     // `conn` is borrowed by each call, so this is a plain closure over plan_id.
@@ -1813,6 +2133,295 @@ mod tests {
             "reset in place, not recreated"
         );
         assert_eq!(envelopes[0].amount, Money::from_dollars(120.0));
+    }
+
+    /// Main with rent $1,500, dining $200, and groceries $600, plus a what-if on it.
+    fn main_and_what_if() -> (Connection, String, String, [String; 3]) {
+        let conn = db::open_in_memory().unwrap();
+        let main = create_plan(&conn, "Main").unwrap();
+        let rent = add_new_transaction(
+            &conn,
+            &main,
+            "Rent",
+            Direction::Out,
+            Money::from_dollars(1500.0),
+        )
+        .unwrap();
+        let dining = add_new_transaction(
+            &conn,
+            &main,
+            "Dining",
+            Direction::Out,
+            Money::from_dollars(200.0),
+        )
+        .unwrap();
+        let groceries =
+            add_new_envelope(&conn, &main, "Groceries", Money::from_dollars(600.0)).unwrap();
+        let what_if = create_what_if(&conn, "Tight month").unwrap();
+        (conn, main, what_if, [rent, dining, groceries])
+    }
+
+    fn amounts(conn: &Connection, plan_id: &str) -> Vec<(String, Money)> {
+        queries::load_plan_entries(conn, plan_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.series.label, e.amount))
+            .collect()
+    }
+
+    #[test]
+    fn first_plan_becomes_main() {
+        let (conn, main, what_if, _) = main_and_what_if();
+        assert_eq!(queries::main_plan_id(&conn).unwrap(), Some(main.clone()));
+        let plan = queries::get_plan(&conn, &what_if).unwrap().unwrap();
+        assert_eq!(plan.base_plan_id, Some(main));
+    }
+
+    #[test]
+    fn what_if_follows_main_except_where_it_changes() {
+        let (conn, main, what_if, [rent, dining, groceries]) = main_and_what_if();
+        assert_eq!(amounts(&conn, &what_if), amounts(&conn, &main));
+
+        let change = editable_item(&conn, &what_if, &groceries).unwrap();
+        set_item_amount(&conn, &change, Money::from_dollars(450.0)).unwrap();
+        remove_plan_item(&conn, &what_if, &dining).unwrap();
+        add_new_transaction(
+            &conn,
+            &what_if,
+            "Car",
+            Direction::Out,
+            Money::from_dollars(340.0),
+        )
+        .unwrap();
+        // Main's later edits reach the what-if.
+        set_item_amount(&conn, &rent, Money::from_dollars(1600.0)).unwrap();
+
+        let entries = queries::load_plan_entries(&conn, &what_if).unwrap();
+        let labels: Vec<_> = entries.iter().map(|e| e.series.label.as_str()).collect();
+        assert_eq!(labels, ["Groceries", "Rent", "Car"]);
+        assert_eq!(
+            entries[0].item_id, groceries,
+            "changed items keep Main's id"
+        );
+        assert_eq!(
+            entries[0].origin,
+            ItemOrigin::Changed {
+                base_amount: Money::from_dollars(600.0)
+            }
+        );
+        assert_eq!(entries[0].amount, Money::from_dollars(450.0));
+        assert_eq!(entries[1].amount, Money::from_dollars(1600.0));
+        assert_eq!(entries[1].origin, ItemOrigin::Inherited);
+        assert_eq!(entries[2].origin, ItemOrigin::Own);
+        // Main is untouched.
+        assert_eq!(
+            amounts(&conn, &main),
+            [
+                ("Groceries".to_string(), Money::from_dollars(600.0)),
+                ("Rent".to_string(), Money::from_dollars(1600.0)),
+                ("Dining".to_string(), Money::from_dollars(200.0)),
+            ]
+        );
+
+        use_main_version(&conn, &what_if, &groceries).unwrap();
+        assert_eq!(
+            queries::load_plan_entries(&conn, &what_if).unwrap()[0].amount,
+            Money::from_dollars(600.0)
+        );
+    }
+
+    #[test]
+    fn a_change_back_to_mains_values_is_no_change() {
+        let (conn, _, what_if, [_, _, groceries]) = main_and_what_if();
+        let change = editable_item(&conn, &what_if, &groceries).unwrap();
+        set_item_amount(&conn, &change, Money::from_dollars(450.0)).unwrap();
+        assert_eq!(
+            queries::load_plan_entries(&conn, &what_if).unwrap()[0].origin,
+            ItemOrigin::Changed {
+                base_amount: Money::from_dollars(600.0)
+            }
+        );
+        set_item_amount(&conn, &change, Money::from_dollars(600.0)).unwrap();
+        assert_eq!(
+            queries::load_plan_entries(&conn, &what_if).unwrap()[0].origin,
+            ItemOrigin::Inherited
+        );
+    }
+
+    #[test]
+    fn stamping_a_what_if_and_main_give_the_same_row_ids() {
+        let (mut conn, main, what_if, [_, _, groceries]) = main_and_what_if();
+        let change = editable_item(&conn, &what_if, &groceries).unwrap();
+        set_item_amount(&conn, &change, Money::from_dollars(450.0)).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        let from_main = stamp(&mut conn, &main, "2026-12", start, 31).unwrap();
+        let ids = stamped_row_ids(&conn, &from_main);
+        restamp(&mut conn, &from_main, &what_if, false).unwrap();
+        assert_eq!(stamped_row_ids(&conn, &from_main), ids);
+        let envelope = &queries::load_envelopes(&conn, &from_main).unwrap()[0];
+        assert_eq!(envelope.amount, Money::from_dollars(450.0));
+    }
+
+    #[test]
+    fn restamping_from_a_what_if_drops_what_it_removes_unless_paid() {
+        let (mut conn, main, what_if, [rent, dining, groceries]) = main_and_what_if();
+        let start = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        let month = stamp(&mut conn, &main, "2026-12", start, 31).unwrap();
+        let rent_row = queries::load_txns(&conn, &month)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.label == "Rent")
+            .unwrap();
+        mark_paid(&conn, &rent_row.id, Money::from_dollars(1500.0), None).unwrap();
+        for item in [&rent, &dining, &groceries] {
+            remove_plan_item(&conn, &what_if, item).unwrap();
+        }
+
+        restamp(&mut conn, &month, &what_if, false).unwrap();
+
+        let txns: Vec<_> = queries::load_txns(&conn, &month)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.label)
+            .collect();
+        assert_eq!(txns, ["Rent"], "paid rent stays; unpaid dining goes");
+        assert!(queries::load_envelopes(&conn, &month).unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_what_if_writes_its_changes_into_main() {
+        let (mut conn, main, what_if, [_, dining, groceries]) = main_and_what_if();
+        let change = editable_item(&conn, &what_if, &groceries).unwrap();
+        set_item_amount(&conn, &change, Money::from_dollars(450.0)).unwrap();
+        remove_plan_item(&conn, &what_if, &dining).unwrap();
+        add_new_transaction(
+            &conn,
+            &what_if,
+            "Car",
+            Direction::Out,
+            Money::from_dollars(340.0),
+        )
+        .unwrap();
+
+        apply_what_if(&mut conn, &what_if).unwrap();
+
+        assert!(queries::get_plan(&conn, &what_if).unwrap().is_none());
+        assert_eq!(
+            amounts(&conn, &main),
+            [
+                ("Groceries".to_string(), Money::from_dollars(450.0)),
+                ("Rent".to_string(), Money::from_dollars(1500.0)),
+                ("Car".to_string(), Money::from_dollars(340.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn make_standalone_keeps_what_the_what_if_resolves_to() {
+        let (mut conn, main, what_if, [rent, dining, _]) = main_and_what_if();
+        remove_plan_item(&conn, &what_if, &dining).unwrap();
+        let before = amounts(&conn, &what_if);
+
+        make_standalone(&mut conn, &what_if).unwrap();
+        set_item_amount(&conn, &rent, Money::from_dollars(1600.0)).unwrap();
+
+        assert!(
+            !queries::get_plan(&conn, &what_if)
+                .unwrap()
+                .unwrap()
+                .is_what_if()
+        );
+        assert_eq!(amounts(&conn, &what_if), before, "no longer follows Main");
+        assert_eq!(amounts(&conn, &main).len(), 3);
+    }
+
+    #[test]
+    fn deleting_mains_item_drops_what_if_changes_and_main_needs_its_what_ifs_gone() {
+        let (mut conn, main, what_if, [_, dining, _]) = main_and_what_if();
+        remove_plan_item(&conn, &what_if, &dining).unwrap();
+        delete_plan_item(&conn, &dining).unwrap();
+        assert!(
+            queries::removed_entries(&conn, &what_if)
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(delete_plan(&mut conn, &main).is_err());
+        delete_plan(&mut conn, &what_if).unwrap();
+        let other = create_plan(&conn, "Other").unwrap();
+        delete_plan(&mut conn, &main).unwrap();
+        assert_eq!(queries::main_plan_id(&conn).unwrap(), Some(other));
+    }
+
+    #[test]
+    fn merge_into_main_moves_an_add_on_plans_items() {
+        let (mut conn, main, _, _) = main_and_what_if();
+        let kids = create_plan(&conn, "Kids").unwrap();
+        add_new_envelope(&conn, &kids, "Gifts", Money::from_dollars(120.0)).unwrap();
+        merge_into_main(&mut conn, &kids).unwrap();
+        assert!(queries::get_plan(&conn, &kids).unwrap().is_none());
+        assert_eq!(amounts(&conn, &main).len(), 4);
+        assert!(merge_into_main(&mut conn, &main).is_err());
+    }
+
+    #[test]
+    fn dated_items_stamp_only_inside_their_months() {
+        let (mut conn, main, what_if, [rent, _, _]) = main_and_what_if();
+        let car = add_new_transaction(
+            &conn,
+            &main,
+            "Car",
+            Direction::Out,
+            Money::from_dollars(340.0),
+        )
+        .unwrap();
+        set_item_dates(&conn, &car, Some("2027-01"), Some("2027-06")).unwrap();
+        assert!(set_item_dates(&conn, &car, Some("2027-06"), Some("2027-01")).is_err());
+        assert!(set_item_dates(&conn, &car, Some("June"), None).is_err());
+        remove_plan_item(&conn, &what_if, &rent).unwrap();
+
+        let labels = |conn: &Connection, month: &str| -> Vec<String> {
+            queries::load_txns(conn, month)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.label)
+                .collect()
+        };
+        let dec = stamp(
+            &mut conn,
+            &main,
+            "2026-12",
+            NaiveDate::from_ymd_opt(2026, 12, 1).unwrap(),
+            31,
+        )
+        .unwrap();
+        let jan = stamp(
+            &mut conn,
+            &main,
+            "2027-01",
+            NaiveDate::from_ymd_opt(2027, 1, 1).unwrap(),
+            31,
+        )
+        .unwrap();
+        assert!(!labels(&conn, &dec).contains(&"Car".to_string()));
+        assert!(labels(&conn, &jan).contains(&"Car".to_string()));
+
+        let skipped: Vec<_> = queries::skipped_entries(
+            &conn,
+            &what_if,
+            NaiveDate::from_ymd_opt(2026, 12, 1).unwrap(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(e, reason)| (e.series.label, reason))
+        .collect();
+        assert_eq!(
+            skipped,
+            [
+                ("Car".to_string(), SkipReason::StartsLater),
+                ("Rent".to_string(), SkipReason::Removed),
+            ]
+        );
     }
 
     #[test]
