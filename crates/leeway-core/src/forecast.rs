@@ -56,7 +56,7 @@ pub fn resolve_plan_entries(
 ) -> Result<Vec<ResolvedPlanEntry>> {
     let entries: Vec<PlanEntry> = queries::load_plan_entries(conn, plan_id)?
         .into_iter()
-        .filter(|entry| entry.active_months.contains(target.month()))
+        .filter(|entry| entry.runs_in(target))
         .collect();
     let mut occurrences = HashMap::<String, usize>::new();
     for entry in &entries {

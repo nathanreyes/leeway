@@ -11,8 +11,9 @@ use crate::{AddDestination, App, BudgetBlock, ConfirmAction, PlanFocus, PromptKi
 use anyhow::Result;
 use chrono::Local;
 use leeway_core::calc::PlanProjection;
-use leeway_core::models::{Direction, Kind, Mode, PeriodType, Plan, PlanEntry};
+use leeway_core::models::{Direction, ItemOrigin, Kind, Mode, PeriodType, Plan, PlanEntry};
 use leeway_core::money::Money;
+use leeway_core::ops;
 use leeway_core::queries::PlanSummary;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -75,6 +76,17 @@ fn handle_list_key(app: &mut App, key: KeyEvent, summaries: &[PlanSummary]) -> R
         KeyCode::Char('k') | KeyCode::Up => app.plans_sel = app.plans_sel.saturating_sub(1),
 
         KeyCode::Char('n') => app.open_text("New plan name", "", PromptKind::NewPlan),
+        KeyCode::Char('w') => app.open_text("New what-if on Main", "", PromptKind::NewWhatIf),
+        KeyCode::Char('A') => {
+            if let Some(s) = selected.filter(|s| s.plan.is_what_if()) {
+                app.open_confirm(
+                    format!("Apply “{}” to Main and delete it?", s.plan.name),
+                    ConfirmAction::ApplyWhatIf {
+                        id: s.plan.id.clone(),
+                    },
+                );
+            }
+        }
 
         KeyCode::Char('l') => {
             if let Some(s) = selected {
@@ -154,6 +166,7 @@ fn handle_item_key(
                     "Amount for this plan (dollars)",
                     crate::amount_edit_string(en.amount),
                     PromptKind::ItemAmount {
+                        plan_id: en.plan_id.clone(),
                         id: en.item_id.clone(),
                     },
                 );
@@ -168,9 +181,45 @@ fn handle_item_key(
                     "Active months (e.g. mar,jul,nov or all)",
                     en.active_months.edit_string(),
                     PromptKind::ItemMonths {
+                        plan_id: en.plan_id.clone(),
                         id: en.item_id.clone(),
                     },
                 );
+            }
+        }
+
+        // The first and last month the item runs, for a car loan or a one-off trip.
+        KeyCode::Char('D') => {
+            if let Some(en) = selected_entry(app, entries) {
+                let dates = match (&en.starts_on, &en.ends_on) {
+                    (None, None) => "none".to_string(),
+                    (Some(s), Some(e)) if s == e => s.clone(),
+                    (s, e) => format!(
+                        "{} to {}",
+                        s.as_deref().unwrap_or(""),
+                        e.as_deref().unwrap_or("")
+                    )
+                    .trim()
+                    .to_string(),
+                };
+                app.open_text_replace_on_type(
+                    "Dates (e.g. 2027-01 to 2027-06, 2027-08, or none)",
+                    dates,
+                    PromptKind::ItemDates {
+                        plan_id: en.plan_id.clone(),
+                        id: en.item_id.clone(),
+                    },
+                );
+            }
+        }
+
+        // On a what-if, drop its change to one of Main's items.
+        KeyCode::Char('u') => {
+            if let Some(en) = selected_entry(app, entries)
+                && matches!(en.origin, ItemOrigin::Changed { .. })
+            {
+                ops::use_main_version(&app.conn, &en.plan_id, &en.item_id)?;
+                app.status = Some(format!("“{}” follows Main again", en.series.label));
             }
         }
 
@@ -183,6 +232,7 @@ fn handle_item_key(
                         en.series.label
                     ),
                     ConfirmAction::DeleteItem {
+                        plan_id: en.plan_id.clone(),
                         id: en.item_id.clone(),
                     },
                 );
@@ -275,7 +325,7 @@ fn budget_block_for_focus(focus: PlanFocus) -> BudgetBlock {
 pub fn draw(frame: &mut Frame, app: &App, summaries: &[PlanSummary], entries: &[PlanEntry]) {
     // The summary grows only when the plan has seasonal items to list, so a plan without
     // them keeps the layout it has always had.
-    let projection = leeway_core::calc::project_plan(entries);
+    let projection = leeway_core::calc::project_plan(entries, Local::now().date_naive());
     let [header, body, summary_area, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
@@ -373,7 +423,7 @@ pub fn draw_detail(
     plan: Option<&Plan>,
     entries: &[PlanEntry],
 ) {
-    let projection = leeway_core::calc::project_plan(entries);
+    let projection = leeway_core::calc::project_plan(entries, Local::now().date_naive());
     let [header, body, summary_area] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
@@ -382,6 +432,7 @@ pub fn draw_detail(
     .areas(area);
 
     let title = match plan {
+        Some(plan) if plan.is_what_if() => format!(" Leeway — What-if on Main: {} ", plan.name),
         Some(plan) => format!(" Leeway — Plan: {} ", plan.name),
         None => " Leeway — No plan selected ".into(),
     };
@@ -437,6 +488,10 @@ pub fn footer_hints(_app: &App) -> Line<'static> {
         Span::raw(" amount  "),
         key(" M "),
         Span::raw(" months  "),
+        key(" D "),
+        Span::raw(" dates  "),
+        key(" u "),
+        Span::raw(" use Main's  "),
         key(" x "),
         Span::raw(" remove"),
     ])

@@ -5,7 +5,7 @@ use crate::{App, BudgetTarget, DashFocus, PlanFocus, PromptKind};
 use anyhow::Result;
 use chrono::{Datelike, NaiveDate};
 use leeway_core::models::{Month, Plan, PlanEntry};
-use leeway_core::queries::PlanSummary;
+use leeway_core::queries::{self, PlanSummary};
 use leeway_core::view::MonthView;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -66,6 +66,7 @@ fn sidebar_rows(
     target: &BudgetTarget,
     months: &[Month],
     plans: &[PlanSummary],
+    main_id: Option<&str>,
     today: NaiveDate,
 ) -> Vec<SidebarRow> {
     let mut labels: Vec<String> = months.iter().map(|month| month.label.clone()).collect();
@@ -124,12 +125,38 @@ fn sidebar_rows(
             )),
         });
     } else {
-        rows.extend(plans.iter().map(|summary| SidebarRow {
+        // Main first with its what-ifs under it, then any other plans.
+        let is_main = |summary: &&PlanSummary| Some(summary.plan.id.as_str()) == main_id;
+        let row = |summary: &PlanSummary, line: Line<'static>| SidebarRow {
             target: Some(BudgetTarget::Plan {
                 plan_id: summary.plan.id.clone(),
             }),
-            line: Line::raw(crate::truncate(&summary.plan.name, 24)),
-        }));
+            line,
+        };
+        for main in plans.iter().filter(is_main) {
+            rows.push(row(
+                main,
+                Line::from(vec![
+                    Span::raw(crate::truncate(&main.plan.name, 20)),
+                    Span::styled(" main", Style::default().fg(Color::DarkGray)),
+                ]),
+            ));
+            for what_if in plans
+                .iter()
+                .filter(|s| s.plan.base_plan_id.as_deref() == Some(main.plan.id.as_str()))
+            {
+                rows.push(row(
+                    what_if,
+                    Line::raw(format!("  ↳ {}", crate::truncate(&what_if.plan.name, 20))),
+                ));
+            }
+        }
+        rows.extend(
+            plans
+                .iter()
+                .filter(|s| !is_main(s) && !s.plan.is_what_if())
+                .map(|s| row(s, Line::raw(crate::truncate(&s.plan.name, 24)))),
+        );
     }
     rows
 }
@@ -142,7 +169,8 @@ fn draw_sidebar(
     plans: &[PlanSummary],
     today: NaiveDate,
 ) {
-    let rows = sidebar_rows(&app.budget_target, months, plans, today);
+    let main_id = queries::main_plan_id(&app.conn).ok().flatten();
+    let rows = sidebar_rows(&app.budget_target, months, plans, main_id.as_deref(), today);
     let selected = rows
         .iter()
         .position(|row| row.target.as_ref() == Some(&app.budget_target));
@@ -235,10 +263,12 @@ fn move_target(
     plans: &[PlanSummary],
     today: NaiveDate,
 ) {
-    let targets: Vec<BudgetTarget> = sidebar_rows(&app.budget_target, months, plans, today)
-        .into_iter()
-        .filter_map(|row| row.target)
-        .collect();
+    let main_id = queries::main_plan_id(&app.conn).ok().flatten();
+    let targets: Vec<BudgetTarget> =
+        sidebar_rows(&app.budget_target, months, plans, main_id.as_deref(), today)
+            .into_iter()
+            .filter_map(|row| row.target)
+            .collect();
     let Some(current) = targets
         .iter()
         .position(|target| target == &app.budget_target)
@@ -292,6 +322,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, no_plans: bool) {
                 Span::raw(" budget  "),
                 key(" n "),
                 Span::raw(" new  "),
+                key(" w "),
+                Span::raw(" what-if  "),
+                key(" A "),
+                Span::raw(" apply  "),
                 key(" l "),
                 Span::raw(" label  "),
                 key(" s "),
@@ -355,6 +389,7 @@ mod tests {
             plan: Plan {
                 id: "baseline".into(),
                 name: "Baseline".into(),
+                base_plan_id: None,
             },
             item_count: 3,
         }];
@@ -366,6 +401,7 @@ mod tests {
             &target,
             &months,
             &plans,
+            Some("baseline"),
             NaiveDate::from_ymd_opt(2026, 8, 22).unwrap(),
         )
         .into_iter()

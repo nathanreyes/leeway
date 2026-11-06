@@ -467,12 +467,22 @@ pub enum PromptKind {
     NewSeries {
         block: BudgetBlock,
     },
-    /// Edit a plan_item's per-plan budgeted amount.
+    /// Create a what-if on Main.
+    NewWhatIf,
+    /// Edit a plan_item's per-plan budgeted amount. On a what-if, an item from Main is
+    /// edited through the what-if's own copy (`ops::editable_item`).
     ItemAmount {
+        plan_id: String,
         id: String,
     },
     /// Edit which months a plan_item is stamped in — per-plan, like the amount.
     ItemMonths {
+        plan_id: String,
+        id: String,
+    },
+    /// Edit the first and last month a plan_item runs.
+    ItemDates {
+        plan_id: String,
         id: String,
     },
     /// Collect the amount, then add a selected or newly-created series to a plan/month.
@@ -569,6 +579,11 @@ pub enum ConfirmAction {
         id: String,
     },
     DeleteItem {
+        plan_id: String,
+        id: String,
+    },
+    /// Write a what-if's changes into Main and delete the what-if.
+    ApplyWhatIf {
         id: String,
     },
     /// Delete a shared series definition. Guarded in `ops::delete_series` (blocked while any
@@ -1916,7 +1931,11 @@ fn confirm_stamp_review(app: &mut App) -> Result<()> {
         return Ok(());
     };
     for item in &review.items {
-        ops::set_item_forecast_method(&app.conn, &item.entry.item_id, item.method)?;
+        // On a what-if, only a new choice makes the what-if its own copy of Main's item.
+        if item.method != item.entry.forecast_method {
+            let id = ops::editable_item(&app.conn, &item.entry.plan_id, &item.entry.item_id)?;
+            ops::set_item_forecast_method(&app.conn, &id, item.method)?;
+        }
     }
     let excluded_item_ids: Vec<String> = review
         .items
@@ -2450,6 +2469,27 @@ fn add_selected_series(
     Ok(())
 }
 
+/// Read what the user typed for an item's dates: `2027-01 to 2027-06`, `2027-01 to` or
+/// `to 2027-06` for one open end, `2027-08` for a single month, or `none` (or nothing) for
+/// no dates. Months are checked by `ops::set_item_dates`.
+fn parse_item_dates(text: &str) -> Option<(Option<String>, Option<String>)> {
+    let text = text.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("none") {
+        return Some((None, None));
+    }
+    let side = |part: &str| {
+        let part = part.trim();
+        (!part.is_empty()).then(|| part.to_string())
+    };
+    match text.split_once("to") {
+        Some((starts, ends)) => {
+            let (starts, ends) = (side(starts), side(ends));
+            (starts.is_some() || ends.is_some()).then_some((starts, ends))
+        }
+        None => Some((side(text), side(text))),
+    }
+}
+
 /// Apply a submitted text prompt. We `take()` the modal first so it closes exactly once,
 /// then act on its kind. Validation failures re-report via `status` instead of mutating.
 fn submit_text(app: &mut App) -> Result<()> {
@@ -2472,6 +2512,21 @@ fn submit_text(app: &mut App) -> Result<()> {
             app.pending_plan_select = Some(id);
             app.screen = Screen::Budget;
             app.status = Some(format!("Created plan “{text}”"));
+        }
+        PromptKind::NewWhatIf => {
+            if text.is_empty() {
+                app.status = Some("What-if name can't be empty".into());
+                return Ok(());
+            }
+            match ops::create_what_if(&app.conn, &text) {
+                Ok(id) => {
+                    reset_editor_selections(app);
+                    app.pending_plan_select = Some(id);
+                    app.screen = Screen::Budget;
+                    app.status = Some(format!("Created what-if “{text}”"));
+                }
+                Err(e) => app.status = Some(e.to_string()),
+            }
         }
         PromptKind::RenamePlan { id } => {
             if !text.is_empty() {
@@ -2523,14 +2578,36 @@ fn submit_text(app: &mut App) -> Result<()> {
                 );
             }
         },
-        PromptKind::ItemAmount { id } => match Money::parse_dollars(&text) {
-            Some(amount) => ops::set_item_amount(&app.conn, &id, amount)?,
+        PromptKind::ItemAmount { plan_id, id } => match Money::parse_dollars(&text) {
+            Some(amount) => {
+                let id = ops::editable_item(&app.conn, &plan_id, &id)?;
+                ops::set_item_amount(&app.conn, &id, amount)?
+            }
             None => app.status = Some(format!("Couldn't read “{text}” as an amount")),
         },
-        PromptKind::ItemMonths { id } => match MonthSet::parse(&text) {
+        PromptKind::ItemMonths { plan_id, id } => match MonthSet::parse(&text) {
             // The parse error already names the token that failed, so show it as written.
-            Ok(months) => ops::set_item_active_months(&app.conn, &id, months)?,
+            Ok(months) => {
+                let id = ops::editable_item(&app.conn, &plan_id, &id)?;
+                ops::set_item_active_months(&app.conn, &id, months)?
+            }
             Err(message) => app.status = Some(message),
+        },
+        PromptKind::ItemDates { plan_id, id } => match parse_item_dates(&text) {
+            // Check first: on a what-if, a rejected edit mustn't leave a copy of Main's item.
+            Some((starts, ends)) => match ops::check_item_dates(starts.as_deref(), ends.as_deref())
+            {
+                Ok((starts, ends)) => {
+                    let id = ops::editable_item(&app.conn, &plan_id, &id)?;
+                    ops::set_item_dates(&app.conn, &id, starts.as_deref(), ends.as_deref())?;
+                }
+                Err(e) => app.status = Some(e.to_string()),
+            },
+            None => {
+                app.status = Some(format!(
+                    "Write dates as 2027-01 to 2027-06, 2027-08, or none (got “{text}”)"
+                ))
+            }
         },
         PromptKind::GoToMonth => match parse_year_month(&text) {
             Some((year, month)) => {
@@ -2759,12 +2836,18 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 let return_to = confirm.return_to_envelope_modal;
                 match confirm.action {
                     ConfirmAction::DeletePlan { id } => {
-                        ops::delete_plan(&mut app.conn, &id)?;
-                        app.status = Some("Plan deleted".into());
+                        match ops::delete_plan(&mut app.conn, &id) {
+                            Ok(()) => app.status = Some("Plan deleted".into()),
+                            Err(e) => app.status = Some(e.to_string()),
+                        }
                     }
-                    ConfirmAction::DeleteItem { id } => {
-                        ops::delete_plan_item(&app.conn, &id)?;
-                        app.status = Some("Item deleted".into());
+                    ConfirmAction::DeleteItem { plan_id, id } => {
+                        ops::remove_plan_item(&app.conn, &plan_id, &id)?;
+                        app.status = Some("Item removed".into());
+                    }
+                    ConfirmAction::ApplyWhatIf { id } => {
+                        ops::apply_what_if(&mut app.conn, &id)?;
+                        app.status = Some("Changes applied to Main".into());
                     }
                     ConfirmAction::DeleteSeries { series_id } => {
                         // The UI pre-checks plan usage, but `delete_series` re-checks and
@@ -2856,10 +2939,14 @@ fn refresh_stamp_review_items(app: &mut App) -> Result<()> {
         .filter(|plan| plan.selected)
         .map(|plan| plan.plan.id.clone())
         .collect();
-    let prior: HashMap<String, (bool, ForecastMethod)> = review
+    // A what-if shares Main's item ids, so state is kept per plan and item.
+    let prior: HashMap<(String, String), (bool, ForecastMethod)> = review
         .items
         .iter()
-        .map(|item| (item.entry.item_id.clone(), (item.enabled, item.method)))
+        .map(|item| {
+            let key = (item.entry.plan_id.clone(), item.entry.item_id.clone());
+            (key, (item.enabled, item.method))
+        })
         .collect();
 
     let mut items = Vec::new();
@@ -2887,7 +2974,7 @@ fn refresh_stamp_review_items(app: &mut App) -> Result<()> {
                 vec![ForecastMethod::Static]
             };
             let (enabled, saved_method) = prior
-                .get(&entry.item_id)
+                .get(&(entry.plan_id.clone(), entry.item_id.clone()))
                 .copied()
                 .unwrap_or((true, entry.forecast_method));
             let method = if methods.contains(&saved_method) {
@@ -2937,7 +3024,7 @@ fn refresh_stamp_preview(app: &mut App) -> Result<()> {
                 ops::days_in_month(year, month),
             )?
             .into_iter()
-            .map(|row| (row.entry.item_id.clone(), row)),
+            .map(|row| ((row.entry.plan_id.clone(), row.entry.item_id.clone()), row)),
         );
     }
 
@@ -2946,7 +3033,7 @@ fn refresh_stamp_preview(app: &mut App) -> Result<()> {
     };
     for item in &mut review.items {
         let selected = resolved
-            .get(&item.entry.item_id)
+            .get(&(item.entry.plan_id.clone(), item.entry.item_id.clone()))
             .map(|row| row.option(item.method).unwrap_or_else(|| row.options[0]));
         item.preview_amount = selected.map(|option| option.amount);
         item.preview_method = selected.map(|option| option.method);
@@ -3774,6 +3861,29 @@ pub(crate) fn amount_edit_string(m: Money) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn item_dates_parse_ranges_single_months_and_none() {
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            parse_item_dates("2027-01 to 2027-06"),
+            Some((some("2027-01"), some("2027-06")))
+        );
+        assert_eq!(
+            parse_item_dates("2027-08"),
+            Some((some("2027-08"), some("2027-08")))
+        );
+        assert_eq!(
+            parse_item_dates("2027-01 to"),
+            Some((some("2027-01"), None))
+        );
+        assert_eq!(
+            parse_item_dates("to 2027-06"),
+            Some((None, some("2027-06")))
+        );
+        assert_eq!(parse_item_dates("none"), Some((None, None)));
+        assert_eq!(parse_item_dates(" to "), None);
+    }
+
     use super::*;
     use ratatui::crossterm::event::KeyModifiers;
     use uuid::Uuid;
@@ -4210,6 +4320,83 @@ mod tests {
             1
         );
         assert_eq!(queries::load_txns(&app.conn, &month.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stamp_review_keeps_main_and_a_what_if_apart() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        let main = queries::main_plan_id(&app.conn).unwrap().unwrap();
+        let item = queries::load_plan_entries(&app.conn, &main).unwrap()[0].clone();
+        let what_if = ops::create_what_if(&app.conn, "Tight").unwrap();
+        let change = ops::editable_item(&app.conn, &what_if, &item.item_id).unwrap();
+        ops::set_item_amount(&app.conn, &change, item.amount + Money::from_dollars(150.0)).unwrap();
+
+        open_stamp_review(&mut app, (2026, 10), None).unwrap();
+        let Some(Modal::StampReview(review)) = &mut app.modal else {
+            panic!("expected stamp review");
+        };
+        for plan in &mut review.plans {
+            plan.selected = true;
+        }
+        refresh_stamp_review_items(&mut app).unwrap();
+        // Turning Main's item off leaves the what-if's copy on.
+        let Some(Modal::StampReview(review)) = &mut app.modal else {
+            panic!("expected stamp review");
+        };
+        for row in &mut review.items {
+            if row.entry.plan_id == main && row.entry.item_id == item.item_id {
+                row.enabled = false;
+            }
+        }
+        refresh_stamp_review_items(&mut app).unwrap();
+        refresh_stamp_preview(&mut app).unwrap();
+
+        let Some(Modal::StampReview(review)) = &app.modal else {
+            panic!("expected stamp review");
+        };
+        let row = |plan: &str| {
+            review
+                .items
+                .iter()
+                .find(|r| r.entry.plan_id == plan && r.entry.item_id == item.item_id)
+                .unwrap()
+        };
+        assert!(!row(&main).enabled);
+        assert!(row(&what_if).enabled);
+        assert_eq!(row(&main).preview_amount, Some(item.amount));
+        assert_eq!(
+            row(&what_if).preview_amount,
+            Some(item.amount + Money::from_dollars(150.0))
+        );
+    }
+
+    #[test]
+    fn a_rejected_date_edit_leaves_the_what_if_following_main() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        let main = queries::main_plan_id(&app.conn).unwrap().unwrap();
+        let item = queries::load_plan_entries(&app.conn, &main).unwrap()[0].clone();
+        let what_if = ops::create_what_if(&app.conn, "Tight").unwrap();
+        app.open_text(
+            "Dates",
+            "",
+            PromptKind::ItemDates {
+                plan_id: what_if.clone(),
+                id: item.item_id.clone(),
+            },
+        );
+        let Some(Modal::Text(prompt)) = &mut app.modal else {
+            panic!("expected prompt");
+        };
+        prompt.buffer = "2027-06 to 2027-01".into();
+        submit_text(&mut app).unwrap();
+
+        assert!(app.status.is_some());
+        let entry = queries::load_plan_entries(&app.conn, &what_if)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.item_id == item.item_id)
+            .unwrap();
+        assert_eq!(entry.origin, leeway_core::models::ItemOrigin::Inherited);
     }
 
     #[test]

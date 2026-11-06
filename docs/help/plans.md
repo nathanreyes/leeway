@@ -4,7 +4,9 @@ Plans are simply a collection of income, bills, and envelopes. They are the base
 
 Typically, you'll create a plan for your baseline month and then stamp it into each new month.
 
-But you can also use plans to compare scenarios, like taking a vacation or buying a new car, without affecting your baseline plan. Stamp future months with different plans to see how your budget changes.
+Your first plan is Main. Put everything you expect in it, and give items dates when they don't run forever.
+
+To compare scenarios, like taking a vacation or buying a new car, make a what-if: Main with changes. A what-if follows Main except where you change it, so editing Main reaches every what-if. Stamp future months with a what-if to see how your budget changes.
 
 ## How it fits
 
@@ -25,6 +27,22 @@ Historical choices use settled bill and income amounts or spending recorded insi
 Stamping a month that already has a plan restamps it. Unpaid items and envelopes match the plan's amounts again, and plan items the month lacks are added. Paid items stay paid at the amount you paid, and spending stays in its envelope.
 
 Press `r` to restamp. If the month has items the plan doesn't, `x` restamps and removes them too: those bills, income, and envelopes with their spending. Removing a paid item doesn't change what's left.
+
+## What-ifs
+
+Press `w` to make a what-if on Main. It starts with no changes and stamps just as Main does. It shows under Main in the sidebar.
+
+Editing an item in a what-if changes it there only; Main keeps its own. Removing one of Main's items with `x` leaves it out of the what-if alone. Press `u` on a changed item to make it follow Main again.
+
+Restamping a month from a what-if takes out the unpaid items it removes. Paid items stay, and so do envelopes with spending.
+
+Press `A` on a what-if to write its changes into Main. Leeway then deletes the what-if. Main can't be deleted while it has what-ifs.
+
+## Dated items
+
+Some items only run for a while: a car loan, a side job, one trip. Focus an item and press `D` to give it dates — `2027-01 to 2027-06`, `2027-01 to` for no end, `2027-08` for one month, or `none`.
+
+Stamping skips months outside the dates, and the Summary leaves dated items out of a typical month.
 
 ## Seasonal items
 
@@ -57,6 +75,8 @@ Plans share the budget sidebar with months. The selected plan's Income, Expenses
 
 - `j` / `k` — move through months and plans
 - `n` — create a new plan
+- `w` — create a what-if on Main
+- `A` — apply the selected what-if to Main
 - `l` — rename the selected plan
 - `s` — stamp the selected plan onto one or more months
 - `x` — delete the selected plan (stamped months are kept)
@@ -66,4 +86,6 @@ With an item pane focused:
 
 - `a` — set this plan's amount for the item
 - `M` — set which months the item runs in
-- `x` — remove the item from this plan (the series is kept)
+- `D` — set the first and last month the item runs
+- `u` — on a what-if, make a changed item follow Main again
+- `x` — remove the item from this plan (the series is kept); on a what-if, leave one of Main's items out

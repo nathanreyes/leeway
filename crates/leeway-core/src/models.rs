@@ -5,7 +5,7 @@
 //! a deliberate choice that keeps each file small and testable.
 
 use crate::money::Money;
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 
 /// Generates a string-backed enum together with the two traits SQLite needs:
 /// `FromSql` (reading a TEXT column into the enum) and `ToSql` (binding the enum
@@ -354,6 +354,27 @@ impl Account {
 pub struct Plan {
     pub id: String,
     pub name: String,
+    /// Main's id on a what-if; `None` for Main and standalone plans.
+    pub base_plan_id: Option<String>,
+}
+
+impl Plan {
+    pub fn is_what_if(&self) -> bool {
+        self.base_plan_id.is_some()
+    }
+}
+
+/// Where a plan entry comes from. Main and standalone plans hold only `Own` entries. A
+/// what-if resolves to Main's entries (`Inherited`, or `Changed` where it overrides one)
+/// plus the ones it adds (`Own`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemOrigin {
+    Own,
+    Inherited,
+    /// A what-if's version of one of Main's items. `base_amount` is Main's current amount.
+    Changed {
+        base_amount: Money,
+    },
 }
 
 /// A first-class recurring item — WHAT a bill/paycheck/envelope is, independent of any
@@ -385,7 +406,63 @@ pub struct PlanEntry {
     /// it. Per-plan like `amount`, so one plan can carry birthday gifts in March/July while
     /// another drops them entirely.
     pub active_months: MonthSet,
+    /// The first and last month the item runs (`YYYY-MM`), `None` for open-ended.
+    pub starts_on: Option<String>,
+    pub ends_on: Option<String>,
+    /// For a what-if's inherited and changed entries, `item_id` is Main's item id, so
+    /// stamping either plan gives the month the same row ids.
+    pub origin: ItemOrigin,
     pub series: Series,
+}
+
+impl PlanEntry {
+    /// Does this entry run in the month that starts on `month`? It must fall inside the
+    /// item's dates and in its active months.
+    pub fn runs_in(&self, month: NaiveDate) -> bool {
+        self.skip_reason(month).is_none()
+    }
+
+    /// Why this entry doesn't run in `month`, or `None` when it does.
+    pub fn skip_reason(&self, month: NaiveDate) -> Option<SkipReason> {
+        let label = month.format("%Y-%m").to_string();
+        if let Some(starts) = &self.starts_on
+            && label < *starts
+        {
+            return Some(SkipReason::StartsLater);
+        }
+        if let Some(ends) = &self.ends_on
+            && label > *ends
+        {
+            return Some(SkipReason::Ended);
+        }
+        if !self.active_months.contains(month.month()) {
+            return Some(SkipReason::OtherMonths);
+        }
+        None
+    }
+
+    /// Runs in `month` and every month after it: what "a typical month" counts.
+    pub fn is_every_month_from(&self, month: NaiveDate) -> bool {
+        self.active_months.is_all() && self.ends_on.is_none() && self.runs_in(month)
+    }
+}
+
+/// Why a plan item doesn't go into a month.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Its first month is later.
+    StartsLater,
+    /// Its last month has passed.
+    Ended,
+    /// It runs in other months of the year.
+    OtherMonths,
+    /// The what-if being stamped removes it.
+    Removed,
+}
+
+/// `label` (`YYYY-MM`) if it names a real month.
+pub fn parse_month_label(label: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(&format!("{}-01", label.trim()), "%Y-%m-%d").ok()
 }
 
 #[derive(Clone, Debug)]

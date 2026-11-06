@@ -25,6 +25,10 @@ static MIGRATIONS: LazyLock<Migrations<'static>> = LazyLock::new(|| {
         M::up(include_str!("migration_004_plan_item_forecast_method.sql")),
         M::up_with_hook(include_str!("migration_005_sync_ready.sql"), fix_month_ids),
         M::up(include_str!("migration_006_bank_sync.sql")),
+        M::up_with_hook(
+            include_str!("migration_007_main_plan_and_what_ifs.sql"),
+            choose_main_plan,
+        ),
     ])
 });
 
@@ -52,6 +56,15 @@ fn fix_month_ids(tx: &Transaction) -> rusqlite_migration::HookResult {
             [&new_id, &old_id],
         )?;
     }
+    Ok(())
+}
+
+/// Name the plan with the most stamped months as Main (see `ops::choose_main_plan`). Every
+/// other plan stays standalone: converting an add-on plan into a what-if would make it "Main
+/// minus nearly everything".
+fn choose_main_plan(tx: &Transaction) -> rusqlite_migration::HookResult {
+    crate::ops::reset_main_plan(tx)
+        .map_err(|e| rusqlite_migration::HookError::Hook(format!("choosing the main plan: {e}")))?;
     Ok(())
 }
 
@@ -87,6 +100,34 @@ pub fn open_in_memory() -> Result<Connection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_names_the_most_stamped_plan_main() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        MIGRATIONS.to_version(&mut conn, 6).unwrap();
+        conn.execute_batch(
+            "INSERT INTO plan (id, name) VALUES ('a', 'Add-on'), ('b', 'Baseline');
+             INSERT INTO month (id, plan_id, label, start_date, days_in_month)
+             VALUES ('m1', 'b', '2026-10', '2026-10-01', 31),
+                    ('m2', 'b', '2026-11', '2026-11-01', 30),
+                    ('m3', 'a', '2026-12', '2026-12-01', 31);",
+        )
+        .unwrap();
+        MIGRATIONS.to_latest(&mut conn).unwrap();
+        assert_eq!(
+            crate::queries::main_plan_id(&conn).unwrap().as_deref(),
+            Some("b")
+        );
+        let what_ifs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM plan WHERE base_plan_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(what_ifs, 0, "other plans stay standalone");
+    }
 
     #[test]
     fn schema_applies_cleanly() {
