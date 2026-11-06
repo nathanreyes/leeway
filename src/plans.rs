@@ -763,68 +763,95 @@ fn entry_row(
     let muted = Style::default().fg(crate::theme::muted(selected));
     let amount_width = 12.min(content_width.saturating_sub(1));
 
-    // Tags sit between the label and the amount, so a narrow pane cuts the label, not them.
-    // Only seasonal, dated, and what-if rows carry one, so an ordinary plan looks as it
-    // always has.
-    let mut tags: Vec<Span<'static>> = Vec::new();
+    // Tags sit between the label and the amount. Only seasonal, dated, and what-if rows
+    // carry one, so an ordinary plan looks as it always has. Each tag has a rank; when the
+    // row is short of room the lowest-ranked go first, and the amount always stays.
+    let mut tags: Vec<(u8, Span<'static>)> = Vec::new();
     if !entry.active_months.is_all() {
-        tags.push(Span::styled(
-            format!(" {}", entry.active_months.short_label()),
-            muted,
+        tags.push((
+            2,
+            Span::styled(format!(" {}", entry.active_months.short_label()), muted),
         ));
     }
     if let Some(dates) = entry.dates_label() {
-        tags.push(Span::styled(format!(" {dates}"), muted));
+        tags.push((1, Span::styled(format!(" {dates}"), muted)));
     }
     match entry.origin {
-        ItemOrigin::Changed { base_amount } => tags.push(Span::styled(
-            format!(" Main {base_amount}"),
-            Style::default().fg(Color::Yellow),
+        ItemOrigin::Changed { base_amount } => tags.push((
+            0,
+            Span::styled(
+                format!(" Main {base_amount}"),
+                Style::default().fg(Color::Yellow),
+            ),
         )),
-        ItemOrigin::Own if what_if => tags.push(Span::styled(
-            " added",
-            Style::default().fg(crate::theme::GREEN),
+        ItemOrigin::Own if what_if => tags.push((
+            0,
+            Span::styled(" added", Style::default().fg(crate::theme::GREEN)),
         )),
-        ItemOrigin::Removed => tags.push(Span::styled(" removed", Style::default().fg(Color::Red))),
+        ItemOrigin::Removed => {
+            tags.push((0, Span::styled(" removed", Style::default().fg(Color::Red))))
+        }
         _ => {}
     }
-    let tag_width: usize = tags.iter().map(|t| t.content.chars().count()).sum();
-    let label = |width: usize| {
-        let width = width.saturating_sub(tag_width).max(1);
-        let mut style = Style::default();
-        if entry.origin == ItemOrigin::Removed {
-            style = muted.add_modifier(Modifier::CROSSED_OUT);
-        }
-        Span::styled(
-            format!("{:<width$}", crate::truncate(&s.label, width)),
-            style,
-        )
-    };
-    let amount = Span::raw(format!("{:>amount_width$}", entry.amount.to_string()));
-    let compact_label_width = content_width.saturating_sub(amount_width + 1).max(1);
 
-    let mut spans = match focus {
-        PlanFocus::Envelopes if content_width >= 44 => {
-            let period = match s.period_type {
-                Some(PeriodType::Daily) => "/day",
-                Some(PeriodType::Weekly) | Some(PeriodType::Monthly) | None => "/mo",
-            };
-            // Envelope series always carry a concrete mode; None is unreachable here.
-            let mode = match s.mode {
-                Some(Mode::Manual) => "manual",
-                _ => "auto",
-            };
-            let label_width = content_width.saturating_sub(14 + amount_width + 1);
-            vec![
-                label(label_width),
-                Span::styled(format!("{:<6}{:<8}", period, mode), muted),
-            ]
-        }
-        _ => vec![label(compact_label_width)],
+    let wide_envelope = focus == PlanFocus::Envelopes && content_width >= 44;
+    // Room left of the amount, less the envelope's period and mode columns.
+    let available = content_width
+        .saturating_sub(amount_width + 1)
+        .saturating_sub(if wide_envelope { 14 } else { 0 })
+        .max(1);
+    let min_label = s.label.chars().count().clamp(1, 6);
+    let budget = available.saturating_sub(min_label);
+    let width_of = |tags: &[(u8, Span<'static>)]| -> usize {
+        tags.iter().map(|(_, t)| t.content.chars().count()).sum()
     };
-    spans.extend(tags);
+    while width_of(&tags) > budget {
+        let Some(lowest) = tags.iter().enumerate().max_by_key(|(_, (rank, _))| *rank) else {
+            break;
+        };
+        let index = lowest.0;
+        if tags.len() > 1 {
+            tags.remove(index);
+        } else {
+            // One tag left and still too wide: cut it to fit, or drop it.
+            let (_, tag) = &mut tags[0];
+            if budget < 3 {
+                tags.clear();
+            } else {
+                *tag = Span::styled(crate::truncate(&tag.content, budget), tag.style);
+            }
+        }
+    }
+    let tag_width = width_of(&tags);
+
+    let mut label_style = Style::default();
+    if entry.origin == ItemOrigin::Removed {
+        label_style = muted.add_modifier(Modifier::CROSSED_OUT);
+    }
+    let label_width = available.saturating_sub(tag_width).max(1);
+    let label = Span::styled(
+        format!("{:<label_width$}", crate::truncate(&s.label, label_width)),
+        label_style,
+    );
+    let mut spans = vec![label];
+    if wide_envelope {
+        let period = match s.period_type {
+            Some(PeriodType::Daily) => "/day",
+            Some(PeriodType::Weekly) | Some(PeriodType::Monthly) | None => "/mo",
+        };
+        // Envelope series always carry a concrete mode; None is unreachable here.
+        let mode = match s.mode {
+            Some(Mode::Manual) => "manual",
+            _ => "auto",
+        };
+        spans.push(Span::styled(format!("{:<6}{:<8}", period, mode), muted));
+    }
+    spans.extend(tags.into_iter().map(|(_, tag)| tag));
     spans.push(Span::raw(" "));
-    spans.push(amount);
+    spans.push(Span::raw(format!(
+        "{:>amount_width$}",
+        entry.amount.to_string()
+    )));
     ListItem::new(Line::from(spans))
 }
 
@@ -1007,6 +1034,44 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_narrow_pane_drops_tags_before_the_amount() {
+        let (_, _, entries, _) = app_with_transaction_plan();
+        let mut entry = entries[0].clone();
+        entry.starts_on = Some("2027-01".into());
+        entry.ends_on = Some("2027-06".into());
+        entry.active_months = leeway_core::models::MonthSet::parse("jan,feb,mar").unwrap();
+        entry.origin = ItemOrigin::Changed {
+            base_amount: Money::from_dollars(1800.0),
+        };
+        for width in [20, 30, 40, 56] {
+            let item = entry_row(&entry, PlanFocus::Expenses, false, width, true);
+            let mut terminal = Terminal::new(TestBackend::new(width as u16, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(
+                        ratatui::widgets::List::new(vec![item.clone()]),
+                        frame.area(),
+                    )
+                })
+                .unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains(&entry.amount.to_string()),
+                "width {width}: {text}"
+            );
+        }
+        // With room, the what-if marker is the last tag to go.
+        let item = entry_row(&entry, PlanFocus::Expenses, false, 40, true);
+        let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(ratatui::widgets::List::new(vec![item]), frame.area())
+            })
+            .unwrap();
+        assert!(buffer_text(&terminal).contains("Main $1,800"));
     }
 
     #[test]
