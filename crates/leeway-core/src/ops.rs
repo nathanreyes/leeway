@@ -34,17 +34,80 @@ pub fn month_id(label: &str) -> String {
 /// once they sync. Restamp can need a second row for an item whose row now stands for another
 /// occurrence of its series; that row gets a random id.
 fn stamped_id(conn: &Connection, table: &str, month_id: &str, item_id: &str) -> Result<String> {
-    let id = Uuid::new_v5(
-        &LEEWAY_NAMESPACE,
-        format!("stamp:{month_id}:{item_id}").as_bytes(),
-    )
-    .to_string();
+    let id = stamp_row_id(month_id, item_id);
     let taken: bool = conn.query_row(
         &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id = ?1)"),
         [&id],
         |r| r.get(0),
     )?;
     Ok(if taken { new_id() } else { id })
+}
+
+/// The id stamping gives plan item `item_id`'s row in `month_id`, when no other row holds it.
+fn stamp_row_id(month_id: &str, item_id: &str) -> String {
+    Uuid::new_v5(
+        &LEEWAY_NAMESPACE,
+        format!("stamp:{month_id}:{item_id}").as_bytes(),
+    )
+    .to_string()
+}
+
+/// Which month row each plan entry stands for: for `active` entries, the row restamp
+/// refreshes; for `removed` ones (a what-if's removals), the row it takes out. Rows the
+/// entry itself stamped match first, by id, so removing one of two payments of a series
+/// can't claim the other's row. Then each unmatched entry takes the next unclaimed row of
+/// its series, in row order, which covers hand-added rows and older ids.
+pub struct RowMatches {
+    pub active: Vec<Option<String>>,
+    pub removed: Vec<Option<String>>,
+}
+
+pub fn match_month_rows(
+    month_id: &str,
+    active: &[PlanEntry],
+    removed: &[PlanEntry],
+    txns: &[Txn],
+    envelopes: &[Envelope],
+) -> RowMatches {
+    let entries: Vec<&PlanEntry> = active.iter().chain(removed).collect();
+    let rows_of = |entry: &PlanEntry| -> Vec<String> {
+        match entry.series.kind {
+            Kind::Envelope => envelopes
+                .iter()
+                .filter(|e| e.series_id.as_deref() == Some(entry.series.id.as_str()))
+                .map(|e| e.id.clone())
+                .collect(),
+            Kind::Transaction => txns
+                .iter()
+                .filter(|t| {
+                    t.envelope_id.is_none()
+                        && t.series_id.as_deref() == Some(entry.series.id.as_str())
+                })
+                .map(|t| t.id.clone())
+                .collect(),
+        }
+    };
+    let mut claimed = HashSet::new();
+    let mut found: Vec<Option<String>> = vec![None; entries.len()];
+    for (i, entry) in entries.iter().enumerate() {
+        let own = stamp_row_id(month_id, &entry.item_id);
+        if rows_of(entry).contains(&own) && claimed.insert(own.clone()) {
+            found[i] = Some(own);
+        }
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        if found[i].is_none() {
+            found[i] = rows_of(entry).into_iter().find(|id| !claimed.contains(id));
+            if let Some(id) = &found[i] {
+                claimed.insert(id.clone());
+            }
+        }
+    }
+    let removed = found.split_off(active.len());
+    RowMatches {
+        active: found,
+        removed,
+    }
 }
 
 /// Persist the app-wide display currency into the `setting` table (upsert). Because
@@ -400,66 +463,48 @@ pub fn restamp_filtered(
     let entries = active_entries_for_month(&tx, month_id, plan_id, excluded_item_ids)?;
     let txns = queries::load_txns(&tx, month_id)?;
     let envelopes = queries::load_envelopes(&tx, month_id)?;
+    let month = queries::month_by_id(&tx, month_id)?
+        .with_context(|| format!("month not found: {month_id}"))?;
+    let removed: Vec<PlanEntry> = queries::removed_entries(&tx, plan_id)?
+        .into_iter()
+        .filter(|entry| entry.runs_in(month.start_date))
+        .collect();
+    let active: Vec<PlanEntry> = entries.iter().map(|r| r.entry.clone()).collect();
+    let matches = match_month_rows(month_id, &active, &removed, &txns, &envelopes);
     let mut matched_txns: HashSet<String> = HashSet::new();
     let mut matched_envelopes: HashSet<String> = HashSet::new();
 
-    for entry in &entries {
-        match entry.entry.series.kind {
-            Kind::Envelope => {
-                if let Some(envelope) =
-                    next_matching_envelope(&envelopes, &matched_envelopes, &entry.entry.series.id)
-                {
-                    matched_envelopes.insert(envelope.id.clone());
-                    refresh_envelope(&tx, &envelope.id, entry)?;
-                } else {
-                    insert_instance_from_entry(&tx, month_id, entry)?;
+    for (entry, row) in entries.iter().zip(&matches.active) {
+        match (entry.entry.series.kind, row) {
+            (Kind::Envelope, Some(id)) => {
+                matched_envelopes.insert(id.clone());
+                refresh_envelope(&tx, id, entry)?;
+            }
+            (Kind::Transaction, Some(id)) => {
+                matched_txns.insert(id.clone());
+                if txns.iter().any(|t| &t.id == id && !t.settled) {
+                    refresh_txn(&tx, id, entry)?;
                 }
             }
-            Kind::Transaction => {
-                if let Some(txn) = next_matching_txn(&txns, &matched_txns, &entry.entry.series.id) {
-                    matched_txns.insert(txn.id.clone());
-                    if !txn.settled {
-                        refresh_txn(&tx, &txn.id, entry)?;
-                    }
-                } else {
-                    insert_instance_from_entry(&tx, month_id, entry)?;
-                }
-            }
+            (_, None) => insert_instance_from_entry(&tx, month_id, entry)?,
         }
     }
 
     // A what-if's removal is intent: rows for an item it removes go without the option,
     // except paid ones and envelopes holding spending. The option still removes those.
-    let month = queries::month_by_id(&tx, month_id)?
-        .with_context(|| format!("month not found: {month_id}"))?;
-    let mut seen_txns = matched_txns.clone();
-    let mut seen_envelopes = matched_envelopes.clone();
-    for removed in queries::removed_entries(&tx, plan_id)?
-        .iter()
-        .filter(|entry| entry.runs_in(month.start_date))
-    {
-        match removed.series.kind {
+    for (entry, row) in removed.iter().zip(&matches.removed) {
+        let Some(id) = row else { continue };
+        match entry.series.kind {
             Kind::Envelope => {
-                if let Some(envelope) =
-                    next_matching_envelope(&envelopes, &seen_envelopes, &removed.series.id)
-                {
-                    seen_envelopes.insert(envelope.id.clone());
-                    let spent = txns
-                        .iter()
-                        .any(|t| t.envelope_id.as_deref() == Some(&envelope.id));
-                    if !spent {
-                        tx.execute("DELETE FROM envelope WHERE id = ?1", [&envelope.id])?;
-                        matched_envelopes.insert(envelope.id.clone());
-                    }
+                if !txns.iter().any(|t| t.envelope_id.as_deref() == Some(id)) {
+                    tx.execute("DELETE FROM envelope WHERE id = ?1", [id])?;
+                    matched_envelopes.insert(id.clone());
                 }
             }
             Kind::Transaction => {
-                if let Some(txn) = next_matching_txn(&txns, &seen_txns, &removed.series.id) {
-                    seen_txns.insert(txn.id.clone());
-                    if !txn.settled {
-                        tx.execute("DELETE FROM txn WHERE id = ?1", [&txn.id])?;
-                        matched_txns.insert(txn.id.clone());
-                    }
+                if txns.iter().any(|t| &t.id == id && !t.settled) {
+                    tx.execute("DELETE FROM txn WHERE id = ?1", [id])?;
+                    matched_txns.insert(id.clone());
                 }
             }
         }
@@ -486,28 +531,6 @@ pub fn restamp_filtered(
     )?;
     tx.commit()?;
     Ok(())
-}
-
-fn next_matching_txn<'a>(
-    txns: &'a [Txn],
-    matched: &HashSet<String>,
-    series_id: &str,
-) -> Option<&'a Txn> {
-    txns.iter().find(|txn| {
-        txn.envelope_id.is_none()
-            && txn.series_id.as_deref() == Some(series_id)
-            && !matched.contains(&txn.id)
-    })
-}
-
-fn next_matching_envelope<'a>(
-    envelopes: &'a [Envelope],
-    matched: &HashSet<String>,
-    series_id: &str,
-) -> Option<&'a Envelope> {
-    envelopes.iter().find(|envelope| {
-        envelope.series_id.as_deref() == Some(series_id) && !matched.contains(&envelope.id)
-    })
 }
 
 fn occurrence_counts(entries: &[PlanEntry]) -> HashMap<String, usize> {
@@ -1206,13 +1229,7 @@ pub fn set_item_dates(
     starts_on: Option<&str>,
     ends_on: Option<&str>,
 ) -> Result<()> {
-    let starts = starts_on.map(month_label).transpose()?;
-    let ends = ends_on.map(month_label).transpose()?;
-    if let (Some(starts), Some(ends)) = (&starts, &ends)
-        && starts > ends
-    {
-        anyhow::bail!("the last month comes before the first");
-    }
+    let (starts, ends) = check_item_dates(starts_on, ends_on)?;
     conn.execute(
         "UPDATE plan_item SET starts_on = ?1, ends_on = ?2 WHERE id = ?3",
         rusqlite::params![starts, ends, item_id],
@@ -1236,6 +1253,22 @@ fn drop_change_matching_main(conn: &Connection, item_id: &str) -> Result<()> {
         [item_id],
     )?;
     Ok(())
+}
+
+/// Item dates as stored, or an error naming what's wrong. Callers editing a what-if check
+/// first, so a rejected edit doesn't leave the what-if its own copy of Main's item.
+pub fn check_item_dates(
+    starts_on: Option<&str>,
+    ends_on: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    let starts = starts_on.map(month_label).transpose()?;
+    let ends = ends_on.map(month_label).transpose()?;
+    if let (Some(starts), Some(ends)) = (&starts, &ends)
+        && starts > ends
+    {
+        anyhow::bail!("the last month comes before the first");
+    }
+    Ok((starts, ends))
 }
 
 /// `label` as a stored month (`YYYY-MM`), or an error naming it.
@@ -2286,6 +2319,48 @@ mod tests {
             .collect();
         assert_eq!(txns, ["Rent"], "paid rent stays; unpaid dining goes");
         assert!(queries::load_envelopes(&conn, &month).unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_one_payment_leaves_the_others_row() {
+        let (mut conn, main, what_if, [rent, _, _]) = main_and_what_if();
+        let rent_series = queries::load_plan_entries(&conn, &main)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.item_id == rent)
+            .unwrap()
+            .series
+            .id;
+        let second =
+            add_plan_item(&conn, &main, &rent_series, Money::from_dollars(1500.0)).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        let month = stamp(&mut conn, &main, "2026-12", start, 31).unwrap();
+        // Pay the first payment, then take it out of the what-if.
+        mark_paid(
+            &conn,
+            &stamp_row_id(&month, &rent),
+            Money::from_dollars(1500.0),
+            None,
+        )
+        .unwrap();
+        remove_plan_item(&conn, &what_if, &rent).unwrap();
+
+        restamp(&mut conn, &month, &what_if, false).unwrap();
+
+        let ids: Vec<String> = queries::load_txns(&conn, &month)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.label == "Rent")
+            .map(|t| t.id)
+            .collect();
+        assert!(
+            ids.contains(&stamp_row_id(&month, &second)),
+            "the kept payment stays"
+        );
+        assert!(
+            ids.contains(&stamp_row_id(&month, &rent)),
+            "the paid one stays"
+        );
     }
 
     #[test]
