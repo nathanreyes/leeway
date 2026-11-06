@@ -18,7 +18,7 @@ Editing a month's bills or envelopes doesn't change the plan either. You can use
 
 Press `s` from any budget panel to open the stamp window. The month pane checks the focused month, or next month when a plan is focused. The plan pane checks the focused plan, or starts empty when a month is focused. Use Space to check more months and plans. The item pane lists items from all checked plans. Use Space to turn an item off for this stamp, or Left/Right or `f` to choose static or a historical amount. `tab` switches panes; `enter` stamps every checked plan into every checked month.
 
-Leeway remembers each amount source, but an off choice lasts for this stamp only. Seasonal plan rules still decide which checked months include each item. A stamped month and one plan must be selected alone so Leeway can ask how to restamp it.
+Leeway remembers each amount source, but an off choice lasts for this stamp only. Seasonal months and dates still decide which checked months include each item; an item that sits out the previewed month says why, such as "starts Jan 2027". Items a checked what-if removes are named under the item pane. A stamped month and one plan must be selected alone so Leeway can ask how to restamp it.
 
 Historical choices use settled bill and income amounts or spending recorded inside manual envelopes. Automatic envelopes stay static. If a saved source has no data for the target month, Leeway shows and uses the static amount but keeps the saved source for later.
 
@@ -32,11 +32,15 @@ Press `r` to restamp. If the month has items the plan doesn't, `x` restamps and 
 
 Press `w` to make a what-if on Main. It starts with no changes and stamps just as Main does. It shows under Main in the sidebar.
 
-Editing an item in a what-if changes it there only; Main keeps its own. Removing one of Main's items with `x` leaves it out of the what-if alone. Press `u` on a changed item to make it follow Main again.
+Editing an item in a what-if changes it there only; Main keeps its own. Removing one of Main's items with `x` leaves it out of the what-if alone. Press `u` on a changed or removed item to make it follow Main again.
+
+Rows say how the what-if differs from Main: a changed item shows Main's amount, an added item says "added", and a removed item stays in the list, struck through.
 
 Restamping a month from a what-if takes out the unpaid items it removes. Paid items stay, and so do envelopes with spending.
 
-Press `A` on a what-if to write its changes into Main. Leeway then deletes the what-if. Main can't be deleted while it has what-ifs.
+Press `A` on a what-if to write its changes into Main. Leeway then deletes the what-if. Press `m` on a what-if to make it standalone: it keeps its items as they are and stops following Main. Main can't be deleted while it has what-ifs.
+
+A plan that is neither Main nor a what-if, such as a small plan from before what-ifs, can join Main: press `m` to move its items into Main and delete it. Then give items dates where they need them.
 
 ## Dated items
 
@@ -77,6 +81,7 @@ Plans share the budget sidebar with months. The selected plan's Income, Expenses
 - `n` — create a new plan
 - `w` — create a what-if on Main
 - `A` — apply the selected what-if to Main
+- `m` — make the selected what-if standalone, or move another plan's items into Main
 - `l` — rename the selected plan
 - `s` — stamp the selected plan onto one or more months
 - `x` — delete the selected plan (stamped months are kept)
@@ -87,5 +92,5 @@ With an item pane focused:
 - `a` — set this plan's amount for the item
 - `M` — set which months the item runs in
 - `D` — set the first and last month the item runs
-- `u` — on a what-if, make a changed item follow Main again
+- `u` — on a what-if, make a changed or removed item follow Main again
 - `x` — remove the item from this plan (the series is kept); on a what-if, leave one of Main's items out

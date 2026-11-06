@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use chrono::{Datelike, Local, NaiveDate};
 use leeway_core::models::{
     AccountType, CreditCardEntryMode, Direction, ForecastMethod, Kind, Mode, MonthSet, PeriodType,
-    Plan, PlanEntry, Series, Txn,
+    Plan, PlanEntry, Series, SkipReason, Txn,
 };
 use leeway_core::money::Money;
 use leeway_core::storage;
@@ -394,6 +394,8 @@ pub struct StampReview {
     pub existing_months: BTreeSet<(i32, u32)>,
     pub plans: Vec<StampReviewPlan>,
     pub items: Vec<StampReviewItem>,
+    /// Items a checked what-if leaves out of the previewed month: (what-if, item).
+    pub removed: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -417,6 +419,8 @@ pub struct StampReviewItem {
     pub methods: Vec<ForecastMethod>,
     pub preview_amount: Option<Money>,
     pub preview_method: Option<ForecastMethod>,
+    /// Why the item stays out of the previewed month, when it does.
+    pub skip: Option<SkipReason>,
 }
 
 /// The deferred effect a chosen option runs. Carries the ids it needs so the action is
@@ -584,6 +588,14 @@ pub enum ConfirmAction {
     },
     /// Write a what-if's changes into Main and delete the what-if.
     ApplyWhatIf {
+        id: String,
+    },
+    /// Turn a what-if into a plan that no longer follows Main.
+    MakeStandalone {
+        id: String,
+    },
+    /// Move a standalone plan's items into Main and delete the plan.
+    MergeIntoMain {
         id: String,
     },
     /// Delete a shared series definition. Guarded in `ops::delete_series` (blocked while any
@@ -995,7 +1007,8 @@ fn run(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                             app.last_plan_id = Some(plan_id.clone());
                         }
                         let entries = match &plan {
-                            Some(plan) => queries::load_plan_entries(&app.conn, &plan.id)?,
+                            // A what-if also lists the items it removes, so they can come back.
+                            Some(plan) => queries::load_plan_rows(&app.conn, &plan.id)?,
                             None => Vec::new(),
                         };
                         reconcile_plan_selection(app, &entries);
@@ -2469,6 +2482,23 @@ fn add_selected_series(
     Ok(())
 }
 
+/// Why `entry` stays out of the previewed month, in the stamp window's words.
+fn skip_text(entry: &PlanEntry, skip: SkipReason) -> String {
+    let month = |label: &Option<String>| {
+        label
+            .as_deref()
+            .and_then(leeway_core::models::parse_month_label)
+            .map(|d| d.format("%b %Y").to_string())
+            .unwrap_or_default()
+    };
+    match skip {
+        SkipReason::StartsLater => format!("starts {}", month(&entry.starts_on)),
+        SkipReason::Ended => format!("ended {}", month(&entry.ends_on)),
+        SkipReason::OtherMonths => format!("only {}", entry.active_months.short_label()),
+        SkipReason::Removed => "removed".into(),
+    }
+}
+
 /// Read what the user typed for an item's dates: `2027-01 to 2027-06`, `2027-01 to` or
 /// `to 2027-06` for one open end, `2027-08` for a single month, or `none` (or nothing) for
 /// no dates. Months are checked by `ops::set_item_dates`.
@@ -2849,6 +2879,16 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         ops::apply_what_if(&mut app.conn, &id)?;
                         app.status = Some("Changes applied to Main".into());
                     }
+                    ConfirmAction::MakeStandalone { id } => {
+                        ops::make_standalone(&mut app.conn, &id)?;
+                        app.status = Some("It no longer follows Main".into());
+                    }
+                    ConfirmAction::MergeIntoMain { id } => {
+                        match ops::merge_into_main(&mut app.conn, &id) {
+                            Ok(()) => app.status = Some("Items moved into Main".into()),
+                            Err(e) => app.status = Some(e.to_string()),
+                        }
+                    }
                     ConfirmAction::DeleteSeries { series_id } => {
                         // The UI pre-checks plan usage, but `delete_series` re-checks and
                         // errors if a plan snuck in; surface that as a status instead of
@@ -2924,6 +2964,7 @@ pub(crate) fn open_stamp_review(
         existing_months,
         plans,
         items: Vec::new(),
+        removed: Vec::new(),
     }));
     refresh_stamp_review_items(app)?;
     refresh_stamp_preview(app)
@@ -2989,6 +3030,7 @@ fn refresh_stamp_review_items(app: &mut App) -> Result<()> {
                 methods,
                 preview_amount: None,
                 preview_method: None,
+                skip: None,
             }
         }));
     }
@@ -3014,6 +3056,19 @@ fn refresh_stamp_preview(app: &mut App) -> Result<()> {
         .map(|plan| plan.plan.id.clone())
         .collect();
     let start = NaiveDate::from_ymd_opt(year, month, 1).expect("valid stamp preview month");
+    let mut removed = Vec::new();
+    for plan in review
+        .plans
+        .iter()
+        .filter(|p| p.selected && p.plan.is_what_if())
+    {
+        removed.extend(
+            queries::removed_entries(&app.conn, &plan.plan.id)?
+                .into_iter()
+                .filter(|entry| entry.runs_in(start))
+                .map(|entry| (plan.plan.name.clone(), entry.series.label)),
+        );
+    }
     let mut resolved = HashMap::new();
     for plan_id in plan_ids {
         resolved.extend(
@@ -3031,7 +3086,9 @@ fn refresh_stamp_preview(app: &mut App) -> Result<()> {
     let Some(Modal::StampReview(review)) = &mut app.modal else {
         return Ok(());
     };
+    review.removed = removed;
     for item in &mut review.items {
+        item.skip = item.entry.skip_reason(start);
         let selected = resolved
             .get(&(item.entry.plan_id.clone(), item.entry.item_id.clone()))
             .map(|row| row.option(item.method).unwrap_or_else(|| row.options[0]));
@@ -3310,6 +3367,8 @@ fn draw_stamp_review(frame: &mut Frame, review: &StampReview) {
             let marker = if item.enabled { "[x]" } else { "[ ]" };
             let method = if !item.enabled {
                 "off".to_string()
+            } else if let Some(skip) = item.skip {
+                skip_text(&item.entry, skip)
             } else if item.preview_method.is_none() {
                 "not in this month".to_string()
             } else if item.preview_method == Some(item.method) {
@@ -3335,14 +3394,34 @@ fn draw_stamp_review(frame: &mut Frame, review: &StampReview) {
     if !item_rows.is_empty() {
         item_state.select(Some(review.selected_item.min(item_rows.len() - 1)));
     }
-    let item_list = selectable_list(item_rows).block(focusable_block(
+    let mut item_block = focusable_block(
         format!(
             " Plan items · preview {:04}-{:02} ",
             review.year,
             review.selected_month + 1
         ),
         review.focus == StampReviewFocus::Items,
-    ));
+    );
+    // A what-if's removals aren't plan items to check, so name them under the list.
+    if !review.removed.is_empty() {
+        let mut by_plan: Vec<(String, Vec<String>)> = Vec::new();
+        for (plan, label) in &review.removed {
+            match by_plan.iter_mut().find(|(p, _)| p == plan) {
+                Some((_, labels)) => labels.push(label.clone()),
+                None => by_plan.push((plan.clone(), vec![label.clone()])),
+            }
+        }
+        let text = by_plan
+            .iter()
+            .map(|(plan, labels)| format!("{plan} removes {}", labels.join(", ")))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        item_block = item_block.title_bottom(Line::from(Span::styled(
+            format!(" {text} "),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    let item_list = selectable_list(item_rows).block(item_block);
     frame.render_stateful_widget(item_list, items_area, &mut item_state);
     render_list_scrollbar(
         frame,
@@ -4368,6 +4447,52 @@ mod tests {
             row(&what_if).preview_amount,
             Some(item.amount + Money::from_dollars(150.0))
         );
+    }
+
+    #[test]
+    fn stamp_review_says_why_items_stay_out() {
+        let (mut app, _, _) = app_with_envelope_modal();
+        let main = queries::main_plan_id(&app.conn).unwrap().unwrap();
+        let car = ops::add_new_transaction(
+            &app.conn,
+            &main,
+            "Car",
+            Direction::Out,
+            Money::from_dollars(340.0),
+        )
+        .unwrap();
+        ops::set_item_dates(&app.conn, &car, Some("2027-01"), None).unwrap();
+        let what_if = ops::create_what_if(&app.conn, "Tight").unwrap();
+        let first = queries::load_plan_entries(&app.conn, &main).unwrap()[0].clone();
+        ops::remove_plan_item(&app.conn, &what_if, &first.item_id).unwrap();
+
+        open_stamp_review(&mut app, (2026, 10), Some(&what_if)).unwrap();
+        let Some(Modal::StampReview(review)) = &app.modal else {
+            panic!("expected stamp review");
+        };
+        let car_row = review
+            .items
+            .iter()
+            .find(|i| i.entry.item_id == car)
+            .unwrap();
+        assert_eq!(car_row.skip, Some(SkipReason::StartsLater));
+        assert_eq!(
+            skip_text(&car_row.entry, SkipReason::StartsLater),
+            "starts Jan 2027"
+        );
+        assert_eq!(
+            review.removed,
+            [("Tight".to_string(), first.series.label.clone())]
+        );
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_stamp_review(frame, review))
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("starts Jan 2027"));
+        assert!(text.contains(&format!("Tight removes {}", first.series.label)));
     }
 
     #[test]

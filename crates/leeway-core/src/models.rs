@@ -375,6 +375,9 @@ pub enum ItemOrigin {
     Changed {
         base_amount: Money,
     },
+    /// One of Main's items the what-if leaves out, as Main has it. Only
+    /// `queries::load_plan_rows` returns these; stamping and projections never see them.
+    Removed,
 }
 
 /// A first-class recurring item — WHAT a bill/paycheck/envelope is, independent of any
@@ -439,6 +442,25 @@ impl PlanEntry {
             return Some(SkipReason::OtherMonths);
         }
         None
+    }
+
+    /// "Jan – Jun 2027", "Aug 2027", "from Jan 2027", "until Mar 2027", or `None` with no
+    /// dates.
+    pub fn dates_label(&self) -> Option<String> {
+        let text = |label: &str| {
+            parse_month_label(label).map_or(label.to_string(), |d| d.format("%b %Y").to_string())
+        };
+        match (&self.starts_on, &self.ends_on) {
+            (None, None) => None,
+            (Some(s), Some(e)) if s == e => Some(text(s)),
+            (Some(s), Some(e)) if s[..4] == e[..4] => {
+                let first = parse_month_label(s).map_or(s.clone(), |d| d.format("%b").to_string());
+                Some(format!("{first} – {}", text(e)))
+            }
+            (Some(s), Some(e)) => Some(format!("{} – {}", text(s), text(e))),
+            (Some(s), None) => Some(format!("from {}", text(s))),
+            (None, Some(e)) => Some(format!("until {}", text(e))),
+        }
     }
 
     /// Runs in `month` and every month after it: what "a typical month" counts.
