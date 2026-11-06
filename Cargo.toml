@@ -4,14 +4,14 @@ members = [".", "crates/leeway-core"]
 # Both crates release together under one version. A release bumps this line and
 # the matching `leeway-core` version under [workspace.dependencies].
 [workspace.package]
-version = "0.1.15"
+version = "0.1.16"
 edition = "2024"
 repository = "https://github.com/nathanreyes/leeway"
 license = "MIT OR Apache-2.0"
 homepage = "https://get-leeway.com"
 
 [workspace.dependencies]
-leeway-core = { path = "crates/leeway-core", version = "0.1.15" }
+leeway-core = { path = "crates/leeway-core", version = "0.1.16" }
 anyhow = "1.0.103"
 chrono = "0.4.45"
 rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
