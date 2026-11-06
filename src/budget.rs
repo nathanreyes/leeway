@@ -317,22 +317,39 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, no_plans: bool) {
                 }
                 Line::from(spans)
             }
-            BudgetTarget::Plan { .. } => Line::from(vec![
-                key(" j/k "),
-                Span::raw(" budget  "),
-                key(" n "),
-                Span::raw(" new  "),
-                key(" w "),
-                Span::raw(" what-if  "),
-                key(" A "),
-                Span::raw(" apply  "),
-                key(" l "),
-                Span::raw(" label  "),
-                key(" s "),
-                Span::raw(" stamp  "),
-                key(" x "),
-                Span::raw(" delete"),
-            ]),
+            BudgetTarget::Plan { ref plan_id } => {
+                // The keys that tie a plan to Main depend on what it is.
+                let plan = queries::get_plan(&app.conn, plan_id).ok().flatten();
+                let main = queries::main_plan_id(&app.conn).ok().flatten();
+                let tie: Vec<Span> = match &plan {
+                    Some(p) if p.is_what_if() => vec![
+                        key(" A "),
+                        Span::raw(" apply  "),
+                        key(" m "),
+                        Span::raw(" standalone  "),
+                    ],
+                    Some(p) if main.as_deref() != Some(p.id.as_str()) => {
+                        vec![key(" m "), Span::raw(" merge into Main  ")]
+                    }
+                    _ => vec![key(" w "), Span::raw(" what-if  ")],
+                };
+                let mut spans = vec![
+                    key(" j/k "),
+                    Span::raw(" budget  "),
+                    key(" n "),
+                    Span::raw(" new  "),
+                ];
+                spans.extend(tie);
+                spans.extend([
+                    key(" l "),
+                    Span::raw(" label  "),
+                    key(" s "),
+                    Span::raw(" stamp  "),
+                    key(" x "),
+                    Span::raw(" delete"),
+                ]);
+                Line::from(spans)
+            }
         }
     } else {
         match app.budget_target {

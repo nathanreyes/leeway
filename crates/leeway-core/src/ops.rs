@@ -2364,6 +2364,56 @@ mod tests {
     }
 
     #[test]
+    fn plan_rows_list_removed_items_that_projections_leave_out() {
+        let (conn, main, what_if, [_, dining, _]) = main_and_what_if();
+        remove_plan_item(&conn, &what_if, &dining).unwrap();
+        let rows = queries::load_plan_rows(&conn, &what_if).unwrap();
+        let removed: Vec<_> = rows
+            .iter()
+            .filter(|e| e.origin == ItemOrigin::Removed)
+            .map(|e| e.series.label.as_str())
+            .collect();
+        assert_eq!(removed, ["Dining"]);
+        let june = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let entries = queries::load_plan_entries(&conn, &what_if).unwrap();
+        assert_eq!(
+            calc::project_plan(&rows, june),
+            calc::project_plan(&entries, june)
+        );
+        assert_eq!(
+            calc::project_month(&rows, june),
+            calc::project_month(&entries, june)
+        );
+        assert_eq!(queries::load_plan_rows(&conn, &main).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn dates_read_as_short_month_ranges() {
+        let (conn, main, _, [rent, _, _]) = main_and_what_if();
+        let label = |starts: Option<&str>, ends: Option<&str>| {
+            set_item_dates(&conn, &rent, starts, ends).unwrap();
+            queries::load_plan_entries(&conn, &main)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.item_id == rent)
+                .unwrap()
+                .dates_label()
+        };
+        assert_eq!(label(None, None), None);
+        assert_eq!(label(Some("2027-08"), Some("2027-08")).unwrap(), "Aug 2027");
+        assert_eq!(
+            label(Some("2027-01"), Some("2027-06")).unwrap(),
+            "Jan – Jun 2027"
+        );
+        assert_eq!(
+            label(Some("2026-11"), Some("2027-02")).unwrap(),
+            "Nov 2026 – Feb 2027"
+        );
+        assert_eq!(label(Some("2027-01"), None).unwrap(), "from Jan 2027");
+        assert_eq!(label(None, Some("2027-03")).unwrap(), "until Mar 2027");
+    }
+
+    #[test]
     fn apply_what_if_writes_its_changes_into_main() {
         let (mut conn, main, what_if, [_, dining, groceries]) = main_and_what_if();
         let change = editable_item(&conn, &what_if, &groceries).unwrap();

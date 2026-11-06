@@ -13,8 +13,8 @@ use chrono::Local;
 use leeway_core::calc::PlanProjection;
 use leeway_core::models::{Direction, ItemOrigin, Kind, Mode, PeriodType, Plan, PlanEntry};
 use leeway_core::money::Money;
-use leeway_core::ops;
 use leeway_core::queries::PlanSummary;
+use leeway_core::{ops, queries};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -77,6 +77,32 @@ fn handle_list_key(app: &mut App, key: KeyEvent, summaries: &[PlanSummary]) -> R
 
         KeyCode::Char('n') => app.open_text("New plan name", "", PromptKind::NewPlan),
         KeyCode::Char('w') => app.open_text("New what-if on Main", "", PromptKind::NewWhatIf),
+        // A what-if can stop following Main; another plan can move its items into Main.
+        KeyCode::Char('m') => {
+            if let Some(s) = selected {
+                let main = queries::main_plan_id(&app.conn)?;
+                if s.plan.is_what_if() {
+                    app.open_confirm(
+                        format!(
+                            "Make “{}” standalone? It stops following Main.",
+                            s.plan.name
+                        ),
+                        ConfirmAction::MakeStandalone {
+                            id: s.plan.id.clone(),
+                        },
+                    );
+                } else if main.as_deref() == Some(s.plan.id.as_str()) {
+                    app.status = Some("This is Main. Press w to make a what-if on it".into());
+                } else {
+                    app.open_confirm(
+                        format!("Move “{}”'s items into Main and delete it?", s.plan.name),
+                        ConfirmAction::MergeIntoMain {
+                            id: s.plan.id.clone(),
+                        },
+                    );
+                }
+            }
+        }
         KeyCode::Char('A') => {
             if let Some(s) = selected.filter(|s| s.plan.is_what_if()) {
                 app.open_confirm(
@@ -216,7 +242,7 @@ fn handle_item_key(
         // On a what-if, drop its change to one of Main's items.
         KeyCode::Char('u') => {
             if let Some(en) = selected_entry(app, entries)
-                && matches!(en.origin, ItemOrigin::Changed { .. })
+                && matches!(en.origin, ItemOrigin::Changed { .. } | ItemOrigin::Removed)
             {
                 ops::use_main_version(&app.conn, &en.plan_id, &en.item_id)?;
                 app.status = Some(format!("“{}” follows Main again", en.series.label));
@@ -225,7 +251,11 @@ fn handle_item_key(
 
         // `x` removes the item from THIS plan; the series survives for other plans.
         KeyCode::Char('x') => {
-            if let Some(en) = selected_entry(app, entries) {
+            if let Some(en) = selected_entry(app, entries)
+                && en.origin == ItemOrigin::Removed
+            {
+                app.status = Some("Already left out. Press u to bring it back".into());
+            } else if let Some(en) = selected_entry(app, entries) {
                 app.open_confirm(
                     format!(
                         "Remove “{}” from this plan? (the series is kept)",
@@ -363,9 +393,16 @@ pub fn draw(frame: &mut Frame, app: &App, summaries: &[PlanSummary], entries: &[
     ])
     .areas(detail_area);
 
-    draw_plan_block(frame, income_area, app, entries, PlanFocus::Income);
-    draw_plan_block(frame, expense_area, app, entries, PlanFocus::Expenses);
-    draw_plan_block(frame, env_area, app, entries, PlanFocus::Envelopes);
+    draw_plan_block(frame, income_area, app, entries, PlanFocus::Income, false);
+    draw_plan_block(
+        frame,
+        expense_area,
+        app,
+        entries,
+        PlanFocus::Expenses,
+        false,
+    );
+    draw_plan_block(frame, env_area, app, entries, PlanFocus::Envelopes, false);
     draw_plan_summary(frame, summary_area, &projection);
 
     // Local verbs switch with focus: plan-scoped in the list, item-scoped in a pane.
@@ -423,6 +460,7 @@ pub fn draw_detail(
     plan: Option<&Plan>,
     entries: &[PlanEntry],
 ) {
+    let what_if = plan.is_some_and(Plan::is_what_if);
     let projection = leeway_core::calc::project_plan(entries, Local::now().date_naive());
     let [header, body, summary_area] = Layout::vertical([
         Constraint::Length(3),
@@ -460,9 +498,16 @@ pub fn draw_detail(
         let [income_area, expense_area] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(items_area);
-        draw_plan_block(frame, income_area, app, entries, PlanFocus::Income);
-        draw_plan_block(frame, expense_area, app, entries, PlanFocus::Expenses);
-        draw_plan_block(frame, env_area, app, entries, PlanFocus::Envelopes);
+        draw_plan_block(frame, income_area, app, entries, PlanFocus::Income, what_if);
+        draw_plan_block(
+            frame,
+            expense_area,
+            app,
+            entries,
+            PlanFocus::Expenses,
+            what_if,
+        );
+        draw_plan_block(frame, env_area, app, entries, PlanFocus::Envelopes, what_if);
     } else {
         let [income_area, expense_area, env_area] = Layout::vertical([
             Constraint::Min(crate::income_block_height(income_count)),
@@ -470,9 +515,16 @@ pub fn draw_detail(
             Constraint::Min(crate::income_block_height(envelope_count)),
         ])
         .areas(body);
-        draw_plan_block(frame, income_area, app, entries, PlanFocus::Income);
-        draw_plan_block(frame, expense_area, app, entries, PlanFocus::Expenses);
-        draw_plan_block(frame, env_area, app, entries, PlanFocus::Envelopes);
+        draw_plan_block(frame, income_area, app, entries, PlanFocus::Income, what_if);
+        draw_plan_block(
+            frame,
+            expense_area,
+            app,
+            entries,
+            PlanFocus::Expenses,
+            what_if,
+        );
+        draw_plan_block(frame, env_area, app, entries, PlanFocus::Envelopes, what_if);
     }
     draw_plan_summary(frame, summary_area, &projection);
 }
@@ -491,7 +543,7 @@ pub fn footer_hints(_app: &App) -> Line<'static> {
         key(" D "),
         Span::raw(" dates  "),
         key(" u "),
-        Span::raw(" use Main's  "),
+        Span::raw(" Main's  "),
         key(" x "),
         Span::raw(" remove"),
     ])
@@ -637,6 +689,7 @@ fn draw_plan_block(
     app: &App,
     entries: &[PlanEntry],
     focus: PlanFocus,
+    what_if: bool,
 ) {
     let focused = app.plan_focus == focus;
     let selected = match focus {
@@ -650,7 +703,15 @@ fn draw_plan_block(
         .iter()
         .filter(|entry| entry_matches_focus(entry, focus))
         .enumerate()
-        .map(|(i, entry)| entry_row(entry, focus, focused && i == selected, content_width))
+        .map(|(i, entry)| {
+            entry_row(
+                entry,
+                focus,
+                focused && i == selected,
+                content_width,
+                what_if,
+            )
+        })
         .collect();
 
     let row_count = rows.len();
@@ -696,21 +757,54 @@ fn entry_row(
     focus: PlanFocus,
     selected: bool,
     content_width: usize,
+    what_if: bool,
 ) -> ListItem<'static> {
     let s = &entry.series;
     let muted = Style::default().fg(crate::theme::muted(selected));
     let amount_width = 12.min(content_width.saturating_sub(1));
+
+    // Tags sit between the label and the amount, so a narrow pane cuts the label, not them.
+    // Only seasonal, dated, and what-if rows carry one, so an ordinary plan looks as it
+    // always has.
+    let mut tags: Vec<Span<'static>> = Vec::new();
+    if !entry.active_months.is_all() {
+        tags.push(Span::styled(
+            format!(" {}", entry.active_months.short_label()),
+            muted,
+        ));
+    }
+    if let Some(dates) = entry.dates_label() {
+        tags.push(Span::styled(format!(" {dates}"), muted));
+    }
+    match entry.origin {
+        ItemOrigin::Changed { base_amount } => tags.push(Span::styled(
+            format!(" Main {base_amount}"),
+            Style::default().fg(Color::Yellow),
+        )),
+        ItemOrigin::Own if what_if => tags.push(Span::styled(
+            " added",
+            Style::default().fg(crate::theme::GREEN),
+        )),
+        ItemOrigin::Removed => tags.push(Span::styled(" removed", Style::default().fg(Color::Red))),
+        _ => {}
+    }
+    let tag_width: usize = tags.iter().map(|t| t.content.chars().count()).sum();
+    let label = |width: usize| {
+        let width = width.saturating_sub(tag_width).max(1);
+        let mut style = Style::default();
+        if entry.origin == ItemOrigin::Removed {
+            style = muted.add_modifier(Modifier::CROSSED_OUT);
+        }
+        Span::styled(
+            format!("{:<width$}", crate::truncate(&s.label, width)),
+            style,
+        )
+    };
+    let amount = Span::raw(format!("{:>amount_width$}", entry.amount.to_string()));
     let compact_label_width = content_width.saturating_sub(amount_width + 1).max(1);
-    let mut line = match focus {
-        PlanFocus::List | PlanFocus::Income | PlanFocus::Expenses => Line::from(vec![
-            Span::raw(format!(
-                "{:<compact_label_width$}",
-                crate::truncate(&s.label, compact_label_width)
-            )),
-            Span::raw(" "),
-            Span::raw(format!("{:>amount_width$}", entry.amount.to_string())),
-        ]),
-        PlanFocus::Envelopes => {
+
+    let mut spans = match focus {
+        PlanFocus::Envelopes if content_width >= 44 => {
             let period = match s.period_type {
                 Some(PeriodType::Daily) => "/day",
                 Some(PeriodType::Weekly) | Some(PeriodType::Monthly) | None => "/mo",
@@ -720,39 +814,18 @@ fn entry_row(
                 Some(Mode::Manual) => "manual",
                 _ => "auto",
             };
-            if content_width >= 44 {
-                let label_width = content_width.saturating_sub(14 + amount_width + 1);
-                Line::from(vec![
-                    Span::raw(format!(
-                        "{:<label_width$}",
-                        crate::truncate(&s.label, label_width)
-                    )),
-                    Span::styled(format!("{:<6}{:<8}", period, mode), muted),
-                    Span::raw(" "),
-                    Span::raw(format!("{:>amount_width$}", entry.amount.to_string())),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::raw(format!(
-                        "{:<compact_label_width$}",
-                        crate::truncate(&s.label, compact_label_width)
-                    )),
-                    Span::raw(" "),
-                    Span::raw(format!("{:>amount_width$}", entry.amount.to_string())),
-                ])
-            }
+            let label_width = content_width.saturating_sub(14 + amount_width + 1);
+            vec![
+                label(label_width),
+                Span::styled(format!("{:<6}{:<8}", period, mode), muted),
+            ]
         }
+        _ => vec![label(compact_label_width)],
     };
-
-    // Only seasonal rows carry a tag, so an ordinary plan looks exactly as it always has.
-    if !entry.active_months.is_all() {
-        line.push_span(Span::styled(
-            format!("  {}", entry.active_months.short_label()),
-            muted,
-        ));
-    }
-
-    ListItem::new(line)
+    spans.extend(tags);
+    spans.push(Span::raw(" "));
+    spans.push(amount);
+    ListItem::new(Line::from(spans))
 }
 
 /// A small pill-styled key hint, e.g. ` n `.
@@ -775,6 +848,10 @@ mod tests {
     use ratatui::crossterm::event::KeyModifiers;
     use rusqlite::Connection;
     use uuid::Uuid;
+
+    fn key_event(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
 
     fn open_test_conn() -> Connection {
         let mut path = std::env::temp_dir();
@@ -867,6 +944,112 @@ mod tests {
     }
 
     #[test]
+    fn a_what_if_shows_how_it_differs_from_main() {
+        let (mut app, plan, entries, _) = app_with_transaction_plan();
+        let rent = entries[0].item_id.clone();
+        let what_if = ops::create_what_if(&app.conn, "Tight").unwrap();
+        let change = ops::editable_item(&app.conn, &what_if, &rent).unwrap();
+        ops::set_item_amount(&app.conn, &change, Money::from_dollars(1600.0)).unwrap();
+        ops::set_item_dates(&app.conn, &change, Some("2027-01"), Some("2027-06")).unwrap();
+        ops::add_new_transaction(
+            &app.conn,
+            &what_if,
+            "Car",
+            Direction::Out,
+            Money::from_dollars(340.0),
+        )
+        .unwrap();
+        let other = ops::add_new_transaction(
+            &app.conn,
+            &plan.id,
+            "Gym",
+            Direction::Out,
+            Money::from_dollars(50.0),
+        )
+        .unwrap();
+        ops::remove_plan_item(&app.conn, &what_if, &other).unwrap();
+        let what_if_plan = queries::get_plan(&app.conn, &what_if).unwrap().unwrap();
+        let rows = queries::load_plan_rows(&app.conn, &what_if).unwrap();
+        app.plan_focus = PlanFocus::Expenses;
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| draw_detail(frame, frame.area(), &app, Some(&what_if_plan), &rows))
+            .unwrap();
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("Main $1,800.00"), "{text}");
+        assert!(text.contains("Jan – Jun 2027"));
+        assert!(text.contains("added"));
+        assert!(text.contains("removed"));
+        assert!(text.contains("What-if on Main: Tight"));
+
+        // u brings the removed row back.
+        let gym = rows.iter().position(|e| e.series.label == "Gym").unwrap();
+        let in_pane: Vec<_> = rows
+            .iter()
+            .filter(|e| entry_matches_focus(e, PlanFocus::Expenses))
+            .collect();
+        let index = in_pane
+            .iter()
+            .position(|e| e.item_id == rows[gym].item_id)
+            .unwrap();
+        set_plan_selection(&mut app, index);
+        handle_item_key(
+            &mut app,
+            key_event(KeyCode::Char('u')),
+            Some(&what_if_plan),
+            &rows,
+        )
+        .unwrap();
+        assert!(
+            queries::removed_entries(&app.conn, &what_if)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn m_makes_a_what_if_standalone_or_merges_a_plan_into_main() {
+        let (mut app, plan, _, _) = app_with_transaction_plan();
+        let what_if = ops::create_what_if(&app.conn, "Tight").unwrap();
+        let kids = ops::create_plan(&app.conn, "Kids").unwrap();
+        ops::add_new_transaction(
+            &app.conn,
+            &kids,
+            "Camp",
+            Direction::Out,
+            Money::from_dollars(90.0),
+        )
+        .unwrap();
+        let summaries = queries::plan_summaries(&app.conn).unwrap();
+        let pick = |app: &mut App, id: &str| {
+            app.plans_sel = summaries.iter().position(|s| s.plan.id == id).unwrap();
+        };
+
+        pick(&mut app, &what_if);
+        handle_list_key(&mut app, key_event(KeyCode::Char('m')), &summaries).unwrap();
+        assert!(matches!(
+            &app.modal,
+            Some(crate::Modal::Confirm(c)) if matches!(c.action, ConfirmAction::MakeStandalone { .. })
+        ));
+        app.modal = None;
+
+        pick(&mut app, &kids);
+        handle_list_key(&mut app, key_event(KeyCode::Char('m')), &summaries).unwrap();
+        assert!(matches!(
+            &app.modal,
+            Some(crate::Modal::Confirm(c)) if matches!(c.action, ConfirmAction::MergeIntoMain { .. })
+        ));
+        app.modal = None;
+
+        pick(&mut app, &plan.id);
+        handle_list_key(&mut app, key_event(KeyCode::Char('m')), &summaries).unwrap();
+        assert!(app.modal.is_none());
+        assert!(app.status.as_deref().unwrap_or("").contains("This is Main"));
+    }
+
+    #[test]
     fn plans_screen_hides_the_projection_note_without_daily_envelopes() {
         let (app, _, entries, _) = app_with_transaction_plan();
         let summaries = queries::plan_summaries(&app.conn).unwrap();
@@ -913,7 +1096,14 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                draw_plan_block(frame, frame.area(), &app, &entries, PlanFocus::Envelopes)
+                draw_plan_block(
+                    frame,
+                    frame.area(),
+                    &app,
+                    &entries,
+                    PlanFocus::Envelopes,
+                    false,
+                )
             })
             .unwrap();
 

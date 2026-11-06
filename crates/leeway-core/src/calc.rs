@@ -125,11 +125,16 @@ pub struct PlanProjection {
 /// 30-day assumption. Legacy weekly envelopes continue to behave as monthly values,
 /// matching stamping behavior.
 pub fn project_plan(entries: &[PlanEntry], month: NaiveDate) -> PlanProjection {
-    let every_month: Vec<&PlanEntry> = entries
-        .iter()
+    // Rows a what-if removes are shown, never counted.
+    let counted = || {
+        entries
+            .iter()
+            .filter(|entry| entry.origin != crate::models::ItemOrigin::Removed)
+    };
+    let every_month: Vec<&PlanEntry> = counted()
         .filter(|entry| entry.is_every_month_from(month))
         .collect();
-    let seasonal = entries.iter().filter(|entry| {
+    let seasonal = counted().filter(|entry| {
         !entry.active_months.is_all()
             && entry.skip_reason(month) != Some(crate::models::SkipReason::Ended)
     });
@@ -174,6 +179,7 @@ pub fn project_plan(entries: &[PlanEntry], month: NaiveDate) -> PlanProjection {
 pub fn project_month(entries: &[PlanEntry], month: NaiveDate) -> Money {
     entries
         .iter()
+        .filter(|entry| entry.origin != crate::models::ItemOrigin::Removed)
         .filter(|entry| entry.runs_in(month))
         .map(signed_projected_amount)
         .sum()

@@ -364,6 +364,23 @@ pub fn removed_entries(conn: &Connection, plan_id: &str) -> Result<Vec<PlanEntry
         .collect())
 }
 
+/// A plan's entries for an editor to show: `load_plan_entries`, plus on a what-if the
+/// items it removes from Main, marked [`ItemOrigin::Removed`], in the same order.
+pub fn load_plan_rows(conn: &Connection, plan_id: &str) -> Result<Vec<PlanEntry>> {
+    let mut rows = load_plan_entries(conn, plan_id)?;
+    let removed = removed_entries(conn, plan_id)?;
+    if removed.is_empty() {
+        return Ok(rows);
+    }
+    rows.extend(removed.into_iter().map(|entry| PlanEntry {
+        plan_id: plan_id.to_string(),
+        origin: ItemOrigin::Removed,
+        ..entry
+    }));
+    rows.sort_by_key(entry_order);
+    Ok(rows)
+}
+
 /// The plan's entries that don't go into the month starting `month`, each with why.
 pub fn skipped_entries(
     conn: &Connection,
