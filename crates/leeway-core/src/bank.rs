@@ -16,7 +16,9 @@ use std::collections::{HashMap, HashSet};
 
 /// How far a bank amount may stray from what's due and still settle the row, in percent.
 const AMOUNT_TOLERANCE_PERCENT: i64 = 15;
-/// Days before the month starts that still count, so a bill paid early settles.
+/// The last days of a month whose payments may belong to the next one: rent paid early, or a
+/// paycheck that came before a weekend payday. Sync asks before using one there, and the
+/// review offers them when picking by hand.
 const EARLY_DAYS: i64 = 7;
 /// How far back suggestions look.
 const SUGGESTION_DAYS: i64 = 100;
@@ -107,6 +109,21 @@ pub struct Report {
     pub settled: Vec<Settled>,
     /// Month rows that more than one bank transaction could settle; the user picks.
     pub ambiguous: Vec<String>,
+    /// Payments at the end of a month whose item was already paid, which may be next month's.
+    pub early: Vec<EarlyPayment>,
+}
+
+/// A payment dated late in one month, matching an item that month already paid and an open
+/// one in the next. Sync doesn't settle it; it asks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EarlyPayment {
+    pub bank: BankTxn,
+    /// The next month's row it would settle.
+    pub txn_id: String,
+    pub label: String,
+    /// The month it's dated in, and the one it would count for, `YYYY-MM`.
+    pub paid_in: String,
+    pub counts_for: String,
 }
 
 /// A stored bank transaction, as the review lists it.
@@ -187,19 +204,50 @@ pub fn unlink_all(conn: &Connection) -> Result<()> {
 // --- Applying a feed -----------------------------------------------------------------
 
 /// Apply `feed` as of `today`: update linked balances, store the transactions, and settle
-/// the month containing `today`. All or nothing.
+/// last month and the month containing `today`, each from the transactions dated in it. Last
+/// month goes first, so a payment that cleared on its last day settles it rather than this
+/// one. All or nothing.
 pub fn apply_feed(conn: &mut Connection, feed: &Feed, today: NaiveDate) -> Result<Report> {
     let tx = conn.transaction()?;
     let links = links(&tx)?;
     let balances = update_balances(&tx, feed, &links)?;
     store_txns(&tx, feed, &links)?;
-    let (settled, ambiguous) = settle_month(&tx, today)?;
+    let this = month_label(today);
+    let last = month_label(first_of(today) - Duration::days(1));
+    let next = month_label(first_of(today) + Duration::days(31));
+    let mut settled = Vec::new();
+    let mut ambiguous = Vec::new();
+    for label in [&last, &this] {
+        if let Some(month) = queries::month_by_label(&tx, label)? {
+            let (s, a) = settle_month(&tx, &month)?;
+            settled.extend(s);
+            ambiguous.extend(a);
+        }
+    }
+    let mut early = Vec::new();
+    for (paid_in, counts_for) in [(&last, &this), (&this, &next)] {
+        if let (Some(paid), Some(counts)) = (
+            queries::month_by_label(&tx, paid_in)?,
+            queries::month_by_label(&tx, counts_for)?,
+        ) {
+            early.extend(early_payments(&tx, &paid, &counts)?);
+        }
+    }
     tx.commit()?;
     Ok(Report {
         balances,
         settled,
         ambiguous,
+        early,
     })
+}
+
+fn month_label(day: NaiveDate) -> String {
+    format!("{:04}-{:02}", day.year(), day.month())
+}
+
+fn first_of(day: NaiveDate) -> NaiveDate {
+    day.with_day(1).expect("every month has a first")
 }
 
 fn update_balances(
@@ -298,12 +346,19 @@ fn store_txns(conn: &Connection, feed: &Feed, links: &HashMap<String, String>) -
     Ok(())
 }
 
-/// The first and last day bank transactions count for in `month`.
-fn window(month: &crate::models::Month) -> (NaiveDate, NaiveDate) {
+/// The first and last day of `month`: sync settles its rows only from transactions dated in it.
+fn dates(month: &crate::models::Month) -> (NaiveDate, NaiveDate) {
     (
-        month.start_date - Duration::days(EARLY_DAYS),
+        month.start_date,
         month.start_date + Duration::days(month.days_in_month - 1),
     )
+}
+
+/// What the review offers when picking by hand: the month, and the last days of the one
+/// before, for a payment made early.
+fn pick_window(month: &crate::models::Month) -> (NaiveDate, NaiveDate) {
+    let (from, to) = dates(month);
+    (from - Duration::days(EARLY_DAYS), to)
 }
 
 /// Posted, not ignored, from a linked account, held by no row, and dated in the window.
@@ -344,6 +399,7 @@ fn map_bank_txn(r: &rusqlite::Row) -> rusqlite::Result<BankTxn> {
 /// A month row sync may settle.
 struct Row {
     id: String,
+    label: String,
     group: String,
     match_text: String,
     direction: Direction,
@@ -352,13 +408,12 @@ struct Row {
     settled: bool,
 }
 
-fn settle_month(conn: &Connection, today: NaiveDate) -> Result<(Vec<Settled>, Vec<String>)> {
-    let label = format!("{:04}-{:02}", today.year(), today.month());
-    let Some(month) = queries::month_by_label(conn, &label)? else {
-        return Ok((Vec::new(), Vec::new()));
-    };
-    let rows = open_rows(conn, &month)?;
-    let (from, to) = window(&month);
+fn settle_month(
+    conn: &Connection,
+    month: &crate::models::Month,
+) -> Result<(Vec<Settled>, Vec<String>)> {
+    let rows = open_rows(conn, month)?;
+    let (from, to) = dates(month);
     let pool = free_txns(conn, from, to, false)?;
 
     // Each group of rows (one series, or one hand-added label) and the pool indexes it could take.
@@ -413,6 +468,65 @@ fn settle_month(conn: &Connection, today: NaiveDate) -> Result<(Vec<Settled>, Ve
     Ok((settled, ambiguous))
 }
 
+/// Payments in the last days of `paid` that no row took, matching an item `paid` already
+/// settled from the bank and an open row in `next`. A payment two items could take is left
+/// out, and so is a second payment for the same row.
+fn early_payments(
+    conn: &Connection,
+    paid: &crate::models::Month,
+    next: &crate::models::Month,
+) -> Result<Vec<EarlyPayment>> {
+    let (_, last) = dates(paid);
+    let pool = free_txns(conn, last - Duration::days(EARLY_DAYS - 1), last, false)?;
+    // Items `paid` still has a row for that the bank hasn't settled could take the payment
+    // themselves, so they don't count as paid.
+    let waiting: HashSet<String> = open_rows(conn, paid)?
+        .into_iter()
+        .map(|r| r.group)
+        .collect();
+    let mut stmt = conn.prepare(
+        "SELECT series_id, label FROM txn
+         WHERE month_id = ?1 AND envelope_id IS NULL AND bank_txn_id IS NOT NULL",
+    )?;
+    let held: HashSet<String> = stmt
+        .query_map([&paid.id], |r| {
+            Ok(group_key(
+                r.get::<_, Option<String>>(0)?.as_deref(),
+                &r.get::<_, String>(1)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let open: Vec<Row> = open_rows(conn, next)?
+        .into_iter()
+        .filter(|r| !r.settled && held.contains(&r.group) && !waiting.contains(&r.group))
+        .collect();
+    let mut early = Vec::new();
+    let mut taken = HashSet::new();
+    for bank in pool {
+        let fits: Vec<&Row> = open.iter().filter(|r| matches(r, &bank)).collect();
+        let Some(row) = fits.first() else { continue };
+        if fits.iter().any(|r| r.group != row.group) || !taken.insert(row.group.clone()) {
+            continue;
+        }
+        early.push(EarlyPayment {
+            txn_id: row.id.clone(),
+            label: row.label.clone(),
+            paid_in: paid.label.clone(),
+            counts_for: next.label.clone(),
+            bank,
+        });
+    }
+    Ok(early)
+}
+
+/// Rows of one series, or hand-added rows sharing a label, are one item.
+fn group_key(series_id: Option<&str>, label: &str) -> String {
+    match series_id {
+        Some(s) => format!("series:{s}"),
+        None => format!("label:{}", label.to_lowercase()),
+    }
+}
+
 /// The month's standalone rows no bank transaction holds yet, settled or not.
 fn open_rows(conn: &Connection, month: &crate::models::Month) -> Result<Vec<Row>> {
     let held: HashSet<String> = conn
@@ -439,10 +553,8 @@ fn open_rows(conn: &Connection, month: &crate::models::Month) -> Result<Vec<Row>
                 .and_then(|s| matches.get(s).cloned())
                 .unwrap_or(label);
             Row {
-                group: match &t.series_id {
-                    Some(s) => format!("series:{s}"),
-                    None => format!("label:{}", t.label.to_lowercase()),
-                },
+                group: group_key(t.series_id.as_deref(), &t.label),
+                label: t.label.clone(),
                 any_amount: t.series_id.as_ref().is_some_and(|s| any_amount.contains(s)),
                 due: t.stamped_amount.unwrap_or(t.amount),
                 match_text,
@@ -524,7 +636,7 @@ fn settle(conn: &Connection, txn_id: &str, bank: &BankTxn) -> Result<()> {
 /// first.
 pub fn free_txns_for_month(conn: &Connection, month_id: &str) -> Result<Vec<BankTxn>> {
     let month = queries::month_by_id(conn, month_id)?.context("month not found")?;
-    let (from, to) = window(&month);
+    let (from, to) = pick_window(&month);
     free_txns(conn, from, to, true)
 }
 
@@ -587,6 +699,16 @@ pub fn settle_from_bank(
             set_match_text(conn, &series, Some(&clean(&bank.description)))?;
         }
     }
+    Ok(())
+}
+
+/// Leave bank transaction `bank_txn_id` alone from now on: the answer to an early payment that
+/// isn't next month's.
+pub fn ignore_txn(conn: &Connection, bank_txn_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE bank_txn SET ignored = 1 WHERE id = ?1",
+        [bank_txn_id],
+    )?;
     Ok(())
 }
 
@@ -752,6 +874,7 @@ mod tests {
         pay: String,
         electric: String,
         pay_series: String,
+        plan: String,
     }
 
     fn today() -> NaiveDate {
@@ -809,7 +932,18 @@ mod tests {
             card,
             month,
             pay_series,
+            plan,
         }
+    }
+
+    /// Stamp November 2026 from the fixture's plan.
+    fn november(f: &mut Fixture) -> String {
+        let start = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        stamp(&mut f.conn, &f.plan, "2026-11", start, 30).unwrap()
+    }
+
+    fn day(text: &str) -> NaiveDate {
+        text.parse().unwrap()
     }
 
     fn account(id: &str, balance: i64, available: Option<i64>) -> FeedAccount {
@@ -906,6 +1040,7 @@ mod tests {
             &feed(vec![
                 txn("chk", "1", "2026-09-28", -100_000, "ACH RENT PMT"),
                 txn("chk", "2", "2026-10-01", 205_255, "ACME PAYROLL PPD ID 99"),
+                txn("chk", "5", "2026-10-02", -100_000, "ACH RENT PMT"),
                 txn("chk", "3", "2026-10-05", -5_000, "DINING OUT"),
                 txn("unlinked", "4", "2026-10-05", -100_000, "RENT"),
                 pending,
@@ -916,8 +1051,8 @@ mod tests {
 
         assert_eq!(
             row(&f.conn, &f.rent),
-            (true, 100_000, Some("2026-09-28".into())),
-            "paid early"
+            (true, 100_000, Some("2026-10-02".into())),
+            "September's rent payment stays out of October"
         );
         assert_eq!(
             row(&f.conn, &f.pay),
@@ -933,8 +1068,8 @@ mod tests {
         let ids: Vec<&str> = free.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["chk/3"],
-            "the pending charge went with the feed that dropped it"
+            vec!["chk/1", "chk/3"],
+            "picking by hand offers the last days of September; the pending charge went with the feed that dropped it"
         );
     }
 
@@ -1206,5 +1341,102 @@ mod tests {
         let found = suggestions(&f.conn, today()).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].key, "city water");
+    }
+
+    #[test]
+    fn a_payment_settles_the_month_it_is_dated_in() {
+        let mut f = fixture();
+        let nov = november(&mut f);
+        let nov_pay = row_by_label(&f.conn, &nov, "Paycheck");
+        // October's paycheck was marked paid by hand before bank sync saw it.
+        ops::mark_paid(&f.conn, &f.pay, Money(200_000), None).unwrap();
+        let report = apply_feed(
+            &mut f.conn,
+            &feed(vec![txn("chk", "1", "2026-10-30", 200_000, "PAYCHECK")]),
+            day("2026-11-03"),
+        )
+        .unwrap();
+        assert_eq!(
+            row(&f.conn, &f.pay),
+            (true, 200_000, Some("2026-10-30".into())),
+            "last month goes first"
+        );
+        assert!(
+            !row(&f.conn, &nov_pay).0,
+            "November's paycheck waits for its own"
+        );
+        assert_eq!(report.settled.len(), 1);
+        assert!(
+            report.early.is_empty(),
+            "October had nothing paid from the bank before it"
+        );
+    }
+
+    #[test]
+    fn a_late_payment_for_an_item_already_paid_is_asked_about() {
+        let mut f = fixture();
+        let nov = november(&mut f);
+        let nov_rent = row_by_label(&f.conn, &nov, "Rent");
+        // October's rent cleared early in the month; another payment came at its end.
+        let first = feed(vec![txn("chk", "1", "2026-10-02", -100_000, "RENT")]);
+        apply_feed(&mut f.conn, &first, day("2026-10-03")).unwrap();
+        let late = feed(vec![txn("chk", "2", "2026-10-28", -100_000, "RENT")]);
+        let report = apply_feed(&mut f.conn, &late, day("2026-10-29")).unwrap();
+        assert_eq!(row(&f.conn, &f.rent).2, Some("2026-10-02".into()));
+        assert!(!row(&f.conn, &nov_rent).0, "never settled without asking");
+        assert_eq!(report.early.len(), 1);
+        let early = &report.early[0];
+        assert_eq!(
+            (
+                early.txn_id.as_str(),
+                early.bank.id.as_str(),
+                early.label.as_str()
+            ),
+            (nov_rent.as_str(), "chk/2", "Rent")
+        );
+        assert_eq!(
+            (early.paid_in.as_str(), early.counts_for.as_str()),
+            ("2026-10", "2026-11")
+        );
+
+        // Into November, it's still last month's payment and still asked about.
+        let report = apply_feed(&mut f.conn, &feed(vec![]), day("2026-11-02")).unwrap();
+        assert_eq!(report.early.len(), 1);
+
+        settle_from_bank(&f.conn, &nov_rent, "chk/2", false).unwrap();
+        assert_eq!(
+            row(&f.conn, &nov_rent),
+            (true, 100_000, Some("2026-10-28".into()))
+        );
+        let report = apply_feed(&mut f.conn, &feed(vec![]), day("2026-11-02")).unwrap();
+        assert!(report.early.is_empty(), "answered");
+    }
+
+    #[test]
+    fn a_late_payment_that_isnt_next_months_can_be_left_alone() {
+        let mut f = fixture();
+        november(&mut f);
+        let first = feed(vec![txn("chk", "1", "2026-10-02", -100_000, "RENT")]);
+        apply_feed(&mut f.conn, &first, day("2026-10-03")).unwrap();
+        let late = feed(vec![txn("chk", "2", "2026-10-28", -100_000, "RENT")]);
+        let report = apply_feed(&mut f.conn, &late, day("2026-10-29")).unwrap();
+        ignore_txn(&f.conn, &report.early[0].bank.id).unwrap();
+        let report = apply_feed(&mut f.conn, &feed(vec![]), day("2026-10-30")).unwrap();
+        assert!(report.early.is_empty());
+    }
+
+    #[test]
+    fn a_late_payment_is_not_asked_about_while_its_own_month_could_take_it() {
+        let mut f = fixture();
+        november(&mut f);
+        // October's rent isn't paid, so the late payment settles October.
+        let report = apply_feed(
+            &mut f.conn,
+            &feed(vec![txn("chk", "1", "2026-10-28", -100_000, "RENT")]),
+            day("2026-10-29"),
+        )
+        .unwrap();
+        assert!(row(&f.conn, &f.rent).0);
+        assert!(report.early.is_empty());
     }
 }
