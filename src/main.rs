@@ -473,6 +473,10 @@ pub enum PromptKind {
     },
     /// Create a what-if on Main.
     NewWhatIf,
+    /// Save a stamped month as a what-if on Main; the submitted text is its name.
+    SaveMonthAsWhatIf {
+        month_id: String,
+    },
     /// Edit a plan_item's per-plan budgeted amount. On a what-if, an item from Main is
     /// edited through the what-if's own copy (`ops::editable_item`).
     ItemAmount {
@@ -2520,6 +2524,21 @@ fn parse_item_dates(text: &str) -> Option<(Option<String>, Option<String>)> {
     }
 }
 
+/// Save the month as a what-if on Main, keeping every difference but one-offs. Returns how
+/// many it kept.
+fn save_month_as_what_if(app: &mut App, month_id: &str, name: &str) -> Result<usize> {
+    let today = Local::now().date_naive();
+    let comparison = ops::month_differences(&app.conn, month_id, true, today)?;
+    let chosen: Vec<String> = comparison
+        .differences
+        .into_iter()
+        .filter(|d| d.checked)
+        .map(|d| d.key)
+        .collect();
+    ops::save_month_as_plan(&mut app.conn, month_id, name, true, &chosen, today)?;
+    Ok(chosen.len())
+}
+
 /// Apply a submitted text prompt. We `take()` the modal first so it closes exactly once,
 /// then act on its kind. Validation failures re-report via `status` instead of mutating.
 fn submit_text(app: &mut App) -> Result<()> {
@@ -2542,6 +2561,18 @@ fn submit_text(app: &mut App) -> Result<()> {
             app.pending_plan_select = Some(id);
             app.screen = Screen::Budget;
             app.status = Some(format!("Created plan “{text}”"));
+        }
+        PromptKind::SaveMonthAsWhatIf { month_id } => {
+            if text.is_empty() {
+                app.status = Some("What-if name can't be empty".into());
+                return Ok(());
+            }
+            app.status = Some(match save_month_as_what_if(app, &month_id, &text) {
+                Ok(0) => format!("Saved “{text}”, a what-if just like Main"),
+                Ok(1) => format!("Saved “{text}”, a what-if with 1 change from Main"),
+                Ok(n) => format!("Saved “{text}”, a what-if with {n} changes from Main"),
+                Err(e) => e.to_string(),
+            });
         }
         PromptKind::NewWhatIf => {
             if text.is_empty() {
@@ -4493,6 +4524,60 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("starts Jan 2027"));
         assert!(text.contains(&format!("Tight removes {}", first.series.label)));
+    }
+
+    #[test]
+    fn w_saves_a_trimmed_month_as_a_what_if_on_main() {
+        let (mut app, manage, _) = app_with_envelope_modal();
+        app.modal = None;
+        app.dash_focus = DashFocus::Header;
+        ops::set_envelope_amount(&app.conn, &manage.envelope_id, Money::from_dollars(250.0))
+            .unwrap();
+        ops::add_oneoff_txn(
+            &app.conn,
+            &manage.month_id,
+            "Gift",
+            Direction::Out,
+            Money::from_dollars(40.0),
+        )
+        .unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let months = queries::months(&app.conn).unwrap();
+        let plans = queries::plan_summaries(&app.conn).unwrap();
+        let view = leeway_core::view::MonthView::build_for(&app.conn, today, 2026, 9).unwrap();
+        budget::handle_sidebar_key(
+            &mut app,
+            key(KeyCode::Char('w')),
+            &months,
+            &plans,
+            today,
+            budget::SidebarDetail::Month(view.as_ref()),
+        )
+        .unwrap();
+        let Some(Modal::Text(prompt)) = &mut app.modal else {
+            panic!("expected the name prompt");
+        };
+        assert_eq!(prompt.buffer, "September 2026");
+        prompt.buffer = "Less dining".into();
+        submit_text(&mut app).unwrap();
+
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Saved “Less dining”, a what-if with 1 change from Main")
+        );
+        let plan = queries::plans(&app.conn)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "Less dining")
+            .unwrap();
+        assert!(plan.is_what_if());
+        let entries = queries::load_plan_entries(&app.conn, &plan.id).unwrap();
+        assert_eq!(entries.len(), 1, "the one-off gift stays out");
+        assert_eq!(entries[0].amount, Money::from_dollars(250.0));
+        let month = queries::month_by_id(&app.conn, &manage.month_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(month.plan_id, Some(plan.id));
     }
 
     #[test]

@@ -30,7 +30,7 @@ Press `r` to restamp. If the month has items the plan doesn't, `x` restamps and 
 
 ## What-ifs
 
-Press `w` to make a what-if on Main. It starts with no changes and stamps just as Main does. It shows under Main in the sidebar.
+Press `w` to make a what-if on Main. It starts with no changes and stamps just as Main does. It shows under Main in the sidebar. Press `w` on a stamped month instead to save that month, edits and all, as a what-if.
 
 Editing an item in a what-if changes it there only; Main keeps its own. Removing one of Main's items with `x` leaves it out of the what-if alone. Press `u` on a changed or removed item to make it follow Main again.
 

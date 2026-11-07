@@ -244,6 +244,19 @@ pub fn handle_sidebar_key(
             BudgetTarget::Plan { .. } if plan.is_some() => app.plan_focus = PlanFocus::Envelopes,
             _ => {}
         },
+        KeyCode::Char('w') if month_view.is_some() && !plans.is_empty() => {
+            let month_id = month_view
+                .map(|view| view.month.id.clone())
+                .unwrap_or_default();
+            let name = month_view.map_or(String::new(), |view| {
+                view.month.start_date.format("%B %Y").to_string()
+            });
+            app.open_text(
+                "Save month as a what-if on Main",
+                name,
+                PromptKind::SaveMonthAsWhatIf { month_id },
+            )
+        }
         KeyCode::Char('n') if plans.is_empty() => {
             app.open_text("New plan name", "", PromptKind::NewPlan)
         }
@@ -312,6 +325,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, no_plans: bool) {
                     key(" g "),
                     Span::raw(" go to month"),
                 ];
+                let label = format!("{:04}-{:02}", app.viewed_year, app.viewed_month);
+                let stamped = queries::month_label_exists(&app.conn, &label).unwrap_or(false);
+                if stamped && !no_plans {
+                    spans.extend([key(" w "), Span::raw(" save as what-if")]);
+                }
                 if no_plans {
                     spans.extend([key(" n "), Span::raw(" new plan")]);
                 }
