@@ -55,8 +55,9 @@ fn stamp_row_id(month_id: &str, item_id: &str) -> String {
 /// Which month row each plan entry stands for: for `active` entries, the row restamp
 /// refreshes; for `removed` ones (a what-if's removals), the row it takes out. Rows the
 /// entry itself stamped match first, by id, so removing one of two payments of a series
-/// can't claim the other's row. Then each unmatched entry takes the next unclaimed row of
-/// its series, in row order, which covers hand-added rows and older ids.
+/// can't claim the other's row. Then each unmatched entry takes an unclaimed row of its
+/// series that budgets the same amount, and last the next unclaimed row, in row order,
+/// which covers hand-added rows and older ids.
 pub struct RowMatches {
     pub active: Vec<Option<String>>,
     pub removed: Vec<Option<String>>,
@@ -95,11 +96,34 @@ pub fn match_month_rows(
             found[i] = Some(own);
         }
     }
-    for (i, entry) in entries.iter().enumerate() {
-        if found[i].is_none() {
-            found[i] = rows_of(entry).into_iter().find(|id| !claimed.contains(id));
-            if let Some(id) = &found[i] {
-                claimed.insert(id.clone());
+    // What a row budgets: a paid bill's amount is what was paid, so its stamped amount
+    // stands for the plan. A daily envelope's amount depends on the month's length, so it
+    // never pairs by amount.
+    let same_amount = |entry: &PlanEntry, id: &str| match entry.series.kind {
+        Kind::Envelope => {
+            entry.series.period_type.map(calc::active_period) != Some(PeriodType::Daily)
+                && envelopes
+                    .iter()
+                    .any(|e| e.id == id && e.amount == entry.amount)
+        }
+        Kind::Transaction => txns.iter().any(|t| {
+            let budget = if t.settled {
+                t.stamped_amount.unwrap_or(t.amount)
+            } else {
+                t.amount
+            };
+            t.id == id && budget == entry.amount
+        }),
+    };
+    for by_amount in [true, false] {
+        for (i, entry) in entries.iter().enumerate() {
+            if found[i].is_none() {
+                found[i] = rows_of(entry)
+                    .into_iter()
+                    .find(|id| !claimed.contains(id) && (!by_amount || same_amount(entry, id)));
+                if let Some(id) = &found[i] {
+                    claimed.insert(id.clone());
+                }
             }
         }
     }
@@ -1014,6 +1038,8 @@ pub struct MonthDifference {
     pub amount: Money,
     /// The plan's amount, for a change or removal.
     pub base_amount: Option<Money>,
+    /// An envelope budgeted per day, so `amount` is a daily rate.
+    pub per_day: bool,
     /// Added to the month by hand, with no series behind it.
     pub one_off: bool,
     /// Whether the save sheet starts it checked: all but one-offs.
@@ -1150,6 +1176,7 @@ struct SavedRow {
     mode: Mode,
     /// The budgeted amount, per period.
     amount: Money,
+    per_day: bool,
 }
 
 struct Diff {
@@ -1191,6 +1218,16 @@ fn compare_month(
         ),
         None => (Vec::new(), Vec::new()),
     };
+    // Items the month's own plan stamps from a forecast. A row still holding what such an
+    // item stamped is as the plan left it, whatever the forecast says now.
+    let forecast_items: HashSet<String> = match &month.plan_id {
+        Some(id) => queries::load_plan_entries(conn, id)?
+            .into_iter()
+            .filter(|e| e.forecast_method != ForecastMethod::Static)
+            .map(|e| e.item_id)
+            .collect(),
+        None => HashSet::new(),
+    };
     let txns = queries::load_txns(conn, month_id)?;
     let envelopes = queries::load_envelopes(conn, month_id)?;
     let active: Vec<PlanEntry> = resolved.iter().map(|r| r.entry.clone()).collect();
@@ -1219,6 +1256,7 @@ fn compare_month(
                 period: e.period_type,
                 mode: e.mode,
                 amount: calc::envelope_period_amount(e.amount, period, month.days_in_month),
+                per_day: calc::active_period(period) == PeriodType::Daily,
             },
             e.amount,
             Some(e.stamped_amount),
@@ -1244,6 +1282,7 @@ fn compare_month(
                 period: PeriodType::Monthly,
                 mode: Mode::Manual,
                 amount: budget,
+                per_day: false,
             },
             budget,
             t.stamped_amount,
@@ -1264,6 +1303,7 @@ fn compare_month(
             direction: entry.series.direction,
             amount,
             base_amount: Some(entry.amount),
+            per_day: entry.series.period_type.map(calc::active_period) == Some(PeriodType::Daily),
             one_off: false,
             checked: true,
             left_change: Money::ZERO,
@@ -1283,8 +1323,9 @@ fn compare_month(
             .iter()
             .find(|(r, ..)| &r.id == row_id)
             .expect("matched rows are the month's");
-        let forecast_kept =
-            entry.forecast_method != ForecastMethod::Static && Some(*budget) == *stamped;
+        let forecast_kept = entry.forecast_method != ForecastMethod::Static
+            && forecast_items.contains(&entry.item_id)
+            && Some(*budget) == *stamped;
         if *budget == resolved.amount || forecast_kept {
             matching += 1;
             continue;
@@ -1326,6 +1367,7 @@ fn compare_month(
                 direction: row.direction,
                 amount: row.amount,
                 base_amount: None,
+                per_day: row.per_day,
                 one_off,
                 checked: !one_off,
                 left_change: left(&added),
@@ -2904,10 +2946,73 @@ mod tests {
         set_envelope_amount(&conn, &lunch, Money::from_dollars(248.0)).unwrap();
         let comparison = month_differences(&conn, &month, true, june()).unwrap();
         assert_eq!(comparison.differences[0].amount, Money::from_dollars(8.0));
+        assert!(comparison.differences[0].per_day);
         let chosen = checked(&comparison);
         let plan =
             save_month_as_plan(&mut conn, &month, "Less lunch", true, &chosen, june()).unwrap();
         assert_eq!(amounts(&conn, &plan)[0].1, Money::from_dollars(8.0));
+    }
+
+    #[test]
+    fn a_what_ifs_fixed_amount_beats_mains_forecast() {
+        let (mut conn, _, what_if, [rent, _, _]) = main_and_what_if();
+        // Main forecasts rent; with no history it falls back to $1,500. The what-if fixes it
+        // at $1,400.
+        set_item_forecast_method(&conn, &rent, ForecastMethod::PreviousMonth).unwrap();
+        let change = editable_item(&conn, &what_if, &rent).unwrap();
+        set_item_amount(&conn, &change, Money::from_dollars(1400.0)).unwrap();
+        set_item_forecast_method(&conn, &change, ForecastMethod::Static).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        let month = stamp(&mut conn, &what_if, "2026-12", start, 31).unwrap();
+
+        let comparison = month_differences(&conn, &month, true, june()).unwrap();
+        let shown: Vec<_> = comparison
+            .differences
+            .iter()
+            .map(|d| (d.label.as_str(), d.kind, d.amount))
+            .collect();
+        assert_eq!(
+            shown,
+            [("Rent", DifferenceKind::Changed, Money::from_dollars(1400.0))]
+        );
+        let chosen = checked(&comparison);
+        let plan = save_month_as_plan(&mut conn, &month, "Copy", true, &chosen, june()).unwrap();
+        assert_eq!(amounts(&conn, &plan)[1].1, Money::from_dollars(1400.0));
+    }
+
+    #[test]
+    fn repeated_additions_keep_their_rows_through_a_restamp() {
+        let (mut conn, main, _, _) = main_and_what_if();
+        let start = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        let month = stamp(&mut conn, &main, "2026-12", start, 31).unwrap();
+        let car = create_series(
+            &conn,
+            Kind::Transaction,
+            "Car",
+            Some(Direction::Out),
+            None,
+            None,
+        )
+        .unwrap();
+        let small =
+            add_series_txn_instance(&conn, &month, &car, Money::from_dollars(100.0)).unwrap();
+        let large =
+            add_series_txn_instance(&conn, &month, &car, Money::from_dollars(200.0)).unwrap();
+        mark_paid(&conn, &small, Money::from_dollars(110.0), None).unwrap();
+
+        let chosen = checked(&month_differences(&conn, &month, true, june()).unwrap());
+        assert_eq!(chosen.len(), 2);
+        let plan =
+            save_month_as_plan(&mut conn, &month, "Two cars", true, &chosen, june()).unwrap();
+        restamp(&mut conn, &month, &plan, false).unwrap();
+
+        let txns = queries::load_txns(&conn, &month).unwrap();
+        let row = |id: &str| txns.iter().find(|t| t.id == id).unwrap();
+        assert_eq!(row(&large).amount, Money::from_dollars(200.0));
+        assert!(!row(&large).settled);
+        assert_eq!(row(&small).amount, Money::from_dollars(110.0));
+        assert!(row(&small).settled);
+        assert_eq!(txns.iter().filter(|t| t.label == "Car").count(), 2);
     }
 
     #[test]

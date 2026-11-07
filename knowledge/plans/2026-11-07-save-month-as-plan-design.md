@@ -30,8 +30,13 @@ right row.
 Each month row is compared by its **budgeted** amount: an envelope's amount, an open
 transaction's amount, and a paid transaction's stamped amount, since paying records what
 was spent, not a plan. Envelope spending rows are skipped. The base amount is what the base
-plan would stamp into this month now (`forecast::resolve_plan_entries`). An item whose base
-uses a forecast counts as matching while the row still holds its stamped amount.
+plan would stamp into this month now (`forecast::resolve_plan_entries`). An item the month's
+own plan stamps from a forecast counts as matching while the row still holds its stamped
+amount; a what-if's fixed amount over Main's forecast still counts as a change.
+
+`match_month_rows` now pairs a plan item with a row of its series that budgets the same
+amount before it falls back to row order. Otherwise two saved payments of one series could
+swap rows on the next restamp, and an open payment take the paid one's amount.
 
 A difference is one of:
 
