@@ -299,8 +299,8 @@ pub fn get_plan(conn: &Connection, plan_id: &str) -> Result<Option<Plan>> {
     }
 }
 
-/// All entries in a plan, with envelopes by label and transactions by direction,
-/// largest amount first, then label, matching the month view.
+/// All entries in a plan in [`entry_order`]: envelopes, then money out before money in,
+/// each largest first.
 ///
 /// A what-if resolves against Main: each of Main's entries unless the what-if removes it,
 /// in the what-if's changed form where it has one, then the entries it adds. Stamping,
@@ -438,12 +438,9 @@ fn own_rows(conn: &Connection, plan_id: &str) -> Result<Vec<PlanRow>> {
                 s.id AS series_id, s.kind AS kind, s.label AS label,
                 s.direction AS direction, s.period_type AS period_type, s.mode AS mode
          FROM plan_item pi JOIN series s ON s.id = pi.series_id
-         WHERE pi.plan_id = ?1
-         ORDER BY s.kind, s.direction DESC,
-                  CASE WHEN s.kind = 'transaction' THEN pi.amount_cents END DESC,
-                  s.label, pi.id",
+         WHERE pi.plan_id = ?1",
     )?;
-    let rows = stmt
+    let mut rows = stmt
         .query_map([plan_id], |r| {
             Ok(PlanRow {
                 entry: map_plan_entry(r)?,
@@ -452,11 +449,12 @@ fn own_rows(conn: &Connection, plan_id: &str) -> Result<Vec<PlanRow>> {
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.sort_by_key(|row| entry_order(&row.entry));
     Ok(rows)
 }
 
-/// The order `own_rows` sorts by, for a resolved what-if: envelopes, then money out before
-/// money in, larger transactions first, then label and id.
+/// How plans list their entries: envelopes, then money out before money in, each largest
+/// first, then label and id. A per-day envelope counts as 30 days of its rate.
 fn entry_order(entry: &PlanEntry) -> (u8, u8, i64, String, String) {
     let kind = match entry.series.kind {
         Kind::Envelope => 0,
@@ -469,7 +467,12 @@ fn entry_order(entry: &PlanEntry) -> (u8, u8, i64, String, String) {
     };
     let amount = match entry.series.kind {
         Kind::Transaction => -entry.amount.cents(),
-        Kind::Envelope => 0,
+        Kind::Envelope => -crate::calc::monthlyized_envelope_amount(
+            entry.amount,
+            entry.series.period_type.unwrap_or(PeriodType::Monthly),
+            30,
+        )
+        .cents(),
     };
     (
         kind,
@@ -902,6 +905,34 @@ mod tests {
         let envelope = load_envelopes(&conn, &months[0]).unwrap().remove(0);
         assert!(envelope.series_label.is_none());
         assert_eq!(envelope.display_label(), "Groceries");
+    }
+
+    #[test]
+    fn plan_envelopes_sort_by_monthly_amount_largest_first() {
+        let conn = db::open_in_memory().unwrap();
+        let plan_id = ops::create_plan(&conn, "Normal").unwrap();
+        let envelope = |label, period, dollars| {
+            let series = ops::create_series(
+                &conn,
+                Kind::Envelope,
+                label,
+                None,
+                Some(period),
+                Some(Mode::Manual),
+            )
+            .unwrap();
+            ops::add_plan_item(&conn, &plan_id, &series, Money::from_dollars(dollars)).unwrap();
+        };
+        envelope("Alpha", PeriodType::Monthly, 100.0);
+        envelope("Bravo", PeriodType::Monthly, 500.0);
+        envelope("Coffee", PeriodType::Daily, 20.0);
+
+        let labels: Vec<String> = load_plan_entries(&conn, &plan_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.series.label)
+            .collect();
+        assert_eq!(labels, ["Coffee", "Bravo", "Alpha"]);
     }
 
     #[test]
