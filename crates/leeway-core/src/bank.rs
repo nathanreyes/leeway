@@ -749,19 +749,7 @@ pub fn set_match_text(conn: &Connection, series_id: &str, text: Option<&str>) ->
 /// use names. Income first, then charges, each largest first.
 pub fn suggestions(conn: &Connection, today: NaiveDate) -> Result<Vec<Suggestion>> {
     let from = today - Duration::days(SUGGESTION_DAYS);
-    // A series no plan gives an amount and no month has used, such as a $0 starter item,
-    // doesn't hide anything.
-    let mut texts: Vec<String> = conn
-        .prepare(
-            "SELECT s.label FROM series s
-             WHERE EXISTS (SELECT 1 FROM plan_item p
-                           WHERE p.series_id = s.id AND p.amount_cents != 0)
-                OR EXISTS (SELECT 1 FROM txn t
-                           WHERE t.series_id = s.id AND (t.amount_cents != 0 OR t.settled))",
-        )?
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    texts.extend(match_texts(conn)?.into_values());
+    let texts = used_texts(conn, true)?;
     let dismissed: HashSet<String> = conn
         .prepare("SELECT key FROM bank_dismissal")?
         .query_map([], |r| r.get(0))?
@@ -849,6 +837,24 @@ fn title_case(text: &str) -> String {
         .join(" ")
 }
 
+/// The labels and match texts of the series in use, envelopes too with `envelopes`. A series
+/// no plan gives an amount and no month has used, such as a $0 starter item, isn't in use.
+fn used_texts(conn: &Connection, envelopes: bool) -> Result<Vec<String>> {
+    let mut texts: Vec<String> = conn
+        .prepare(
+            "SELECT s.label FROM series s
+             WHERE (?1 OR s.kind = 'transaction')
+               AND (EXISTS (SELECT 1 FROM plan_item p
+                            WHERE p.series_id = s.id AND p.amount_cents != 0)
+                    OR EXISTS (SELECT 1 FROM txn t
+                               WHERE t.series_id = s.id AND (t.amount_cents != 0 OR t.settled)))",
+        )?
+        .query_map([envelopes], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    texts.extend(match_texts(conn)?.into_values());
+    Ok(texts)
+}
+
 /// Stop suggesting the charges cleaned to `key`.
 pub fn dismiss(conn: &Connection, key: &str) -> Result<()> {
     conn.execute(
@@ -856,6 +862,159 @@ pub fn dismiss(conn: &Connection, key: &str) -> Result<()> {
         [key],
     )?;
     Ok(())
+}
+
+// --- Spending ----------------------------------------------------------------------------
+
+/// How far apart the two sides of a transfer may post.
+const TRANSFER_DAYS: i64 = 3;
+/// Envelope estimates round up to a multiple of this many whole units of the currency.
+const ESTIMATE_STEP: i64 = 10;
+
+/// Charges from the last few months that share a cleaned description, which the apps sort
+/// into envelopes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpendingGroup {
+    pub key: String,
+    /// What the charges came to, positive.
+    pub total: Money,
+    pub count: u32,
+    /// The months it was seen in, `YYYY-MM`, oldest first.
+    pub months: Vec<String>,
+}
+
+/// What an envelope might get each month, from the spending sorted into it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvelopeEstimate {
+    pub label: String,
+    pub monthly: Money,
+}
+
+/// Money out from the last few months that isn't a bill: not a recurring charge, not named by
+/// an income or bill in use, and not a transfer. A charge is a transfer when a linked
+/// account shows the same amount coming in within a few days, which also catches card
+/// payments and refunds. Largest total first.
+pub fn spending_groups(conn: &Connection, today: NaiveDate) -> Result<Vec<SpendingGroup>> {
+    let from = today - Duration::days(SUGGESTION_DAYS);
+    let texts = used_texts(conn, false)?;
+    let recurring: HashSet<String> = suggestions(conn, today)?
+        .into_iter()
+        .filter(|s| s.direction == Direction::Out)
+        .map(|s| s.key)
+        .collect();
+    let mut incoming: Vec<(NaiveDate, i64, bool)> = conn
+        .prepare(
+            "SELECT posted, amount_cents FROM bank_txn
+             WHERE pending = 0 AND amount_cents > 0 AND posted BETWEEN ?1 AND ?2
+               AND bank_account_id IN (SELECT bank_account_id FROM account WHERE bank_account_id IS NOT NULL)",
+        )?
+        .query_map(
+            params![
+                (from - Duration::days(TRANSFER_DAYS)).to_string(),
+                (today + Duration::days(TRANSFER_DAYS)).to_string(),
+            ],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )?
+        .filter_map(|row| {
+            let (date, cents) = row.ok()?;
+            Some((date.parse().ok()?, cents, false))
+        })
+        .collect();
+    incoming.sort();
+
+    let mut groups: HashMap<String, Vec<BankTxn>> = HashMap::new();
+    for t in free_txns(conn, from, today, false)? {
+        let Ok(date) = t.date.parse::<NaiveDate>() else {
+            continue;
+        };
+        if t.amount.0 >= 0 {
+            continue;
+        }
+        // Each incoming amount answers one charge only.
+        if let Some(other) = incoming.iter_mut().find(|(d, cents, used)| {
+            !*used && *cents == -t.amount.0 && (*d - date).num_days().abs() <= TRANSFER_DAYS
+        }) {
+            other.2 = true;
+            continue;
+        }
+        let key = clean(&t.description);
+        if !key.is_empty()
+            && !recurring.contains(&key)
+            && !texts.iter().any(|text| names(&t.description, text))
+        {
+            groups.entry(key).or_default().push(t);
+        }
+    }
+    let mut found: Vec<SpendingGroup> = groups
+        .into_iter()
+        .map(|(key, txns)| {
+            let mut months: Vec<String> = txns.iter().map(|t| t.date[..7].to_string()).collect();
+            months.dedup();
+            SpendingGroup {
+                key,
+                total: Money(txns.iter().map(|t| -t.amount.0).sum()),
+                count: txns.len() as u32,
+                months,
+            }
+        })
+        .collect();
+    found.sort_by(|a, b| b.total.0.cmp(&a.total.0).then(a.key.cmp(&b.key)));
+    Ok(found)
+}
+
+/// Each envelope's share of the spending groups, by `assignments` from group key to envelope
+/// label: the total over the history divided by the months it covers, rounded up to the next
+/// ten. Keys with no group, and envelopes that come to nothing, are left out. Largest first.
+pub fn envelope_estimates(
+    conn: &Connection,
+    today: NaiveDate,
+    assignments: &HashMap<String, String>,
+) -> Result<Vec<EnvelopeEstimate>> {
+    let mut totals: HashMap<String, i64> = HashMap::new();
+    for group in spending_groups(conn, today)? {
+        if let Some(label) = assignments.get(&group.key).map(|l| l.trim())
+            && !label.is_empty()
+        {
+            *totals.entry(label.to_string()).or_default() += group.total.0;
+        }
+    }
+    let days = history_days(conn, today)?;
+    let step = ESTIMATE_STEP
+        * queries::currency(conn)?
+            .unwrap_or(crate::currency::USD)
+            .scale();
+    let mut estimates: Vec<EnvelopeEstimate> = totals
+        .into_iter()
+        .map(|(label, total)| {
+            // 1461 days in 48 months: an average month of 30.4375 days.
+            let steps = (total.max(0) as u128 * 1461).div_ceil(days as u128 * 48 * step as u128);
+            EnvelopeEstimate {
+                label,
+                monthly: Money(steps as i64 * step),
+            }
+        })
+        .filter(|e| e.monthly.0 > 0)
+        .collect();
+    estimates.sort_by(|a, b| b.monthly.0.cmp(&a.monthly.0).then(a.label.cmp(&b.label)));
+    Ok(estimates)
+}
+
+/// The days of history the spending groups draw on: from the oldest linked transaction in
+/// their window to today. At least a month, so a few days of history don't count as a
+/// month's spending several times over.
+fn history_days(conn: &Connection, today: NaiveDate) -> Result<i64> {
+    let from = today - Duration::days(SUGGESTION_DAYS);
+    let oldest: Option<String> = conn.query_row(
+        "SELECT MIN(posted) FROM bank_txn
+         WHERE pending = 0 AND posted BETWEEN ?1 AND ?2
+           AND bank_account_id IN (SELECT bank_account_id FROM account WHERE bank_account_id IS NOT NULL)",
+        params![from.to_string(), today.to_string()],
+        |r| r.get(0),
+    )?;
+    let oldest = oldest
+        .and_then(|d| d.parse::<NaiveDate>().ok())
+        .unwrap_or(today);
+    Ok(((today - oldest).num_days() + 1).max(30))
 }
 
 #[cfg(test)]
@@ -1230,6 +1389,103 @@ mod tests {
         );
         assert_eq!(found[0].payments, 1);
         assert_eq!(found[0].months, vec!["2026-08", "2026-09", "2026-10"]);
+    }
+
+    /// Spending over August to October: Trader Joe's at three different amounts, Netflix
+    /// monthly, rent, a card payment, a Target charge twice with one refunded, a café, and a
+    /// pending charge.
+    fn spending_feed(f: &mut Fixture) {
+        let mut pending = txn("cc", "p1", "2026-10-14", -4_000, "TRADER JOES #552");
+        pending.pending = true;
+        let txns = vec![
+            txn("cc", "t1", "2026-08-03", -6_000, "TRADER JOES #552"),
+            txn("cc", "t2", "2026-09-03", -8_250, "TRADER JOES #552"),
+            txn("cc", "t3", "2026-10-03", -4_100, "TRADER JOES #552"),
+            txn("cc", "n1", "2026-08-12", -1_549, "NETFLIX.COM"),
+            txn("cc", "n2", "2026-09-12", -1_549, "NETFLIX.COM"),
+            txn("chk", "r1", "2026-09-01", -100_000, "ACH RENT PMT"),
+            txn("chk", "c1", "2026-09-25", -50_000, "CHASE CARD PAYMENT"),
+            txn("cc", "c2", "2026-09-26", 50_000, "PAYMENT THANK YOU"),
+            txn("cc", "g1", "2026-09-10", -2_500, "TARGET 00012"),
+            txn("cc", "g2", "2026-09-11", -2_500, "TARGET 00012"),
+            txn("cc", "g3", "2026-09-12", 2_500, "TARGET REFUND"),
+            txn("cc", "d1", "2026-09-20", -1_500, "DINING HALL CAFE"),
+            txn("chk", "i1", "2026-09-30", 200_000, "ACME PAYROLL"),
+            pending,
+        ];
+        apply_feed(&mut f.conn, &feed(txns), today()).unwrap();
+    }
+
+    #[test]
+    fn spending_groups_leave_out_bills_transfers_and_refunds() {
+        let mut f = fixture();
+        spending_feed(&mut f);
+        let groups = spending_groups(&f.conn, today()).unwrap();
+        let summary: Vec<(&str, i64, u32)> = groups
+            .iter()
+            .map(|g| (g.key.as_str(), g.total.0, g.count))
+            .collect();
+        // Netflix recurs, rent is a bill in use, the card payment and one Target charge each
+        // meet money coming in. An envelope's label (Dining) hides nothing.
+        assert_eq!(
+            summary,
+            vec![
+                ("trader joes", 18_350, 3),
+                ("target", 2_500, 1),
+                ("dining hall cafe", 1_500, 1),
+            ]
+        );
+        assert_eq!(groups[0].months, vec!["2026-08", "2026-09", "2026-10"]);
+    }
+
+    #[test]
+    fn estimates_spread_each_envelope_over_the_history_and_round_up() {
+        let mut f = fixture();
+        spending_feed(&mut f);
+        let assignments: HashMap<String, String> = [
+            ("trader joes", "Groceries"),
+            ("target", "Shopping"),
+            ("dining hall cafe", "Shopping"),
+            ("netflix", "Entertainment"),
+            ("nothing like it", "Gifts"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let estimates = envelope_estimates(&f.conn, today(), &assignments).unwrap();
+        // August 3 to October 15 is 74 days, about 2.43 months. $183.50 of groceries is
+        // $75.45 a month, and $40 of shopping is $16.45.
+        assert_eq!(
+            estimates,
+            vec![
+                EnvelopeEstimate {
+                    label: "Groceries".into(),
+                    monthly: Money(8_000),
+                },
+                EnvelopeEstimate {
+                    label: "Shopping".into(),
+                    monthly: Money(2_000),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_short_history_counts_as_a_month() {
+        let mut f = fixture();
+        apply_feed(
+            &mut f.conn,
+            &feed(vec![txn("cc", "1", "2026-10-12", -9_000, "TRADER JOES")]),
+            today(),
+        )
+        .unwrap();
+        let assignments = HashMap::from([("trader joes".to_string(), "Groceries".to_string())]);
+        let estimates = envelope_estimates(&f.conn, today(), &assignments).unwrap();
+        assert_eq!(
+            estimates[0].monthly,
+            Money(10_000),
+            "$90 in 4 days is a month's $90, up to $100"
+        );
     }
 
     #[test]
